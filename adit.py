@@ -1,10 +1,11 @@
 import networkx as nx
-import pandas as pd
 import numpy as np
+import pandas as pd
 from sentence_transformers import SentenceTransformer
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split
+
 
 class ADIT:
     def __init__(self, theory_name, l1_papers, transformer=None):
@@ -58,27 +59,25 @@ class ADIT:
     def compute_eigenfactor(self):
         """
         Compute article-level Eigenfactor scores using modified PageRank.
-        
         Based on Larsen et al. (2014): Modified for citation networks where
         citations flow backward in time. Uses PageRank with citation direction
         (citing -> cited) and handles temporal acyclic nature.
-        
+
         :return: Dict of Eigenfactor scores for each node
         """
         try:
             # Use PageRank with citation direction (citing -> cited)
             # In citation networks, if A cites B, B gets importance from A
             eigenfactor_scores = nx.pagerank(self.ecosystem, alpha=0.85, max_iter=100)
-        except:
-            # Fallback to simple centrality if PageRank fails
-            eigenfactor_scores = {node: 1.0 for node in self.ecosystem.nodes()}
-        
+        except Exception:
+            # If PageRank fails (e.g., convergence error or empty graph), fall back to uniform scores
+            # Keep fallback minimal so feature extraction can continue; consider logging the exception for debugging.
+            eigenfactor_scores = dict.fromkeys(self.ecosystem.nodes(), 1.0)
         return eigenfactor_scores
 
     def extract_features(self, papers_data):
         """
         Extract features for L2 papers combining hand-designed and modern NLP features.
-        
         Hand-designed features from Larsen et al. (2014, 2019):
         - Eigenfactor_Eco: Article-level Eigenfactor (prestige-based importance)
         - Betweenness centrality: Bridge importance in citation network
@@ -88,27 +87,29 @@ class ADIT:
         - Word count in abstract
         - Theory name/acronym presence in title/keywords/abstract (binary flags)
         - Key construct presence in title/abstract (binary flags)
-        
+
         Modern NLP features:
         - Semantic similarity: Cosine similarity via sentence transformers
 
-        :param papers_data: Dict with paper info: {paper_id: {'title': str, 'abstract': str, 
-                                                             'keywords': str, 'citations': int, 
-                                                             'year': int}}
+        :param papers_data: Dict with paper info: {paper_id: {'title': str, 'abstract': str,
+                                                          'keywords': str, 'citations': int,
+                                                          'year': int}}
         :return: DataFrame with features
         """
         features = []
         concat_L1_abs = " ".join([papers_data.get(p, {}).get('abstract', '') for p in self.l1_papers])
         theory_emb = self.transformer.encode(concat_L1_abs)
-        
+
         # Compute network centrality measures
         try:
             betweenness_scores = nx.betweenness_centrality(self.ecosystem)
-        except:
-            betweenness_scores = {node: 0.0 for node in self.ecosystem.nodes()}
-        
+        except Exception:
+            # If betweenness computation fails (resource limit or other issue),
+            # assign zero betweenness so downstream feature pipeline continues.
+            betweenness_scores = dict.fromkeys(self.ecosystem.nodes(), 0.0)
+
         eigenfactor_scores = self.compute_eigenfactor()
-        
+
         # Determine min and max year for dynamic normalization
         years = [papers_data.get(p, {}).get('year', 2010) for p in papers_data]
         min_year = min(years) if years else 2010
@@ -126,7 +127,7 @@ class ADIT:
 
                 # 1. Network feature: Eigenfactor_Eco (article-level Eigenfactor)
                 eigenfactor = eigenfactor_scores.get(node, 0.0)
-                
+
                 # 2. Network feature: Betweenness centrality (bridge importance)
                 betweenness = betweenness_scores.get(node, 0.0)
 
@@ -216,7 +217,7 @@ class ADIT:
         y_pred = self.classifier.predict(X_test)
         print("Classification Report:")
         print(classification_report(y_test, y_pred, zero_division=0))
-        print(f"\nFeature Importance (top 5):")
+        print("\nFeature Importance (top 5):")
         feature_importance = pd.DataFrame({
             'feature': feature_cols,
             'importance': self.classifier.feature_importances_

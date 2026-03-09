@@ -1,0 +1,64 @@
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+exclude = [".venv", ".git", "__pycache__", ".*", "build", "dist"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # Pyflakes
+    "I",    # isort
+    "C",    # flake8-comprehensions
+    "B",    # flake8-bugbear
+]
+ignore = [
+    "E501",  # line too long (covered by black)
+    "W191",  # indentation contains tabs
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["adit"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311"]
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adit"
+version = "0.1.0"
+description = "Adaptation of ADIT (Academic Discipline Intelligence Tool) using modern NLP and citation networks"
+requires-python = ">=3.9"
+dependencies = [
+    "scikit-learn",
+    "networkx",
+    "pandas",
+    "numpy",
+    "sentence-transformers",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-mock",
+    "ruff",
+    "black",
+]

@@ -5,3 +5,5 @@ numpy
 sentence-transformers
 pytest>=7.0
 pytest-mock
+ruff
+black

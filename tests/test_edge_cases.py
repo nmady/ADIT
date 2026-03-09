@@ -1,8 +1,8 @@
 """Edge-case and validation tests for ADIT."""
 
-import pytest
 import numpy as np
 import pandas as pd
+
 from adit import ADIT
 
 
