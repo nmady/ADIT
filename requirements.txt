@@ -3,3 +3,5 @@ networkx
 pandas
 numpy
 sentence-transformers
+pytest>=7.0
+pytest-mock
