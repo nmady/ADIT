@@ -20,6 +20,40 @@ class ADIT:
         self.transformer = SentenceTransformer('all-MiniLM-L6-v2')  # For text embeddings
         self.classifier = RandomForestClassifier()
 
+    def build_ecosystem(self, citation_data):
+        """
+        Build a citation ecosystem graph with three levels:
+        - L1: Foundational theory papers
+        - L2: Papers that cite at least one L1 paper
+        - L3: Papers cited by L2 papers that are not already in L1/L2
+
+        :param citation_data: Dict of {citing_paper: [cited_papers]}
+        """
+        # Add foundational theory papers.
+        for paper in self.l1_papers:
+            self.ecosystem.add_node(paper, level='L1')
+
+        # First pass: classify citing papers as L2 when they cite any L1 paper.
+        for citing, cited_list in citation_data.items():
+            cites_l1 = any(cited in self.l1_papers for cited in cited_list)
+            if cites_l1:
+                self.ecosystem.add_node(citing, level='L2')
+
+            for cited in cited_list:
+                if cited not in self.ecosystem:
+                    self.ecosystem.add_node(cited, level='Unknown')
+                self.ecosystem.add_edge(citing, cited)
+
+        # Second pass: promote unknown nodes cited by L2 papers to L3.
+        for node, data in list(self.ecosystem.nodes(data=True)):
+            if data.get('level') != 'Unknown':
+                continue
+
+            predecessors = list(self.ecosystem.predecessors(node))
+            cited_by_l2 = any(self.ecosystem.nodes[p].get('level') == 'L2' for p in predecessors)
+            if cited_by_l2:
+                self.ecosystem.nodes[node]['level'] = 'L3'
+
     def compute_eigenfactor(self):
         """
         Compute article-level Eigenfactor scores using modified PageRank.
@@ -276,10 +310,15 @@ if __name__ == "__main__":
     print(features)
     print(f"\nFeature columns: {list(features.columns)}")
 
-    # Mock labels (1: subscribes to TAM, 0: does not)
-    # PaperA: 1 (extends TAM), PaperB: 1 (tests TAM), PaperC: 0 (unrelated), 
-    # PaperD: 0 (unrelated), PaperE: 1 (applies TAM)
-    labels = [1, 1, 0, 0, 1]
+    # Mock labels keyed by paper_id (1: subscribes to TAM, 0: does not)
+    label_map = {
+        'PaperA': 1,  # extends TAM
+        'PaperB': 1,  # tests TAM
+        'PaperC': 0,  # unrelated
+        'PaperD': 0,  # unrelated (may not be in extracted L2 set)
+        'PaperE': 1,  # applies TAM
+    }
+    labels = [label_map.get(paper_id, 0) for paper_id in features['paper_id']]
 
     print("\n=== Training Classifier ===")
     adit.train_classifier(features, labels)
