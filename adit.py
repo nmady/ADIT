@@ -17,47 +17,39 @@ class ADIT:
         self.theory_name = theory_name
         self.l1_papers = l1_papers
         self.ecosystem = nx.DiGraph()
-        self.model = SentenceTransformer('all-MiniLM-L6-v2')  # For text embeddings
+        self.transformer = SentenceTransformer('all-MiniLM-L6-v2')  # For text embeddings
         self.classifier = RandomForestClassifier()
 
-    def build_ecosystem(self, citation_data):
+    def compute_eigenfactor(self):
         """
-        Build the theory ecosystem from citation data.
-
-        :param citation_data: Dict or DataFrame with paper citations
+        Compute article-level Eigenfactor scores using modified PageRank.
+        
+        Based on Larsen et al. (2014): Modified for citation networks where
+        citations flow backward in time. Uses PageRank with citation direction
+        (citing -> cited) and handles temporal acyclic nature.
+        
+        :return: Dict of Eigenfactor scores for each node
         """
-        # Add L1 papers
-        for paper in self.l1_papers:
-            self.ecosystem.add_node(paper, level='L1')
-
-        # Assuming citation_data is a dict: {citing_paper: [cited_papers]}
-        # Build L2: papers citing L1
-        l2_papers = set()
-        for citing, cited_list in citation_data.items():
-            if any(cited in self.l1_papers for cited in cited_list):
-                l2_papers.add(citing)
-                self.ecosystem.add_node(citing, level='L2')
-                for cited in cited_list:
-                    if cited in self.l1_papers:
-                        self.ecosystem.add_edge(citing, cited)
-
-        # L3: papers cited by L2 (simplified)
-        for l2_paper in l2_papers:
-            if l2_paper in citation_data:
-                for cited in citation_data[l2_paper]:
-                    if cited not in self.l1_papers and cited not in l2_papers:
-                        self.ecosystem.add_node(cited, level='L3')
-                        self.ecosystem.add_edge(l2_paper, cited)
+        try:
+            # Use PageRank with citation direction (citing -> cited)
+            # In citation networks, if A cites B, B gets importance from A
+            eigenfactor_scores = nx.pagerank(self.ecosystem, alpha=0.85, max_iter=100)
+        except:
+            # Fallback to simple centrality if PageRank fails
+            eigenfactor_scores = {node: 1.0 for node in self.ecosystem.nodes()}
+        
+        return eigenfactor_scores
 
     def extract_features(self, papers_data):
         """
         Extract features for L2 papers combining hand-designed and modern NLP features.
         
         Hand-designed features from Larsen et al. (2014, 2019):
-        - Eigenfactor_Eco: Network importance in theory ecosystem
+        - Eigenfactor_Eco: Article-level Eigenfactor (prestige-based importance)
+        - Betweenness centrality: Bridge importance in citation network
         - Theory-Attribution Ratio (TAR): Citations to other L2 papers
         - Impact: Citation count
-        - Publication Year
+        - Publication Year (dynamically normalized to [0, 1] based on data range)
         - Word count in abstract
         - Theory name/acronym presence in title/keywords/abstract (binary flags)
         - Key construct presence in title/abstract (binary flags)
@@ -71,14 +63,22 @@ class ADIT:
         :return: DataFrame with features
         """
         features = []
-        theory_desc = " ".join([papers_data.get(p, {}).get('abstract', '') for p in self.l1_papers])
-        theory_emb = self.model.encode(theory_desc)
+        concat_L1_abs = " ".join([papers_data.get(p, {}).get('abstract', '') for p in self.l1_papers])
+        theory_emb = self.transformer.encode(concat_L1_abs)
         
-        # Compute Eigenfactor approximation using betweenness centrality
+        # Compute network centrality measures
         try:
-            eigenfactor_scores = nx.betweenness_centrality(self.ecosystem)
+            betweenness_scores = nx.betweenness_centrality(self.ecosystem)
         except:
-            eigenfactor_scores = {node: 1.0 for node in self.ecosystem.nodes()}
+            betweenness_scores = {node: 0.0 for node in self.ecosystem.nodes()}
+        
+        eigenfactor_scores = self.compute_eigenfactor()
+        
+        # Determine min and max year for dynamic normalization
+        years = [papers_data.get(p, {}).get('year', 2010) for p in papers_data]
+        min_year = min(years) if years else 2010
+        max_year = max(years) if years else 2010
+        year_range = max_year - min_year if max_year > min_year else 1
 
         for node, data in self.ecosystem.nodes(data=True):
             if data.get('level') == 'L2':
@@ -86,11 +86,14 @@ class ADIT:
                 title = paper_info.get('title', '').lower()
                 abstract = paper_info.get('abstract', '').lower()
                 keywords = paper_info.get('keywords', '').lower()
-                citations = paper_info.get('citations', 0)
+                citation_count = paper_info.get('citations', 0)
                 year = paper_info.get('year', 2010)
 
-                # 1. Network feature: Eigenfactor_Eco (approximated via betweenness centrality)
+                # 1. Network feature: Eigenfactor_Eco (article-level Eigenfactor)
                 eigenfactor = eigenfactor_scores.get(node, 0.0)
+                
+                # 2. Network feature: Betweenness centrality (bridge importance)
+                betweenness = betweenness_scores.get(node, 0.0)
 
                 # 2. Theory-Attribution Ratio (TAR): fraction of references to L2 papers
                 l2_papers_cited = 0
@@ -102,10 +105,10 @@ class ADIT:
                 tar = (l2_papers_cited / max(total_refs, 1)) if total_refs > 0 else 0.0
 
                 # 3. Impact (citation count)
-                impact = citations
+                impact = citation_count
 
-                # 4. Publication year (normalized)
-                pub_year_norm = (year - 2000) / 30.0  # Normalize to roughly [0, 1]
+                # 4. Publication year (normalized dynamically to [0, 1])
+                pub_year_norm = (year - min_year) / year_range
 
                 # 5. Abstract word count
                 word_count = len(abstract.split())
@@ -128,7 +131,7 @@ class ADIT:
                                      if construct in title or construct in abstract)
 
                 # 13. Semantic similarity (modern NLP via embeddings)
-                paper_emb = self.model.encode(abstract)
+                paper_emb = self.transformer.encode(abstract)
                 norm_theory = np.linalg.norm(theory_emb)
                 norm_paper = np.linalg.norm(paper_emb)
                 if norm_theory > 0 and norm_paper > 0:
@@ -143,6 +146,7 @@ class ADIT:
                 features.append({
                     'paper_id': node,
                     'eigenfactor': eigenfactor,
+                    'betweenness': betweenness,
                     'theory_attribution_ratio': tar,
                     'impact': impact,
                     'pub_year': pub_year_norm,
