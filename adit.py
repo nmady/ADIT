@@ -124,10 +124,12 @@ class ADIT:
                 acronym_in_keywords = int(acronym in keywords)
                 acronym_in_abstract = int(acronym in abstract)
 
-                # 12. Key constructs count (example: TAM uses "usefulness", "ease of use")
+                # 12. Key constructs - individual binary flags (example: TAM uses "usefulness", "ease of use")
                 key_constructs = ['usefulness', 'ease of use', 'acceptance', 'intention', 'attitude']
-                constructs_count = sum(1 for construct in key_constructs 
-                                     if construct in title or construct in abstract)
+                construct_features = {}
+                for construct in key_constructs:
+                    feature_name = f"has_{construct.replace(' ', '_')}"
+                    construct_features[feature_name] = int(construct in title or construct in abstract)
 
                 # 13. Semantic similarity (modern NLP via embeddings)
                 paper_emb = self.transformer.encode(abstract)
@@ -156,7 +158,7 @@ class ADIT:
                     'acronym_in_title': acronym_in_title,
                     'acronym_in_keywords': acronym_in_keywords,
                     'acronym_in_abstract': acronym_in_abstract,
-                    'key_constructs_count': constructs_count,
+                    **construct_features,  # Unpack individual construct flags
                     'semantic_similarity': semantic_similarity,
                     'in_degree': in_degree,
                     'out_degree': out_degree
