@@ -48,7 +48,7 @@ class ADIT:
         - Eigenfactor_Eco: Article-level Eigenfactor (prestige-based importance)
         - Betweenness centrality: Bridge importance in citation network
         - Theory-Attribution Ratio (TAR): Citations to other L2 papers
-        - Impact: Citation count
+        - Citation count: Number of citations
         - Publication Year (dynamically normalized to [0, 1] based on data range)
         - Word count in abstract
         - Theory name/acronym presence in title/keywords/abstract (binary flags)
@@ -104,8 +104,7 @@ class ADIT:
                         l2_papers_cited += eigenfactor_scores.get(ref, 0.0)
                 tar = (l2_papers_cited / max(total_refs, 1)) if total_refs > 0 else 0.0
 
-                # 3. Impact (citation count)
-                impact = citation_count
+                # 3. Citation count
 
                 # 4. Publication year (normalized dynamically to [0, 1])
                 pub_year_norm = (year - min_year) / year_range
@@ -148,7 +147,7 @@ class ADIT:
                     'eigenfactor': eigenfactor,
                     'betweenness': betweenness,
                     'theory_attribution_ratio': tar,
-                    'impact': impact,
+                    'citation_count': citation_count,
                     'pub_year': pub_year_norm,
                     'abstract_word_count': word_count,
                     'theory_in_title': theory_in_title,
