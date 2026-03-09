@@ -7,7 +7,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 
 class ADIT:
-    def __init__(self, theory_name, l1_papers):
+    def __init__(self, theory_name, l1_papers, transformer=None):
         """
         Initialize ADIT for a specific theory.
 
@@ -17,7 +17,8 @@ class ADIT:
         self.theory_name = theory_name
         self.l1_papers = l1_papers
         self.ecosystem = nx.DiGraph()
-        self.transformer = SentenceTransformer('all-MiniLM-L6-v2')  # For text embeddings
+        # Dependency injection: accept an optional transformer for easier testing
+        self.transformer = transformer or SentenceTransformer('all-MiniLM-L6-v2')  # For text embeddings
         self.classifier = RandomForestClassifier()
 
     def build_ecosystem(self, citation_data):
