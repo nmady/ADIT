@@ -49,7 +49,11 @@ def _parse_l1(l1_papers: Optional[str], l1_file: Optional[Path]) -> List[str]:
     if l1_file:
         if not l1_file.exists():
             raise typer.BadParameter(f"L1 file not found: {l1_file}")
-        parsed = [line.strip() for line in l1_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+        parsed = [
+            line.strip()
+            for line in l1_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
         if parsed:
             return parsed
 
@@ -71,7 +75,9 @@ def _resolve_labels(labels_data: Any, features: pd.DataFrame) -> List[int]:
 @app.command()
 def run(
     config: Optional[Path] = typer.Option(None, help="Path to JSON/YAML config file."),
-    theory_name: Optional[str] = typer.Option(None, help="Theory name, e.g. 'Technology Acceptance Model'."),
+    theory_name: Optional[str] = typer.Option(
+        None, help="Theory name, e.g. 'Technology Acceptance Model'."
+    ),
     acronym: Optional[str] = typer.Option(None, help="Optional explicit acronym, e.g. 'TAM'."),
     l1_papers: Optional[str] = typer.Option(
         None, help="Comma-separated L1 paper IDs/titles (alternative to --l1-file)."
@@ -82,8 +88,12 @@ def run(
     labels_data: Optional[Path] = typer.Option(
         None, help="Optional labels JSON (dict by paper_id, or list aligned to extracted features)."
     ),
-    output_features: Optional[Path] = typer.Option(None, help="Optional CSV path for extracted features."),
-    output_predictions: Optional[Path] = typer.Option(None, help="Optional CSV path for predictions."),
+    output_features: Optional[Path] = typer.Option(
+        None, help="Optional CSV path for extracted features."
+    ),
+    output_predictions: Optional[Path] = typer.Option(
+        None, help="Optional CSV path for predictions."
+    ),
 ) -> None:
     """Run ADIT using CLI values and/or a config file."""
     cfg = _load_config(config)
@@ -96,7 +106,9 @@ def run(
     l1_file = l1_file or (Path(cfg["l1_file"]) if cfg.get("l1_file") else None)
     l1 = _parse_l1(l1_papers or l1_cfg_str, l1_file)
 
-    citation_data_path = citation_data or (Path(cfg["citation_data"]) if cfg.get("citation_data") else None)
+    citation_data_path = citation_data or (
+        Path(cfg["citation_data"]) if cfg.get("citation_data") else None
+    )
     papers_data_path = papers_data or (Path(cfg["papers_data"]) if cfg.get("papers_data") else None)
     labels_data_path = labels_data or (Path(cfg["labels_data"]) if cfg.get("labels_data") else None)
 

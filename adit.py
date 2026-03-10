@@ -19,7 +19,9 @@ class ADIT:
         :param acronym: Optional explicit acronym (e.g., 'TAM'). If omitted, derived from theory_name.
         """
         self.theory_name = theory_name
-        self.acronym = acronym.lower() if acronym else "".join(w[0] for w in theory_name.split()).lower()
+        self.acronym = (
+            acronym.lower() if acronym else "".join(w[0] for w in theory_name.split()).lower()
+        )
         self.l1_papers = l1_papers
         self.ecosystem = nx.DiGraph()
         # Dependency injection: accept an optional transformer for easier testing

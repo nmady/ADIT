@@ -18,7 +18,9 @@ class FakeADIT:
     def __init__(self, theory_name, l1_papers, acronym=None):
         self.theory_name = theory_name
         self.l1_papers = l1_papers
-        self.acronym = acronym.lower() if acronym else "".join(w[0] for w in theory_name.split()).lower()
+        self.acronym = (
+            acronym.lower() if acronym else "".join(w[0] for w in theory_name.split()).lower()
+        )
         self.trained = False
         FakeADIT.last_instance = self
 
@@ -64,7 +66,13 @@ def test_cli_run_with_direct_args_and_labels(tmp_path, monkeypatch):
     _write_json(
         papers_file,
         {
-            "PaperA": {"title": "A", "abstract": "a", "keywords": "k", "citations": 1, "year": 2010},
+            "PaperA": {
+                "title": "A",
+                "abstract": "a",
+                "keywords": "k",
+                "citations": 1,
+                "year": 2010,
+            },
             "TAM1": {
                 "title": "TAM",
                 "abstract": "foundation",
@@ -129,7 +137,13 @@ def test_cli_run_with_json_config_and_no_labels(tmp_path, monkeypatch):
     _write_json(
         papers_file,
         {
-            "PaperA": {"title": "A", "abstract": "a", "keywords": "k", "citations": 1, "year": 2010},
+            "PaperA": {
+                "title": "A",
+                "abstract": "a",
+                "keywords": "k",
+                "citations": 1,
+                "year": 2010,
+            },
             "TAM1": {
                 "title": "TAM",
                 "abstract": "foundation",
@@ -174,7 +188,13 @@ def test_cli_cli_args_override_config_values(tmp_path, monkeypatch):
     _write_json(
         papers_file,
         {
-            "PaperA": {"title": "A", "abstract": "a", "keywords": "k", "citations": 1, "year": 2010},
+            "PaperA": {
+                "title": "A",
+                "abstract": "a",
+                "keywords": "k",
+                "citations": 1,
+                "year": 2010,
+            },
             "TAM1": {
                 "title": "TAM",
                 "abstract": "foundation",
