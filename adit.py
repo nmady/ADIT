@@ -1,3 +1,5 @@
+import logging
+
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -71,7 +73,7 @@ class ADIT:
             eigenfactor_scores = nx.pagerank(self.ecosystem, alpha=0.85, max_iter=100)
         except Exception:
             # If PageRank fails (e.g., convergence error or empty graph), fall back to uniform scores
-            # Keep fallback minimal so feature extraction can continue; consider logging the exception for debugging.
+            logging.warning("PageRank computation failed, using uniform scores as fallback", exc_info=True)
             eigenfactor_scores = dict.fromkeys(self.ecosystem.nodes(), 1.0)
         return eigenfactor_scores
 
@@ -106,6 +108,7 @@ class ADIT:
         except Exception:
             # If betweenness computation fails (resource limit or other issue),
             # assign zero betweenness so downstream feature pipeline continues.
+            logging.warning("Betweenness centrality computation failed, using zero scores as fallback", exc_info=True)
             betweenness_scores = dict.fromkeys(self.ecosystem.nodes(), 0.0)
 
         eigenfactor_scores = self.compute_eigenfactor()
