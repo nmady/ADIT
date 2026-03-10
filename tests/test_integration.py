@@ -10,15 +10,15 @@ def test_adit_full_pipeline(mock_transformer, sample_citation_data, sample_paper
     """Test the complete ADIT workflow: build → extract → train → predict."""
 
     # 1. Initialize ADIT with mocked transformer
-    adit = ADIT('TAM', ['TAM1', 'TAM2'], transformer=mock_transformer)
+    adit = ADIT("TAM", ["TAM1", "TAM2"], transformer=mock_transformer)
 
     # 2. Build ecosystem
     adit.build_ecosystem(sample_citation_data)
 
     # Verify ecosystem structure
     assert len(adit.ecosystem.nodes) > 0
-    assert any(data.get('level') == 'L1' for _, data in adit.ecosystem.nodes(data=True))
-    assert any(data.get('level') == 'L2' for _, data in adit.ecosystem.nodes(data=True))
+    assert any(data.get("level") == "L1" for _, data in adit.ecosystem.nodes(data=True))
+    assert any(data.get("level") == "L2" for _, data in adit.ecosystem.nodes(data=True))
 
     # 3. Extract features
     features = adit.extract_features(sample_papers_data)
@@ -26,29 +26,37 @@ def test_adit_full_pipeline(mock_transformer, sample_citation_data, sample_paper
     # Verify features are produced
     assert isinstance(features, pd.DataFrame)
     assert len(features) > 0
-    assert 'paper_id' in features.columns
-    assert all(col in features.columns for col in [
-        'eigenfactor', 'betweenness', 'citation_count', 'pub_year',
-        'has_usefulness', 'has_ease_of_use', 'has_acceptance',
-        'semantic_similarity'
-    ])
+    assert "paper_id" in features.columns
+    assert all(
+        col in features.columns
+        for col in [
+            "eigenfactor",
+            "betweenness",
+            "citation_count",
+            "pub_year",
+            "has_usefulness",
+            "has_ease_of_use",
+            "has_acceptance",
+            "semantic_similarity",
+        ]
+    )
 
     # 4. Create labels aligned with extracted papers (L2 only)
     label_map = {
-        'PaperA': 1,
-        'PaperB': 1,
-        'PaperC': 0,
-        'PaperD': 0,
-        'PaperE': 1,
+        "PaperA": 1,
+        "PaperB": 1,
+        "PaperC": 0,
+        "PaperD": 0,
+        "PaperE": 1,
     }
-    labels = [label_map.get(paper_id, 0) for paper_id in features['paper_id']]
+    labels = [label_map.get(paper_id, 0) for paper_id in features["paper_id"]]
 
     # 5. Train classifier
     adit.train_classifier(features, labels)
 
     # Verify classifier is trained and has feature importances
     assert adit.classifier is not None
-    assert hasattr(adit.classifier, 'feature_importances_')
+    assert hasattr(adit.classifier, "feature_importances_")
     assert len(adit.classifier.feature_importances_) > 0
 
     # 6. Make predictions

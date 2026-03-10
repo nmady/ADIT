@@ -9,18 +9,18 @@ from adit import ADIT
 
 def _build_features_and_labels(mock_transformer, sample_citation_data, sample_papers_data):
     """Build a deterministic feature matrix and aligned labels for classifier tests."""
-    adit = ADIT('TAM', ['TAM1', 'TAM2'], transformer=mock_transformer)
+    adit = ADIT("TAM", ["TAM1", "TAM2"], transformer=mock_transformer)
     adit.build_ecosystem(sample_citation_data)
     features = adit.extract_features(sample_papers_data)
 
     label_map = {
-        'PaperA': 1,
-        'PaperB': 1,
-        'PaperC': 0,
-        'PaperD': 0,
-        'PaperE': 1,
+        "PaperA": 1,
+        "PaperB": 1,
+        "PaperC": 0,
+        "PaperD": 0,
+        "PaperE": 1,
     }
-    labels = [label_map.get(paper_id, 0) for paper_id in features['paper_id']]
+    labels = [label_map.get(paper_id, 0) for paper_id in features["paper_id"]]
     return adit, features, labels
 
 
@@ -32,7 +32,7 @@ def test_train_classifier_fits_model(mock_transformer, sample_citation_data, sam
 
     adit.train_classifier(features, labels)
 
-    assert hasattr(adit.classifier, 'feature_importances_')
+    assert hasattr(adit.classifier, "feature_importances_")
     assert len(adit.classifier.feature_importances_) == len(features.columns) - 1
 
 
@@ -44,12 +44,12 @@ def test_train_classifier_excludes_paper_id_column(
         mock_transformer, sample_citation_data, sample_papers_data
     )
 
-    fit_spy = mocker.spy(adit.classifier, 'fit')
+    fit_spy = mocker.spy(adit.classifier, "fit")
     adit.train_classifier(features, labels)
 
     # fit(X_train, y_train) should be called with only numeric feature columns.
     X_train_arg = fit_spy.call_args.args[0]
-    assert 'paper_id' not in X_train_arg.columns
+    assert "paper_id" not in X_train_arg.columns
 
 
 def test_train_classifier_raises_on_label_length_mismatch(

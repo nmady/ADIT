@@ -4,9 +4,9 @@ Test exception handling and logging in ADIT.
 Verifies that exceptions in PageRank and betweenness centrality
 are properly caught, logged, and handled with fallback values.
 """
+
 import logging
 
-import networkx as nx
 import pytest
 
 from adit import ADIT
@@ -15,60 +15,56 @@ from adit import ADIT
 @pytest.fixture
 def simple_adit(mock_transformer):
     """Create a simple ADIT instance for testing."""
-    l1_papers = ['Paper1', 'Paper2']
-    adit = ADIT('TestTheory', l1_papers, transformer=mock_transformer)
+    l1_papers = ["Paper1", "Paper2"]
+    adit = ADIT("TestTheory", l1_papers, transformer=mock_transformer)
     return adit
 
 
 @pytest.fixture
 def simple_citation_data():
     """Minimal citation data for testing."""
-    return {
-        'PaperA': ['Paper1'],
-        'PaperB': ['Paper2'],
-        'PaperC': ['Paper1', 'Paper2']
-    }
+    return {"PaperA": ["Paper1"], "PaperB": ["Paper2"], "PaperC": ["Paper1", "Paper2"]}
 
 
 @pytest.fixture
 def simple_papers_data():
     """Minimal papers data for testing."""
     return {
-        'PaperA': {
-            'title': 'Test paper A',
-            'abstract': 'Abstract for paper A',
-            'keywords': 'test, paper',
-            'citations': 10,
-            'year': 2020
+        "PaperA": {
+            "title": "Test paper A",
+            "abstract": "Abstract for paper A",
+            "keywords": "test, paper",
+            "citations": 10,
+            "year": 2020,
         },
-        'PaperB': {
-            'title': 'Test paper B',
-            'abstract': 'Abstract for paper B',
-            'keywords': 'test, paper',
-            'citations': 5,
-            'year': 2021
+        "PaperB": {
+            "title": "Test paper B",
+            "abstract": "Abstract for paper B",
+            "keywords": "test, paper",
+            "citations": 5,
+            "year": 2021,
         },
-        'PaperC': {
-            'title': 'Test paper C',
-            'abstract': 'Abstract for paper C',
-            'keywords': 'test, paper',
-            'citations': 8,
-            'year': 2022
+        "PaperC": {
+            "title": "Test paper C",
+            "abstract": "Abstract for paper C",
+            "keywords": "test, paper",
+            "citations": 8,
+            "year": 2022,
         },
-        'Paper1': {
-            'title': 'Foundational paper 1',
-            'abstract': 'Foundation abstract 1',
-            'keywords': 'foundation',
-            'citations': 100,
-            'year': 2010
+        "Paper1": {
+            "title": "Foundational paper 1",
+            "abstract": "Foundation abstract 1",
+            "keywords": "foundation",
+            "citations": 100,
+            "year": 2010,
         },
-        'Paper2': {
-            'title': 'Foundational paper 2',
-            'abstract': 'Foundation abstract 2',
-            'keywords': 'foundation',
-            'citations': 50,
-            'year': 2012
-        }
+        "Paper2": {
+            "title": "Foundational paper 2",
+            "abstract": "Foundation abstract 2",
+            "keywords": "foundation",
+            "citations": 50,
+            "year": 2012,
+        },
     }
 
 
@@ -77,7 +73,7 @@ def test_pagerank_exception_logging(simple_adit, simple_citation_data, mocker, c
     simple_adit.build_ecosystem(simple_citation_data)
 
     # Mock nx.pagerank to raise an exception
-    mocker.patch('networkx.pagerank', side_effect=Exception("PageRank convergence failed"))
+    mocker.patch("networkx.pagerank", side_effect=Exception("PageRank convergence failed"))
 
     # Capture logging at WARNING level
     with caplog.at_level(logging.WARNING):
@@ -98,7 +94,7 @@ def test_pagerank_exception_fallback_values(simple_adit, simple_citation_data, m
     simple_adit.build_ecosystem(simple_citation_data)
 
     # Mock nx.pagerank to raise an exception
-    mocker.patch('networkx.pagerank', side_effect=RuntimeError("Convergence error"))
+    mocker.patch("networkx.pagerank", side_effect=RuntimeError("Convergence error"))
 
     scores = simple_adit.compute_eigenfactor()
 
@@ -108,50 +104,58 @@ def test_pagerank_exception_fallback_values(simple_adit, simple_citation_data, m
     assert all(score == 1.0 for score in scores.values())
 
 
-def test_betweenness_exception_logging(simple_adit, simple_citation_data, simple_papers_data, mocker, caplog):
+def test_betweenness_exception_logging(
+    simple_adit, simple_citation_data, simple_papers_data, mocker, caplog
+):
     """Test that betweenness centrality exceptions are caught and logged."""
     simple_adit.build_ecosystem(simple_citation_data)
 
     # Mock nx.betweenness_centrality to raise an exception
-    mocker.patch('networkx.betweenness_centrality', side_effect=MemoryError("Out of memory"))
+    mocker.patch("networkx.betweenness_centrality", side_effect=MemoryError("Out of memory"))
 
     # Capture logging at WARNING level
     with caplog.at_level(logging.WARNING):
         features = simple_adit.extract_features(simple_papers_data)
 
     # Verify logging occurred
-    assert any("Betweenness centrality computation failed" in record.message for record in caplog.records)
+    assert any(
+        "Betweenness centrality computation failed" in record.message for record in caplog.records
+    )
     assert any("zero scores as fallback" in record.message for record in caplog.records)
 
     # Verify features were still extracted (with zero betweenness)
-    assert 'betweenness' in features.columns
-    assert all(features['betweenness'] == 0.0)
+    assert "betweenness" in features.columns
+    assert all(features["betweenness"] == 0.0)
 
 
-def test_betweenness_exception_fallback_values(simple_adit, simple_citation_data, simple_papers_data, mocker):
+def test_betweenness_exception_fallback_values(
+    simple_adit, simple_citation_data, simple_papers_data, mocker
+):
     """Test that betweenness fallback provides correct zero scores."""
     simple_adit.build_ecosystem(simple_citation_data)
 
     # Mock nx.betweenness_centrality to raise an exception
-    mocker.patch('networkx.betweenness_centrality', side_effect=ValueError("Invalid graph"))
+    mocker.patch("networkx.betweenness_centrality", side_effect=ValueError("Invalid graph"))
 
     features = simple_adit.extract_features(simple_papers_data)
 
     # All L2 papers should have betweenness = 0.0
-    assert 'betweenness' in features.columns
-    assert all(features['betweenness'] == 0.0)
+    assert "betweenness" in features.columns
+    assert all(features["betweenness"] == 0.0)
     # Verify other features are still computed
     assert len(features) > 0
-    assert 'eigenfactor' in features.columns
+    assert "eigenfactor" in features.columns
 
 
-def test_both_exceptions_together(simple_adit, simple_citation_data, simple_papers_data, mocker, caplog):
+def test_both_exceptions_together(
+    simple_adit, simple_citation_data, simple_papers_data, mocker, caplog
+):
     """Test that both PageRank and betweenness exceptions can be handled simultaneously."""
     simple_adit.build_ecosystem(simple_citation_data)
 
     # Mock both functions to raise exceptions
-    mocker.patch('networkx.pagerank', side_effect=Exception("PageRank failed"))
-    mocker.patch('networkx.betweenness_centrality', side_effect=Exception("Betweenness failed"))
+    mocker.patch("networkx.pagerank", side_effect=Exception("PageRank failed"))
+    mocker.patch("networkx.betweenness_centrality", side_effect=Exception("Betweenness failed"))
 
     with caplog.at_level(logging.WARNING):
         features = simple_adit.extract_features(simple_papers_data)
@@ -162,10 +166,10 @@ def test_both_exceptions_together(simple_adit, simple_citation_data, simple_pape
     assert any("Betweenness centrality computation failed" in msg for msg in log_messages)
 
     # Verify features extracted with fallback values
-    assert 'eigenfactor' in features.columns
-    assert 'betweenness' in features.columns
-    assert all(features['eigenfactor'] == 1.0)
-    assert all(features['betweenness'] == 0.0)
+    assert "eigenfactor" in features.columns
+    assert "betweenness" in features.columns
+    assert all(features["eigenfactor"] == 1.0)
+    assert all(features["betweenness"] == 0.0)
 
 
 def test_normal_operation_no_logging(simple_adit, simple_citation_data, simple_papers_data, caplog):
@@ -179,8 +183,8 @@ def test_normal_operation_no_logging(simple_adit, simple_citation_data, simple_p
     assert len(caplog.records) == 0
 
     # Features should be computed normally
-    assert 'eigenfactor' in features.columns
-    assert 'betweenness' in features.columns
+    assert "eigenfactor" in features.columns
+    assert "betweenness" in features.columns
     # Eigenfactor should not all be 1.0 (PageRank actually ran)
     # Note: in a very small graph, PageRank might converge to near-uniform values,
     # but the fallback is exactly 1.0, so we can distinguish

@@ -21,7 +21,9 @@ class ADIT:
         self.l1_papers = l1_papers
         self.ecosystem = nx.DiGraph()
         # Dependency injection: accept an optional transformer for easier testing
-        self.transformer = transformer or SentenceTransformer('all-MiniLM-L6-v2')  # For text embeddings
+        self.transformer = transformer or SentenceTransformer(
+            "all-MiniLM-L6-v2"
+        )  # For text embeddings
         self.classifier = RandomForestClassifier()
 
     def build_ecosystem(self, citation_data):
@@ -35,28 +37,28 @@ class ADIT:
         """
         # Add foundational theory papers.
         for paper in self.l1_papers:
-            self.ecosystem.add_node(paper, level='L1')
+            self.ecosystem.add_node(paper, level="L1")
 
         # First pass: classify citing papers as L2 when they cite any L1 paper.
         for citing, cited_list in citation_data.items():
             cites_l1 = any(cited in self.l1_papers for cited in cited_list)
             if cites_l1:
-                self.ecosystem.add_node(citing, level='L2')
+                self.ecosystem.add_node(citing, level="L2")
 
             for cited in cited_list:
                 if cited not in self.ecosystem:
-                    self.ecosystem.add_node(cited, level='Unknown')
+                    self.ecosystem.add_node(cited, level="Unknown")
                 self.ecosystem.add_edge(citing, cited)
 
         # Second pass: promote unknown nodes cited by L2 papers to L3.
         for node, data in list(self.ecosystem.nodes(data=True)):
-            if data.get('level') != 'Unknown':
+            if data.get("level") != "Unknown":
                 continue
 
             predecessors = list(self.ecosystem.predecessors(node))
-            cited_by_l2 = any(self.ecosystem.nodes[p].get('level') == 'L2' for p in predecessors)
+            cited_by_l2 = any(self.ecosystem.nodes[p].get("level") == "L2" for p in predecessors)
             if cited_by_l2:
-                self.ecosystem.nodes[node]['level'] = 'L3'
+                self.ecosystem.nodes[node]["level"] = "L3"
 
     def compute_eigenfactor(self):
         """
@@ -73,7 +75,9 @@ class ADIT:
             eigenfactor_scores = nx.pagerank(self.ecosystem, alpha=0.85, max_iter=100)
         except Exception:
             # If PageRank fails (e.g., convergence error or empty graph), fall back to uniform scores
-            logging.warning("PageRank computation failed, using uniform scores as fallback", exc_info=True)
+            logging.warning(
+                "PageRank computation failed, using uniform scores as fallback", exc_info=True
+            )
             eigenfactor_scores = dict.fromkeys(self.ecosystem.nodes(), 1.0)
         return eigenfactor_scores
 
@@ -99,7 +103,9 @@ class ADIT:
         :return: DataFrame with features
         """
         features = []
-        concat_L1_abs = " ".join([papers_data.get(p, {}).get('abstract', '') for p in self.l1_papers])
+        concat_L1_abs = " ".join(
+            [papers_data.get(p, {}).get("abstract", "") for p in self.l1_papers]
+        )
         theory_emb = self.transformer.encode(concat_L1_abs)
 
         # Compute network centrality measures
@@ -108,25 +114,28 @@ class ADIT:
         except Exception:
             # If betweenness computation fails (resource limit or other issue),
             # assign zero betweenness so downstream feature pipeline continues.
-            logging.warning("Betweenness centrality computation failed, using zero scores as fallback", exc_info=True)
+            logging.warning(
+                "Betweenness centrality computation failed, using zero scores as fallback",
+                exc_info=True,
+            )
             betweenness_scores = dict.fromkeys(self.ecosystem.nodes(), 0.0)
 
         eigenfactor_scores = self.compute_eigenfactor()
 
         # Determine min and max year for dynamic normalization
-        years = [papers_data.get(p, {}).get('year', 2010) for p in papers_data]
+        years = [papers_data.get(p, {}).get("year", 2010) for p in papers_data]
         min_year = min(years) if years else 2010
         max_year = max(years) if years else 2010
         year_range = max_year - min_year if max_year > min_year else 1
 
         for node, data in self.ecosystem.nodes(data=True):
-            if data.get('level') == 'L2':
+            if data.get("level") == "L2":
                 paper_info = papers_data.get(node, {})
-                title = paper_info.get('title', '').lower()
-                abstract = paper_info.get('abstract', '').lower()
-                keywords = paper_info.get('keywords', '').lower()
-                citation_count = paper_info.get('citations', 0)
-                year = paper_info.get('year', 2010)
+                title = paper_info.get("title", "").lower()
+                abstract = paper_info.get("abstract", "").lower()
+                keywords = paper_info.get("keywords", "").lower()
+                citation_count = paper_info.get("citations", 0)
+                year = paper_info.get("year", 2010)
 
                 # 1. Network feature: Eigenfactor_Eco (article-level Eigenfactor)
                 eigenfactor = eigenfactor_scores.get(node, 0.0)
@@ -139,7 +148,7 @@ class ADIT:
                 total_refs = len(list(self.ecosystem.successors(node)))
                 for ref in self.ecosystem.successors(node):
                     ref_data = self.ecosystem.nodes[ref]
-                    if ref_data.get('level') == 'L2':
+                    if ref_data.get("level") == "L2":
                         l2_papers_cited += eigenfactor_scores.get(ref, 0.0)
                 tar = (l2_papers_cited / max(total_refs, 1)) if total_refs > 0 else 0.0
 
@@ -158,17 +167,25 @@ class ADIT:
                 theory_in_abstract = int(theory_name in abstract)
 
                 # 9-11. Theory acronym in title/keywords/abstract (binary)
-                acronym = ''.join([w[0] for w in self.theory_name.split()]).lower()
+                acronym = "".join([w[0] for w in self.theory_name.split()]).lower()
                 acronym_in_title = int(acronym in title)
                 acronym_in_keywords = int(acronym in keywords)
                 acronym_in_abstract = int(acronym in abstract)
 
                 # 12. Key constructs - individual binary flags (example: TAM uses "usefulness", "ease of use")
-                key_constructs = ['usefulness', 'ease of use', 'acceptance', 'intention', 'attitude']
+                key_constructs = [
+                    "usefulness",
+                    "ease of use",
+                    "acceptance",
+                    "intention",
+                    "attitude",
+                ]
                 construct_features = {}
                 for construct in key_constructs:
                     feature_name = f"has_{construct.replace(' ', '_')}"
-                    construct_features[feature_name] = int(construct in title or construct in abstract)
+                    construct_features[feature_name] = int(
+                        construct in title or construct in abstract
+                    )
 
                 # 13. Semantic similarity (modern NLP via embeddings)
                 paper_emb = self.transformer.encode(abstract)
@@ -183,25 +200,27 @@ class ADIT:
                 in_degree = self.ecosystem.in_degree(node)
                 out_degree = self.ecosystem.out_degree(node)
 
-                features.append({
-                    'paper_id': node,
-                    'eigenfactor': eigenfactor,
-                    'betweenness': betweenness,
-                    'theory_attribution_ratio': tar,
-                    'citation_count': citation_count,
-                    'pub_year': pub_year_norm,
-                    'abstract_word_count': word_count,
-                    'theory_in_title': theory_in_title,
-                    'theory_in_keywords': theory_in_keywords,
-                    'theory_in_abstract': theory_in_abstract,
-                    'acronym_in_title': acronym_in_title,
-                    'acronym_in_keywords': acronym_in_keywords,
-                    'acronym_in_abstract': acronym_in_abstract,
-                    **construct_features,  # Unpack individual construct flags
-                    'semantic_similarity': semantic_similarity,
-                    'in_degree': in_degree,
-                    'out_degree': out_degree
-                })
+                features.append(
+                    {
+                        "paper_id": node,
+                        "eigenfactor": eigenfactor,
+                        "betweenness": betweenness,
+                        "theory_attribution_ratio": tar,
+                        "citation_count": citation_count,
+                        "pub_year": pub_year_norm,
+                        "abstract_word_count": word_count,
+                        "theory_in_title": theory_in_title,
+                        "theory_in_keywords": theory_in_keywords,
+                        "theory_in_abstract": theory_in_abstract,
+                        "acronym_in_title": acronym_in_title,
+                        "acronym_in_keywords": acronym_in_keywords,
+                        "acronym_in_abstract": acronym_in_abstract,
+                        **construct_features,  # Unpack individual construct flags
+                        "semantic_similarity": semantic_similarity,
+                        "in_degree": in_degree,
+                        "out_degree": out_degree,
+                    }
+                )
 
         return pd.DataFrame(features)
 
@@ -212,7 +231,7 @@ class ADIT:
         :param features_df: DataFrame with features
         :param labels: List of labels (1: subscribes, 0: not)
         """
-        feature_cols = [col for col in features_df.columns if col != 'paper_id']
+        feature_cols = [col for col in features_df.columns if col != "paper_id"]
         X = features_df[feature_cols]
         y = labels
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -221,10 +240,13 @@ class ADIT:
         print("Classification Report:")
         print(classification_report(y_test, y_pred, zero_division=0))
         print("\nFeature Importance (top 5):")
-        feature_importance = pd.DataFrame({
-            'feature': feature_cols,
-            'importance': self.classifier.feature_importances_
-        }).sort_values('importance', ascending=False).head(5)
+        feature_importance = (
+            pd.DataFrame(
+                {"feature": feature_cols, "importance": self.classifier.feature_importances_}
+            )
+            .sort_values("importance", ascending=False)
+            .head(5)
+        )
         print(feature_importance)
 
     def predict_subscription(self, features_df):
@@ -234,79 +256,80 @@ class ADIT:
         :param features_df: DataFrame with features
         :return: Predictions (1: subscribes, 0: does not)
         """
-        feature_cols = [col for col in features_df.columns if col != 'paper_id']
+        feature_cols = [col for col in features_df.columns if col != "paper_id"]
         X = features_df[feature_cols]
         return self.classifier.predict(X)
+
 
 # Example usage with mock data
 if __name__ == "__main__":
     # Mock L1 papers (TAM originating papers)
-    l1 = ['TAM1', 'TAM2']
+    l1 = ["TAM1", "TAM2"]
 
-    adit = ADIT('TAM', l1)
+    adit = ADIT("TAM", l1)
 
     # Mock citation data: {citing_paper: [cited_papers]}
     citation_data = {
-        'PaperA': ['TAM1'],
-        'PaperB': ['TAM2'],
-        'PaperC': ['TAM1', 'Other'],
-        'PaperD': ['Unrelated'],
-        'PaperE': ['TAM1', 'TAM2']
+        "PaperA": ["TAM1"],
+        "PaperB": ["TAM2"],
+        "PaperC": ["TAM1", "Other"],
+        "PaperD": ["Unrelated"],
+        "PaperE": ["TAM1", "TAM2"],
     }
 
     adit.build_ecosystem(citation_data)
 
     # Mock paper data with all relevant fields
     papers_data = {
-        'PaperA': {
-            'title': 'Extension of Technology Acceptance Model',
-            'abstract': 'This paper extends TAM with new constructs for mobile adoption.',
-            'keywords': 'TAM, technology acceptance, mobile',
-            'citations': 50,
-            'year': 2015
+        "PaperA": {
+            "title": "Extension of Technology Acceptance Model",
+            "abstract": "This paper extends TAM with new constructs for mobile adoption.",
+            "keywords": "TAM, technology acceptance, mobile",
+            "citations": 50,
+            "year": 2015,
         },
-        'PaperB': {
-            'title': 'Empirical test of TAM',
-            'abstract': 'We test TAM in a new context with emphasis on ease of use and usefulness.',
-            'keywords': 'TAM, acceptance, empirical study',
-            'citations': 30,
-            'year': 2012
+        "PaperB": {
+            "title": "Empirical test of TAM",
+            "abstract": "We test TAM in a new context with emphasis on ease of use and usefulness.",
+            "keywords": "TAM, acceptance, empirical study",
+            "citations": 30,
+            "year": 2012,
         },
-        'PaperC': {
-            'title': 'Unrelated topic in information systems',
-            'abstract': 'This paper studies something unrelated to technology acceptance.',
-            'keywords': 'information systems, management',
-            'citations': 10,
-            'year': 2010
+        "PaperC": {
+            "title": "Unrelated topic in information systems",
+            "abstract": "This paper studies something unrelated to technology acceptance.",
+            "keywords": "information systems, management",
+            "citations": 10,
+            "year": 2010,
         },
-        'PaperD': {
-            'title': 'AI and machine learning applications',
-            'abstract': 'Methods for applying machine learning to various domains.',
-            'keywords': 'machine learning, AI',
-            'citations': 5,
-            'year': 2018
+        "PaperD": {
+            "title": "AI and machine learning applications",
+            "abstract": "Methods for applying machine learning to various domains.",
+            "keywords": "machine learning, AI",
+            "citations": 5,
+            "year": 2018,
         },
-        'PaperE': {
-            'title': 'TAM in healthcare: Ease of use and behavioral intention',
-            'abstract': 'Applies TAM to understand healthcare technology adoption with focus on usefulness.',
-            'keywords': 'TAM, acceptance, healthcare, behavioral intention',
-            'citations': 25,
-            'year': 2014
+        "PaperE": {
+            "title": "TAM in healthcare: Ease of use and behavioral intention",
+            "abstract": "Applies TAM to understand healthcare technology adoption with focus on usefulness.",
+            "keywords": "TAM, acceptance, healthcare, behavioral intention",
+            "citations": 25,
+            "year": 2014,
         },
-        'TAM1': {
-            'title': 'Technology Acceptance Model',
-            'abstract': 'Original TAM paper proposing model of technology acceptance.',
-            'keywords': 'TAM, acceptance, technology',
-            'citations': 1000,
-            'year': 1989
+        "TAM1": {
+            "title": "Technology Acceptance Model",
+            "abstract": "Original TAM paper proposing model of technology acceptance.",
+            "keywords": "TAM, acceptance, technology",
+            "citations": 1000,
+            "year": 1989,
         },
-        'TAM2': {
-            'title': 'Technology Acceptance Model extension',
-            'abstract': 'Extension of TAM with more constructs.',
-            'keywords': 'TAM, acceptance',
-            'citations': 500,
-            'year': 1992
-        }
+        "TAM2": {
+            "title": "Technology Acceptance Model extension",
+            "abstract": "Extension of TAM with more constructs.",
+            "keywords": "TAM, acceptance",
+            "citations": 500,
+            "year": 1992,
+        },
     }
 
     # Extract features for all L2 papers
@@ -317,18 +340,18 @@ if __name__ == "__main__":
 
     # Mock labels keyed by paper_id (1: subscribes to TAM, 0: does not)
     label_map = {
-        'PaperA': 1,  # extends TAM
-        'PaperB': 1,  # tests TAM
-        'PaperC': 0,  # unrelated
-        'PaperD': 0,  # unrelated (may not be in extracted L2 set)
-        'PaperE': 1,  # applies TAM
+        "PaperA": 1,  # extends TAM
+        "PaperB": 1,  # tests TAM
+        "PaperC": 0,  # unrelated
+        "PaperD": 0,  # unrelated (may not be in extracted L2 set)
+        "PaperE": 1,  # applies TAM
     }
-    labels = [label_map.get(paper_id, 0) for paper_id in features['paper_id']]
+    labels = [label_map.get(paper_id, 0) for paper_id in features["paper_id"]]
 
     print("\n=== Training Classifier ===")
     adit.train_classifier(features, labels)
 
     print("\n=== Predictions ===")
     predictions = adit.predict_subscription(features)
-    for i, paper_id in enumerate(features['paper_id']):
+    for i, paper_id in enumerate(features["paper_id"]):
         print(f"{paper_id}: {'Subscribes' if predictions[i] == 1 else 'Does not subscribe'}")
