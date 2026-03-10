@@ -10,14 +10,16 @@ from sklearn.model_selection import train_test_split
 
 
 class ADIT:
-    def __init__(self, theory_name, l1_papers, transformer=None):
+    def __init__(self, theory_name, l1_papers, transformer=None, acronym=None):
         """
         Initialize ADIT for a specific theory.
 
         :param theory_name: Name of the theory (e.g., 'TAM')
         :param l1_papers: List of originating paper IDs or titles
+        :param acronym: Optional explicit acronym (e.g., 'TAM'). If omitted, derived from theory_name.
         """
         self.theory_name = theory_name
+        self.acronym = acronym.lower() if acronym else "".join(w[0] for w in theory_name.split()).lower()
         self.l1_papers = l1_papers
         self.ecosystem = nx.DiGraph()
         # Dependency injection: accept an optional transformer for easier testing
@@ -167,7 +169,7 @@ class ADIT:
                 theory_in_abstract = int(theory_name in abstract)
 
                 # 9-11. Theory acronym in title/keywords/abstract (binary)
-                acronym = "".join([w[0] for w in self.theory_name.split()]).lower()
+                acronym = self.acronym
                 acronym_in_title = int(acronym in title)
                 acronym_in_keywords = int(acronym in keywords)
                 acronym_in_abstract = int(acronym in abstract)

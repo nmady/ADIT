@@ -3,6 +3,8 @@ networkx
 pandas
 numpy
 sentence-transformers
+typer
+pyyaml
 pytest>=7.0
 pytest-mock
 ruff

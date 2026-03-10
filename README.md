@@ -19,15 +19,48 @@ ADIT uses machine learning to identify papers that subscribe to a specific theor
 
 ## Usage
 
-1. Define the theory's originating papers.
-2. Collect citation data (manually or via APIs).
-3. Run the ecosystem builder.
-4. Train the classifier on labeled data.
-5. Predict subscribing papers.
+### Typer CLI
+
+The project includes a Typer-based interface in `cli.py`.
+
+Run with direct command-line arguments:
+
+```bash
+python cli.py \
+	--theory-name "Technology Acceptance Model" \
+	--acronym TAM \
+	--l1-papers "TAM1,TAM2" \
+	--citation-data citation_data.json \
+	--papers-data papers_data.json \
+	--labels-data labels_data.json \
+	--output-features outputs/features.csv \
+	--output-predictions outputs/predictions.csv
+```
+
+Run with a config file instead:
+
+```bash
+python cli.py --config config.yml
+```
+
+Example `config.yml`:
+
+```yaml
+theory_name: Technology Acceptance Model
+acronym: TAM
+l1_papers: [TAM1, TAM2]
+citation_data: citation_data.json
+papers_data: papers_data.json
+labels_data: labels_data.json
+output_features: outputs/features.csv
+output_predictions: outputs/predictions.csv
+```
+
+If `labels_data` is omitted, the CLI extracts features and skips training/prediction.
 
 ## Adaptation Notes
 
-- Replaces traditional ML with transformer-based embeddings for text analysis.
+- Augments traditional ML with transformer-based embeddings for text analysis.
 - Uses NetworkX for graph analysis.
 - Extensible to other theories and datasets.
 

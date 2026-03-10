@@ -53,6 +53,8 @@ dependencies = [
     "pandas",
     "numpy",
     "sentence-transformers",
+    "typer",
+    "pyyaml",
 ]
 
 [project.optional-dependencies]
