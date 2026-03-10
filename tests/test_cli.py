@@ -8,6 +8,7 @@ import pandas as pd
 from typer.testing import CliRunner
 
 import cli
+import re
 
 
 class FakeADIT:
@@ -104,6 +105,7 @@ def test_cli_run_with_direct_args_and_labels(tmp_path, monkeypatch):
             "--output-predictions",
             str(predictions_out),
         ],
+        color=False,
     )
 
     assert result.exit_code == 0, result.output
@@ -242,11 +244,13 @@ def test_cli_requires_theory_and_data(tmp_path):
     """CLI should fail with a clear message when required inputs are missing."""
     result = runner.invoke(cli.app, [])
     assert result.exit_code != 0
-    assert "Provide L1 papers via --l1-papers or --l1-file" in result.output
+    clean_output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    assert "Provide L1 papers via --l1-papers or --l1-file" in clean_output
 
     config_file = tmp_path / "bad_config.json"
     _write_json(config_file, {"theory_name": "Only Theory"})
 
     result2 = runner.invoke(cli.app, ["--config", str(config_file), "--l1-papers", "TAM1"])
     assert result2.exit_code != 0
-    assert "citation_data path is required" in result2.output
+    clean_output2 = re.sub(r"\x1b\[[0-9;]*m", "", result2.output)
+    assert "citation_data path is required" in clean_output2
