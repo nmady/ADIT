@@ -9,7 +9,48 @@ from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
 
 
+# Public helper and stopword list for acronym derivation. Exported so tests
+# and lightweight test doubles can reuse the exact same logic without
+# duplicating definitions.
+ACRONYM_STOPWORDS = {
+    "a",
+    "an",
+    "the",
+    "of",
+    "in",
+    "on",
+    "at",
+    "to",
+    "from",
+    "by",
+    "with",
+    "for",
+    "as",
+    "about",
+    "and",
+    "or",
+    "but",
+    "is",
+    "are",
+}
+
+
+def derive_acronym(theory_name: str) -> str:
+    """Derive a deterministic acronym from a theory name.
+
+    Strategy: ignore common minor words (stopwords) when deriving the
+    acronym. If removing stopwords leaves no words, fall back to using the
+    original words so the output is never empty.
+    """
+    words = theory_name.split()
+    content_words = [w for w in words if w.lower() not in ACRONYM_STOPWORDS]
+    selected_words = content_words or words
+    return "".join(w[0] for w in selected_words).lower()
+
+
 class ADIT:
+    pass
+
     def __init__(self, theory_name, l1_papers, transformer=None, acronym=None):
         """
         Initialize ADIT for a specific theory.
@@ -19,9 +60,7 @@ class ADIT:
         :param acronym: Optional explicit acronym (e.g., 'TAM'). If omitted, derived from theory_name.
         """
         self.theory_name = theory_name
-        self.acronym = (
-            acronym.lower() if acronym else "".join(w[0] for w in theory_name.split()).lower()
-        )
+        self.acronym = acronym.lower() if acronym else derive_acronym(theory_name)
         self.l1_papers = l1_papers
         self.ecosystem = nx.DiGraph()
         # Dependency injection: accept an optional transformer for easier testing

@@ -1,6 +1,7 @@
 """Tests for Typer CLI argument and config-file execution paths."""
 
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -8,7 +9,7 @@ import pandas as pd
 from typer.testing import CliRunner
 
 import cli
-import re
+from adit import derive_acronym
 
 
 class FakeADIT:
@@ -19,9 +20,7 @@ class FakeADIT:
     def __init__(self, theory_name, l1_papers, acronym=None):
         self.theory_name = theory_name
         self.l1_papers = l1_papers
-        self.acronym = (
-            acronym.lower() if acronym else "".join(w[0] for w in theory_name.split()).lower()
-        )
+        self.acronym = acronym.lower() if acronym else derive_acronym(theory_name)
         self.trained = False
         FakeADIT.last_instance = self
 
