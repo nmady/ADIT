@@ -8,7 +8,6 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
 
-
 # Public helper and stopword list for acronym derivation. Exported so tests
 # and lightweight test doubles can reuse the exact same logic without
 # duplicating definitions.

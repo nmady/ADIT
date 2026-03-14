@@ -3,6 +3,7 @@
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -253,3 +254,79 @@ def test_cli_requires_theory_and_data(tmp_path):
     assert result2.exit_code != 0
     clean_output2 = re.sub(r"\x1b\[[0-9;]*m", "", result2.output)
     assert "citation_data path is required" in clean_output2
+
+
+def test_cli_online_mode_uses_ingestion_without_local_files(monkeypatch):
+    """Online mode should ingest citation inputs without requiring local JSON paths."""
+    monkeypatch.setattr(cli, "ADIT", FakeADIT)
+
+    def fake_ingest(**kwargs):
+        assert kwargs["theory_name"] == "Technology Acceptance Model"
+        assert kwargs["l1_papers"] == ["TAM1", "TAM2"]
+        assert kwargs["depth"] == "l2"
+        assert kwargs["sources"] == ["openalex", "crossref"]
+        return SimpleNamespace(
+            citation_data={"PaperA": ["TAM1"]},
+            papers_data={
+                "PaperA": {
+                    "title": "A",
+                    "abstract": "a",
+                    "keywords": "k",
+                    "citations": 1,
+                    "year": 2010,
+                },
+                "TAM1": {
+                    "title": "TAM",
+                    "abstract": "foundation",
+                    "keywords": "tam",
+                    "citations": 100,
+                    "year": 1990,
+                },
+            },
+            metadata={"paper_count": 2, "edge_count": 1},
+        )
+
+    monkeypatch.setattr(cli, "ingest_from_internet", fake_ingest)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "--online",
+            "--theory-name",
+            "Technology Acceptance Model",
+            "--l1-papers",
+            "TAM1,TAM2",
+            "--sources",
+            "openalex,crossref",
+            "--depth",
+            "l2",
+        ],
+        color=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Online ingestion complete:" in result.output
+    assert "Extracted 2 L2 feature rows." in result.output
+
+
+def test_cli_online_mode_rejects_invalid_depth(monkeypatch):
+    """Online mode should validate supported depth values."""
+    monkeypatch.setattr(cli, "ADIT", FakeADIT)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "--online",
+            "--theory-name",
+            "Technology Acceptance Model",
+            "--l1-papers",
+            "TAM1,TAM2",
+            "--depth",
+            "bad-depth",
+        ],
+        color=False,
+    )
+
+    assert result.exit_code != 0
+    clean_output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    assert "depth must be either 'l2' or 'l2l3'" in clean_output

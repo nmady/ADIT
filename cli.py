@@ -6,8 +6,59 @@ import pandas as pd
 import typer
 
 from adit import ADIT
+from citation_ingestion import ingest_from_internet
 
 app = typer.Typer(help="ADIT CLI: run with direct arguments or a config file.")
+
+CONFIG_OPTION = typer.Option(None, help="Path to JSON/YAML config file.")
+THEORY_NAME_OPTION = typer.Option(None, help="Theory name, e.g. 'Technology Acceptance Model'.")
+ACRONYM_OPTION = typer.Option(None, help="Optional explicit acronym, e.g. 'TAM'.")
+L1_PAPERS_OPTION = typer.Option(
+    None, help="Comma-separated L1 paper IDs/titles (alternative to --l1-file)."
+)
+L1_FILE_OPTION = typer.Option(None, help="Path to newline-separated L1 papers file.")
+CITATION_DATA_OPTION = typer.Option(None, help="Path to citation JSON dict.")
+PAPERS_DATA_OPTION = typer.Option(None, help="Path to paper metadata JSON dict.")
+LABELS_DATA_OPTION = typer.Option(
+    None, help="Optional labels JSON (dict by paper_id, or list aligned to extracted features)."
+)
+ONLINE_OPTION = typer.Option(
+    False,
+    "--online",
+    help="Fetch citation data and metadata from internet providers instead of local JSON files.",
+)
+SOURCES_OPTION = typer.Option(
+    None,
+    help="Comma-separated providers for online mode: openalex,semantic_scholar,crossref.",
+)
+DEPTH_OPTION = typer.Option("l2l3", help="Online expansion depth: l2 or l2l3.")
+KEY_CONSTRUCTS_OPTION = typer.Option(
+    None,
+    help="Optional comma-separated key constructs to improve online retrieval relevance.",
+)
+CACHE_DIR_OPTION = typer.Option(None, help="Optional cache directory for online ingestion.")
+REFRESH_CACHE_OPTION = typer.Option(
+    False,
+    help="Ignore ingestion cache and force fresh network retrieval in online mode.",
+)
+MAX_L2_OPTION = typer.Option(
+    200,
+    help="Maximum L2 papers to retrieve per provider in online mode.",
+)
+MAX_L3_OPTION = typer.Option(
+    500,
+    help="Maximum L3 reference edges to retrieve per provider in online mode.",
+)
+SAVE_INGESTED_CITATION_OPTION = typer.Option(
+    None,
+    help="Optional output path to persist online-ingested citation_data JSON.",
+)
+SAVE_INGESTED_PAPERS_OPTION = typer.Option(
+    None,
+    help="Optional output path to persist online-ingested papers_data JSON.",
+)
+OUTPUT_FEATURES_OPTION = typer.Option(None, help="Optional CSV path for extracted features.")
+OUTPUT_PREDICTIONS_OPTION = typer.Option(None, help="Optional CSV path for predictions.")
 
 
 def _load_config(config_path: Optional[Path]) -> Dict[str, Any]:
@@ -72,80 +123,204 @@ def _resolve_labels(labels_data: Any, features: pd.DataFrame) -> List[int]:
     raise typer.BadParameter("labels_data must be either a JSON list or dict.")
 
 
+def _resolve_cli_inputs(
+    cfg: Dict[str, Any],
+    theory_name: Optional[str],
+    acronym: Optional[str],
+    l1_papers: Optional[str],
+    l1_file: Optional[Path],
+    citation_data: Optional[Path],
+    papers_data: Optional[Path],
+    labels_data: Optional[Path],
+    sources: Optional[str],
+    depth: str,
+    key_constructs: Optional[str],
+    cache_dir: Optional[Path],
+    refresh_cache: bool,
+    max_l2: int,
+    max_l3: int,
+    save_ingested_citation_data: Optional[Path],
+    save_ingested_papers_data: Optional[Path],
+    output_features: Optional[Path],
+    output_predictions: Optional[Path],
+    online: bool,
+) -> Dict[str, Any]:
+    l1_cfg = cfg.get("l1_papers")
+    l1_cfg_str = ",".join(l1_cfg) if isinstance(l1_cfg, list) else None
+    resolved_l1_file = l1_file or (Path(cfg["l1_file"]) if cfg.get("l1_file") else None)
+
+    return {
+        "theory_name": theory_name or cfg.get("theory_name"),
+        "acronym": acronym or cfg.get("acronym"),
+        "l1": _parse_l1(l1_papers or l1_cfg_str, resolved_l1_file),
+        "citation_data_path": citation_data
+        or (Path(cfg["citation_data"]) if cfg.get("citation_data") else None),
+        "papers_data_path": papers_data
+        or (Path(cfg["papers_data"]) if cfg.get("papers_data") else None),
+        "labels_data_path": labels_data
+        or (Path(cfg["labels_data"]) if cfg.get("labels_data") else None),
+        "output_features": output_features
+        or (Path(cfg["output_features"]) if cfg.get("output_features") else None),
+        "output_predictions": output_predictions
+        or (Path(cfg["output_predictions"]) if cfg.get("output_predictions") else None),
+        "online": bool(online or cfg.get("online", False)),
+        "sources": sources or cfg.get("sources"),
+        "depth": (depth or cfg.get("depth") or "l2l3").lower(),
+        "key_constructs": key_constructs or cfg.get("key_constructs"),
+        "cache_dir": cache_dir or (Path(cfg["cache_dir"]) if cfg.get("cache_dir") else None),
+        "refresh_cache": bool(refresh_cache or cfg.get("refresh_cache", False)),
+        "max_l2": int(cfg.get("max_l2", max_l2)),
+        "max_l3": int(cfg.get("max_l3", max_l3)),
+        "save_ingested_citation_data": save_ingested_citation_data
+        or (
+            Path(cfg["save_ingested_citation_data"])
+            if cfg.get("save_ingested_citation_data")
+            else None
+        ),
+        "save_ingested_papers_data": save_ingested_papers_data
+        or (
+            Path(cfg["save_ingested_papers_data"]) if cfg.get("save_ingested_papers_data") else None
+        ),
+    }
+
+
+def _persist_json(path: Path, payload: Dict[str, Any], label: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    typer.echo(f"Saved {label} to {path}")
+
+
+def _load_pipeline_inputs(params: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    if params["online"]:
+        selected_sources = [
+            item.strip()
+            for item in (params["sources"] or "openalex,semantic_scholar,crossref").split(",")
+            if item.strip()
+        ]
+        constructs = [
+            item.strip() for item in (params["key_constructs"] or "").split(",") if item.strip()
+        ]
+        if params["depth"] not in {"l2", "l2l3"}:
+            raise typer.BadParameter("depth must be either 'l2' or 'l2l3' in online mode.")
+
+        ingestion = ingest_from_internet(
+            theory_name=params["theory_name"],
+            l1_papers=params["l1"],
+            key_constructs=constructs,
+            sources=selected_sources,
+            depth=params["depth"],
+            cache_dir=params["cache_dir"],
+            refresh=params["refresh_cache"],
+            max_l2=params["max_l2"],
+            max_l3=params["max_l3"],
+        )
+        typer.echo(
+            "Online ingestion complete: "
+            f"papers={ingestion.metadata.get('paper_count', 0)} "
+            f"edges={ingestion.metadata.get('edge_count', 0)} "
+            f"sources={','.join(selected_sources)}"
+        )
+
+        if params["save_ingested_citation_data"]:
+            _persist_json(
+                params["save_ingested_citation_data"],
+                ingestion.citation_data,
+                "ingested citation_data",
+            )
+        if params["save_ingested_papers_data"]:
+            _persist_json(
+                params["save_ingested_papers_data"],
+                ingestion.papers_data,
+                "ingested papers_data",
+            )
+        return ingestion.citation_data, ingestion.papers_data
+
+    if not params["citation_data_path"]:
+        raise typer.BadParameter("citation_data path is required (CLI arg or config).")
+    if not params["papers_data_path"]:
+        raise typer.BadParameter("papers_data path is required (CLI arg or config).")
+
+    return (
+        _load_json_dict(params["citation_data_path"], "citation_data"),
+        _load_json_dict(params["papers_data_path"], "papers_data"),
+    )
+
+
 @app.command()
 def run(
-    config: Optional[Path] = typer.Option(None, help="Path to JSON/YAML config file."),
-    theory_name: Optional[str] = typer.Option(
-        None, help="Theory name, e.g. 'Technology Acceptance Model'."
-    ),
-    acronym: Optional[str] = typer.Option(None, help="Optional explicit acronym, e.g. 'TAM'."),
-    l1_papers: Optional[str] = typer.Option(
-        None, help="Comma-separated L1 paper IDs/titles (alternative to --l1-file)."
-    ),
-    l1_file: Optional[Path] = typer.Option(None, help="Path to newline-separated L1 papers file."),
-    citation_data: Optional[Path] = typer.Option(None, help="Path to citation JSON dict."),
-    papers_data: Optional[Path] = typer.Option(None, help="Path to paper metadata JSON dict."),
-    labels_data: Optional[Path] = typer.Option(
-        None, help="Optional labels JSON (dict by paper_id, or list aligned to extracted features)."
-    ),
-    output_features: Optional[Path] = typer.Option(
-        None, help="Optional CSV path for extracted features."
-    ),
-    output_predictions: Optional[Path] = typer.Option(
-        None, help="Optional CSV path for predictions."
-    ),
+    config: Optional[Path] = CONFIG_OPTION,
+    theory_name: Optional[str] = THEORY_NAME_OPTION,
+    acronym: Optional[str] = ACRONYM_OPTION,
+    l1_papers: Optional[str] = L1_PAPERS_OPTION,
+    l1_file: Optional[Path] = L1_FILE_OPTION,
+    citation_data: Optional[Path] = CITATION_DATA_OPTION,
+    papers_data: Optional[Path] = PAPERS_DATA_OPTION,
+    labels_data: Optional[Path] = LABELS_DATA_OPTION,
+    online: bool = ONLINE_OPTION,
+    sources: Optional[str] = SOURCES_OPTION,
+    depth: str = DEPTH_OPTION,
+    key_constructs: Optional[str] = KEY_CONSTRUCTS_OPTION,
+    cache_dir: Optional[Path] = CACHE_DIR_OPTION,
+    refresh_cache: bool = REFRESH_CACHE_OPTION,
+    max_l2: int = MAX_L2_OPTION,
+    max_l3: int = MAX_L3_OPTION,
+    save_ingested_citation_data: Optional[Path] = SAVE_INGESTED_CITATION_OPTION,
+    save_ingested_papers_data: Optional[Path] = SAVE_INGESTED_PAPERS_OPTION,
+    output_features: Optional[Path] = OUTPUT_FEATURES_OPTION,
+    output_predictions: Optional[Path] = OUTPUT_PREDICTIONS_OPTION,
 ) -> None:
     """Run ADIT using CLI values and/or a config file."""
     cfg = _load_config(config)
 
-    theory_name = theory_name or cfg.get("theory_name")
-    acronym = acronym or cfg.get("acronym")
-
-    l1_cfg = cfg.get("l1_papers")
-    l1_cfg_str = ",".join(l1_cfg) if isinstance(l1_cfg, list) else None
-    l1_file = l1_file or (Path(cfg["l1_file"]) if cfg.get("l1_file") else None)
-    l1 = _parse_l1(l1_papers or l1_cfg_str, l1_file)
-
-    citation_data_path = citation_data or (
-        Path(cfg["citation_data"]) if cfg.get("citation_data") else None
+    params = _resolve_cli_inputs(
+        cfg,
+        theory_name,
+        acronym,
+        l1_papers,
+        l1_file,
+        citation_data,
+        papers_data,
+        labels_data,
+        sources,
+        depth,
+        key_constructs,
+        cache_dir,
+        refresh_cache,
+        max_l2,
+        max_l3,
+        save_ingested_citation_data,
+        save_ingested_papers_data,
+        output_features,
+        output_predictions,
+        online,
     )
-    papers_data_path = papers_data or (Path(cfg["papers_data"]) if cfg.get("papers_data") else None)
-    labels_data_path = labels_data or (Path(cfg["labels_data"]) if cfg.get("labels_data") else None)
 
-    output_features = output_features or (
-        Path(cfg["output_features"]) if cfg.get("output_features") else None
-    )
-    output_predictions = output_predictions or (
-        Path(cfg["output_predictions"]) if cfg.get("output_predictions") else None
-    )
-
-    if not theory_name:
+    if not params["theory_name"]:
         raise typer.BadParameter("theory_name is required (CLI arg or config).")
-    if not citation_data_path:
-        raise typer.BadParameter("citation_data path is required (CLI arg or config).")
-    if not papers_data_path:
-        raise typer.BadParameter("papers_data path is required (CLI arg or config).")
 
-    citation_dict = _load_json_dict(citation_data_path, "citation_data")
-    papers_dict = _load_json_dict(papers_data_path, "papers_data")
+    citation_dict, papers_dict = _load_pipeline_inputs(params)
 
-    adit = ADIT(theory_name=theory_name, l1_papers=l1, acronym=acronym)
+    adit = ADIT(
+        theory_name=params["theory_name"],
+        l1_papers=params["l1"],
+        acronym=params["acronym"],
+    )
     adit.build_ecosystem(citation_dict)
     features = adit.extract_features(papers_dict)
 
     typer.echo(f"Extracted {len(features)} L2 feature rows.")
-    typer.echo(f"Using theory='{theory_name}' acronym='{adit.acronym}'")
+    typer.echo(f"Using theory='{params['theory_name']}' acronym='{adit.acronym}'")
 
-    if output_features:
-        output_features.parent.mkdir(parents=True, exist_ok=True)
-        features.to_csv(output_features, index=False)
-        typer.echo(f"Saved features to {output_features}")
+    if params["output_features"]:
+        params["output_features"].parent.mkdir(parents=True, exist_ok=True)
+        features.to_csv(params["output_features"], index=False)
+        typer.echo(f"Saved features to {params['output_features']}")
 
-    if not labels_data_path:
+    if not params["labels_data_path"]:
         typer.echo("No labels_data provided; skipped training/prediction.")
         return
 
-    labels_raw = json.loads(labels_data_path.read_text(encoding="utf-8"))
+    labels_raw = json.loads(params["labels_data_path"].read_text(encoding="utf-8"))
     labels = _resolve_labels(labels_raw, features)
     adit.train_classifier(features, labels)
     predictions = adit.predict_subscription(features)
@@ -153,10 +328,10 @@ def run(
     predictions_df = pd.DataFrame({"paper_id": features["paper_id"], "prediction": predictions})
     typer.echo(f"Generated {len(predictions_df)} predictions.")
 
-    if output_predictions:
-        output_predictions.parent.mkdir(parents=True, exist_ok=True)
-        predictions_df.to_csv(output_predictions, index=False)
-        typer.echo(f"Saved predictions to {output_predictions}")
+    if params["output_predictions"]:
+        params["output_predictions"].parent.mkdir(parents=True, exist_ok=True)
+        predictions_df.to_csv(params["output_predictions"], index=False)
+        typer.echo(f"Saved predictions to {params['output_predictions']}")
     else:
         typer.echo(predictions_df.to_string(index=False))
 
