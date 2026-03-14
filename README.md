@@ -75,6 +75,8 @@ output_predictions: outputs/predictions.csv
 
 Example online-ingestion config:
 
+See `examples/online-ingestion.config.yml` for a ready-to-edit copy.
+
 ```yaml
 theory_name: Technology Acceptance Model
 acronym: TAM

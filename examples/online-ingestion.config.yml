@@ -1,0 +1,22 @@
+theory_name: Technology Acceptance Model
+acronym: TAM
+l1_papers:
+  - 10.2307/249008
+  - 10.1287/mnsc.35.8.982
+online: true
+sources:
+  - openalex
+  - semantic_scholar
+  - crossref
+depth: l2l3
+key_constructs:
+  - usefulness
+  - ease of use
+  - behavioral intention
+cache_dir: .cache/adit_ingestion
+refresh_cache: false
+max_l2: 100
+max_l3: 250
+save_ingested_citation_data: outputs/citation_data.json
+save_ingested_papers_data: outputs/papers_data.json
+output_features: outputs/features.csv
