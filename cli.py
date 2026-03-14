@@ -196,14 +196,16 @@ def _load_pipeline_inputs(params: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[
         if isinstance(raw_sources, list):
             selected_sources = [s.strip() for s in raw_sources if s and s.strip()]
         else:
-            selected_sources = [item.strip() for item in str(raw_sources).split(",") if item.strip()]
+            selected_sources = [
+                item.strip() for item in str(raw_sources).split(",") if item.strip()
+            ]
 
         raw_constructs = params.get("key_constructs") or ""
         if isinstance(raw_constructs, list):
             constructs = [s.strip() for s in raw_constructs if s and s.strip()]
         else:
             constructs = [item.strip() for item in str(raw_constructs).split(",") if item.strip()]
-        
+
         if params["depth"] not in {"l2", "l2l3"}:
             raise typer.BadParameter("depth must be either 'l2' or 'l2l3' in online mode.")
 

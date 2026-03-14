@@ -112,6 +112,121 @@ If `labels_data` is omitted, the CLI extracts features and skips training/predic
 - `--save-ingested-citation-data` and `--save-ingested-papers-data` let you persist normalized outputs for offline replay.
 - Tests do not rely on live provider calls; the internet ingestion path is covered with mocked fixtures.
 
+### `citation_data.json` Format
+
+`citation_data.json` is a JSON object (dictionary) where:
+
+- Each key is a citing paper ID.
+- Each value is a JSON array of cited paper IDs.
+- IDs are treated as opaque strings (for example DOI strings, local IDs like `TAM1`, or provider IDs like `openalex:W1708393801`).
+
+Shape:
+
+```json
+{
+	"<citing_paper_id>": ["<cited_paper_id>", "<cited_paper_id>", "..."],
+	"<another_citing_paper_id>": []
+}
+```
+
+Minimal offline example:
+
+```json
+{
+	"PaperA": ["TAM1", "PaperX"],
+	"PaperB": ["TAM2"],
+	"PaperC": []
+}
+```
+
+Provider-ingested example (what online mode writes):
+
+```json
+{
+	"openalex:W1708393801": [
+		"openalex:W134333820",
+		"openalex:W1483247443"
+	],
+	"openalex:W2337589995": []
+}
+```
+
+Behavior and expectations:
+
+- Edge direction is `citing -> cited`.
+- Empty lists are valid and mean "paper known, no references captured."
+- Cited IDs do not need to exist as top-level keys; ADIT creates nodes for them when building the graph.
+- The file must be a JSON object, not a list.
+- When running offline mode, this file is required via `--citation-data` (or `citation_data` in config).
+
+### `papers_data.json` Format
+
+`papers_data.json` is a JSON object (dictionary) keyed by paper ID, where each value is a metadata object.
+
+Shape:
+
+```json
+{
+	"<paper_id>": {
+		"title": "<string>",
+		"abstract": "<string>",
+		"keywords": "<string>",
+		"citations": 0,
+		"year": null
+	}
+}
+```
+
+If year is unknown, prefer `null`:
+
+```json
+{
+	"<paper_id>": {
+		"title": "<string>",
+		"abstract": "<string>",
+		"keywords": "<string>",
+		"citations": 0,
+		"year": null
+	}
+}
+```
+
+Minimal offline example:
+
+```json
+{
+	"TAM1": {
+		"title": "Technology Acceptance Model",
+		"abstract": "Original TAM paper.",
+		"keywords": "TAM, acceptance",
+		"citations": 1000,
+		"year": 1989
+	},
+	"PaperA": {
+		"title": "Extension of Technology Acceptance Model",
+		"abstract": "This paper extends TAM in a new context.",
+		"keywords": "TAM, technology acceptance",
+		"citations": 50,
+		"year": 2015
+	}
+}
+```
+
+Behavior and expectations:
+
+- Keys should use the same ID namespace as `citation_data.json` for correct graph-to-metadata joins.
+- Missing fields are tolerated; ADIT applies defaults during feature extraction:
+	- `title`, `abstract`, `keywords` default to empty string.
+	- `citations` defaults to `0`.
+	- `year` is treated as unknown when missing/invalid (`null` recommended in JSON).
+- Publication-year normalization is computed only from known years present in the dataset.
+- For papers with unknown year, `pub_year` is emitted as missing (`NaN`) in extracted features.
+- During classifier train/predict, missing numeric feature values (including `pub_year`) are imputed with the training-set median.
+- `keywords` is currently treated as a plain string and searched with substring checks.
+- Extra fields are allowed and ignored by the current feature extractor.
+- When running offline mode, this file is required via `--papers-data` (or `papers_data` in config).
+- In online mode, this file is generated when using `--save-ingested-papers-data`.
+
 ## Adaptation Notes
 
 - Augments traditional ML with transformer-based embeddings for text analysis.
