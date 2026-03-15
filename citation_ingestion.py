@@ -484,7 +484,9 @@ class OpenAlexProvider(CitationProvider):
                 if not ref_id:
                     continue
                 edges.setdefault(pid, set()).add(ref_id)
-                papers.setdefault(ref_id, IngestionPaper(paper_id=ref_id, doi=_doi_from_identifier(ref_id)))
+                papers.setdefault(
+                    ref_id, IngestionPaper(paper_id=ref_id, doi=_doi_from_identifier(ref_id))
+                )
                 budget -= 1
             time.sleep(0.03)
 

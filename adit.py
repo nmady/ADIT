@@ -9,7 +9,6 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
 
-
 # Public helper and stopword list for acronym derivation. Exported so tests
 # and lightweight test doubles can reuse the exact same logic without
 # duplicating definitions.
@@ -183,7 +182,9 @@ class ADIT:
 
         # Determine min and max year for dynamic normalization using only known years.
         known_years = [
-            yr for yr in (_coerce_year(meta.get("year")) for meta in papers_data.values()) if yr is not None
+            yr
+            for yr in (_coerce_year(meta.get("year")) for meta in papers_data.values())
+            if yr is not None
         ]
         min_year = min(known_years) if known_years else 0.0
         max_year = max(known_years) if known_years else 0.0
@@ -329,7 +330,9 @@ class ADIT:
         :return: Predictions (1: subscribes, 0: does not)
         """
         # Prefer training-time schema; fall back only when predict is called before train.
-        feature_cols = self._feature_cols or [col for col in features_df.columns if col != "paper_id"]
+        feature_cols = self._feature_cols or [
+            col for col in features_df.columns if col != "paper_id"
+        ]
         X = features_df[feature_cols]
         X_imputed = self.imputer.transform(X)
         return self.classifier.predict(X_imputed)
