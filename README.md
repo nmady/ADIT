@@ -227,6 +227,35 @@ Behavior and expectations:
 - When running offline mode, this file is required via `--papers-data` (or `papers_data` in config).
 - In online mode, this file is generated when using `--save-ingested-papers-data`.
 
+## Config reference
+
+A compact reference for keys accepted in config files (and equivalent CLI flags). Types shown as (type, default).
+
+- **theory_name**: (string, required) — Human-readable theory name used for keyword matching and acronym derivation. CLI: `--theory-name`.
+- **acronym**: (string, optional) — Explicit acronym to search for (e.g., `TAM`). If omitted, derived from `theory_name`.
+- **l1_papers**: (list|string, required) — L1 seed papers. In YAML provide a list, or use comma-separated string on CLI. Example: `[TAM1, TAM2]` or `--l1-papers "TAM1,TAM2"`.
+- **l1_file**: (path, optional) — Path to newline-separated file of L1 paper IDs (alternative to `l1_papers`).
+- **citation_data** / **citation_data**: (path, optional) — Offline `citation_data.json` path. Required when `online: false`.
+- **papers_data**: (path, optional) — Offline `papers_data.json` path. Required when `online: false`.
+- **labels_data**: (path, optional) — Labels file (JSON list aligned to features or dict by paper_id) used for training.
+- **online**: (bool, default: false) — When true, fetch citation and paper metadata from online providers instead of local JSON.
+- **sources**: (list|string, default: [openalex, semantic_scholar, crossref]) — Providers to query in online mode. Accepts YAML lists or comma-separated strings on CLI.
+- **depth**: (string, default: l2l3) — Ingestion expansion depth: `l2` or `l2l3`.
+- **key_constructs**: (list|string, optional) — Additional keywords to bias provider search relevance. Accepts YAML lists or comma-separated strings.
+- **cache_dir**: (path, default: .cache/adit_ingestion) — Directory to cache provider responses and merged ingestion payloads.
+- **refresh_cache**: (bool, default: false) — If true, ignore cached ingestion and force fresh retrieval.
+- **max_l2**: (int, default: 200) — Per-provider cap on L2 candidates requested from each source (effective per-provider limit may be lower due to provider caps).
+- **max_l3**: (int, default: 500) — Per-provider cap on L3 reference edges retrieved when expanding L2 → L3.
+- **save_ingested_citation_data**: (path, optional) — Persist normalized `citation_data.json` produced by online ingestion.
+- **save_ingested_papers_data**: (path, optional) — Persist normalized `papers_data.json` produced by online ingestion.
+- **output_features**: (path, optional) — CSV path to write extracted features.
+- **output_predictions**: (path, optional) — CSV path to write model predictions.
+
+Notes:
+- Many config keys accept either YAML lists (recommended for examples) or comma-separated CLI strings — the CLI normalizes both formats.
+- `max_l2`/`max_l3` are applied per-provider; the final L2/L3 coverage is the union of provider outputs after deduplication.
+- Use `year: null` in `papers_data.json` to indicate unknown publication year; ADIT emits `pub_year` as `NaN` and imputes numeric features at training time.
+
 ## Adaptation Notes
 
 - Augments traditional ML with transformer-based embeddings for text analysis.
