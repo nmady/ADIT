@@ -18,3 +18,5 @@ larsen2019.txt
 paper_text.txt
 extract_pdf*.py
 logs/
+.cache/
+outputs/

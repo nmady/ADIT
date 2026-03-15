@@ -9,6 +9,20 @@ class _FakeProvider(ci.CitationProvider):
 
     def __init__(self):
         self.calls = 0
+        self.seed_calls = 0
+
+    def fetch_seed_metadata(self, l1_papers):
+        self.seed_calls += 1
+        return {
+            "doi:10.1000/xyz1": ci.IngestionPaper(
+                paper_id="doi:10.1000/xyz1",
+                title="Foundational Paper",
+                abstract="Canonical theory text.",
+                citations=100,
+                year=2000,
+                doi="10.1000/xyz1",
+            )
+        }
 
     def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
         self.calls += 1
@@ -31,13 +45,6 @@ class _FakeProvider(ci.CitationProvider):
                     year=2022,
                     citations=12,
                     doi="10.1000/abc",
-                ),
-                "doi:10.1000/xyz1": ci.IngestionPaper(
-                    paper_id="doi:10.1000/xyz1",
-                    title="Foundational Paper",
-                    year=2000,
-                    citations=100,
-                    doi="10.1000/xyz1",
                 ),
             },
         )
@@ -90,6 +97,7 @@ def test_ingest_from_internet_dedupes_and_uses_cache(monkeypatch, tmp_path):
     )
 
     assert provider.calls == 1
+    assert provider.seed_calls == 1
     assert result1.metadata["paper_count"] >= 3
     assert result1.metadata["edge_count"] >= 2
 
@@ -111,4 +119,31 @@ def test_ingest_from_internet_dedupes_and_uses_cache(monkeypatch, tmp_path):
     )
 
     assert provider.calls == 1
+    assert provider.seed_calls == 1
     assert result2.metadata["cache_key"] == result1.metadata["cache_key"]
+
+
+def test_ingest_from_internet_hydrates_l1_metadata_from_seed_lookup(monkeypatch, tmp_path):
+    provider = _FakeProvider()
+
+    def fake_build_providers(_sources):
+        return [provider]
+
+    monkeypatch.setattr(ci, "build_providers", fake_build_providers)
+
+    result = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["fake"],
+        depth="l2",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        max_l2=10,
+        max_l3=0,
+    )
+
+    l1_entry = result.papers_data["doi:10.1000/xyz1"]
+    assert l1_entry["title"] == "Foundational Paper"
+    assert l1_entry["abstract"] == "Canonical theory text."
+    assert l1_entry["citations"] == 100
+    assert l1_entry["year"] == 2000

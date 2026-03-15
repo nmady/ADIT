@@ -23,7 +23,7 @@ class IngestionPaper:
     abstract: str = ""
     keywords: str = ""
     citations: int = 0
-    year: int = 2010
+    year: Optional[int] = None
     doi: Optional[str] = None
     source_ids: Dict[str, str] = field(default_factory=dict)
 
@@ -54,6 +54,15 @@ class CitationProvider:
         max_l3: int = 500,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
         raise NotImplementedError
+
+    def fetch_seed_metadata(
+        self,
+        l1_papers: Sequence[str],
+    ) -> Dict[str, IngestionPaper]:
+        return {}
+
+
+_CACHE_SCHEMA_VERSION = 2
 
 
 def _safe_get(url: str, timeout: int = 20) -> Optional[dict]:
@@ -131,7 +140,7 @@ def _paper_to_output_dict(paper: IngestionPaper) -> Dict[str, object]:
         "abstract": paper.abstract,
         "keywords": paper.keywords,
         "citations": int(paper.citations or 0),
-        "year": int(paper.year or 2010),
+        "year": int(paper.year) if paper.year is not None else None,
     }
 
 
@@ -157,6 +166,14 @@ def _query_terms(theory_name: str, key_constructs: Optional[Sequence[str]]) -> s
     if key_constructs:
         terms.extend([k.strip() for k in key_constructs if k.strip()])
     return " ".join([t for t in terms if t])
+
+
+def _doi_from_identifier(identifier: str) -> Optional[str]:
+    if not identifier:
+        return None
+    if identifier.startswith("doi:"):
+        return identifier.split(":", 1)[1]
+    return None
 
 
 def _reconstruct_openalex_abstract(inv_idx: dict) -> str:
@@ -197,7 +214,7 @@ def _paper_from_openalex_item(item: dict, paper_id: str) -> IngestionPaper:
         abstract=_reconstruct_openalex_abstract(item.get("abstract_inverted_index") or {}),
         keywords="",
         citations=int(item.get("cited_by_count") or 0),
-        year=int(item.get("publication_year") or 2010),
+        year=int(item.get("publication_year")) if item.get("publication_year") else None,
         doi=item.get("doi"),
         source_ids={"openalex": str(item.get("id", ""))},
     )
@@ -225,21 +242,34 @@ def _should_keep_semantic_item(item: dict, linked_l1: Set[str], theory_name: str
 
 
 def _paper_from_semantic_item(item: dict, paper_id: str) -> IngestionPaper:
+    ext_ids = item.get("externalIds") or {}
     return IngestionPaper(
         paper_id=paper_id,
         title=item.get("title") or "",
-        year=int(item.get("year") or 2010),
+        abstract=item.get("abstract") or "",
+        year=int(item.get("year")) if item.get("year") else None,
         citations=int(item.get("citationCount") or 0),
+        doi=ext_ids.get("DOI"),
         source_ids={"semantic_scholar": str(item.get("paperId", ""))},
     )
 
 
 def _seed_l1_papers(l1_papers: Sequence[str]) -> tuple[List[str], Dict[str, IngestionPaper]]:
     normalized = [normalize_identifier(value) for value in l1_papers if value]
-    papers = {
-        paper_id: IngestionPaper(paper_id=paper_id, title=paper_id, year=2010)
-        for paper_id in normalized
-    }
+    papers = {}
+    for raw, norm in zip(l1_papers, normalized):
+        # If the raw L1 looks like a DOI, capture it so canonical merge keys match provider DOIs.
+        raw_lower = (raw or "").strip().lower()
+        doi_val = None
+        if raw_lower.startswith("https://doi.org/"):
+            doi_val = raw_lower.replace("https://doi.org/", "")
+        elif raw_lower.startswith("doi:"):
+            doi_val = raw_lower.replace("doi:", "")
+        elif re.match(r"^10\.\d{4,9}/", raw_lower):
+            doi_val = raw_lower
+
+        # Create a minimal placeholder with no title and no default year so incoming metadata wins.
+        papers[norm] = IngestionPaper(paper_id=norm, title="", year=None, doi=doi_val)
     return normalized, papers
 
 
@@ -295,6 +325,17 @@ def _fetch_provider_graph(
     return all_edges, all_papers, stats
 
 
+def _merge_seed_metadata(
+    all_papers: Dict[str, IngestionPaper],
+    seed_papers: Dict[str, IngestionPaper],
+) -> None:
+    for pid, paper in seed_papers.items():
+        if pid in all_papers:
+            all_papers[pid] = _merge_papers(all_papers[pid], paper)
+        else:
+            all_papers[pid] = paper
+
+
 def _request_payload(
     theory_name: str,
     l1_papers: Sequence[str],
@@ -305,6 +346,7 @@ def _request_payload(
     max_l3: int,
 ) -> dict:
     return {
+        "cache_schema_version": _CACHE_SCHEMA_VERSION,
         "theory_name": theory_name,
         "l1_papers": list(l1_papers),
         "key_constructs": list(key_constructs or []),
@@ -352,6 +394,30 @@ class OpenAlexProvider(CitationProvider):
     name = "openalex"
     capabilities = ProviderCapabilities(True, True, True)
 
+    def fetch_seed_metadata(
+        self,
+        l1_papers: Sequence[str],
+    ) -> Dict[str, IngestionPaper]:
+        papers: Dict[str, IngestionPaper] = {}
+        for paper_id in l1_papers:
+            payload = None
+            doi = _doi_from_identifier(paper_id)
+            if doi:
+                query = urllib.parse.urlencode({"filter": f"doi:{doi}", "per-page": 1})
+                result = _safe_get(f"https://api.openalex.org/works?{query}")
+                matches = (result or {}).get("results", [])
+                payload = matches[0] if matches else None
+            elif paper_id.startswith("openalex:"):
+                token = paper_id.split(":", 1)[1]
+                payload = _safe_get(f"https://api.openalex.org/works/{token}")
+
+            if not payload:
+                continue
+
+            papers[paper_id] = _paper_from_openalex_item(payload, paper_id)
+            time.sleep(0.03)
+        return papers
+
     def fetch_l2_and_metadata(
         self,
         l1_papers: Sequence[str],
@@ -383,7 +449,7 @@ class OpenAlexProvider(CitationProvider):
 
             # Minimal metadata entries for referenced L1 papers if missing.
             for ref in linked_l1:
-                papers.setdefault(ref, IngestionPaper(paper_id=ref, title=ref, year=2010))
+                papers.setdefault(ref, IngestionPaper(paper_id=ref, doi=_doi_from_identifier(ref)))
 
             time.sleep(0.03)
 
@@ -418,7 +484,7 @@ class OpenAlexProvider(CitationProvider):
                 if not ref_id:
                     continue
                 edges.setdefault(pid, set()).add(ref_id)
-                papers.setdefault(ref_id, IngestionPaper(paper_id=ref_id, title=ref_id, year=2010))
+                papers.setdefault(ref_id, IngestionPaper(paper_id=ref_id, doi=_doi_from_identifier(ref_id)))
                 budget -= 1
             time.sleep(0.03)
 
@@ -428,6 +494,34 @@ class OpenAlexProvider(CitationProvider):
 class SemanticScholarProvider(CitationProvider):
     name = "semantic_scholar"
     capabilities = ProviderCapabilities(True, True, True)
+
+    def fetch_seed_metadata(
+        self,
+        l1_papers: Sequence[str],
+    ) -> Dict[str, IngestionPaper]:
+        papers: Dict[str, IngestionPaper] = {}
+        for paper_id in l1_papers:
+            payload = None
+            doi = _doi_from_identifier(paper_id)
+            if doi:
+                encoded = urllib.parse.quote(doi, safe="")
+                payload = _safe_get(
+                    "https://api.semanticscholar.org/graph/v1/paper/DOI:"
+                    f"{encoded}?fields=paperId,title,abstract,year,citationCount,externalIds"
+                )
+            elif paper_id.startswith("semantic_scholar:"):
+                token = paper_id.split(":", 1)[1]
+                payload = _safe_get(
+                    "https://api.semanticscholar.org/graph/v1/paper/"
+                    f"{token}?fields=paperId,title,abstract,year,citationCount,externalIds"
+                )
+
+            if not payload:
+                continue
+
+            papers[paper_id] = _paper_from_semantic_item(payload, paper_id)
+            time.sleep(0.05)
+        return papers
 
     def fetch_l2_and_metadata(
         self,
@@ -462,7 +556,7 @@ class SemanticScholarProvider(CitationProvider):
             edges.setdefault(paper_id, set()).update(linked_l1)
             papers[paper_id] = _paper_from_semantic_item(item, paper_id)
             for ref in linked_l1:
-                papers.setdefault(ref, IngestionPaper(paper_id=ref, title=ref, year=2010))
+                papers.setdefault(ref, IngestionPaper(paper_id=ref, doi=_doi_from_identifier(ref)))
             time.sleep(0.05)
 
         return edges, papers
@@ -517,6 +611,39 @@ class CrossrefProvider(CitationProvider):
     name = "crossref"
     capabilities = ProviderCapabilities(True, False, False)
 
+    def fetch_seed_metadata(
+        self,
+        l1_papers: Sequence[str],
+    ) -> Dict[str, IngestionPaper]:
+        papers: Dict[str, IngestionPaper] = {}
+        for paper_id in l1_papers:
+            doi = _doi_from_identifier(paper_id)
+            if not doi:
+                continue
+
+            payload = _safe_get(
+                f"https://api.crossref.org/works/{urllib.parse.quote(doi, safe='')}"
+            )
+            item = (payload or {}).get("message")
+            if not item:
+                continue
+
+            titles = item.get("title") or []
+            title = titles[0] if titles else ""
+            issued = item.get("issued", {}).get("date-parts", [[]])
+            year = issued[0][0] if issued and issued[0] else None
+            citations = int(item.get("is-referenced-by-count") or 0)
+            papers[paper_id] = IngestionPaper(
+                paper_id=paper_id,
+                title=title,
+                year=int(year) if year else None,
+                citations=citations,
+                doi=doi,
+                source_ids={self.name: doi},
+            )
+            time.sleep(0.03)
+        return papers
+
     def fetch_l2_and_metadata(
         self,
         l1_papers: Sequence[str],
@@ -542,13 +669,13 @@ class CrossrefProvider(CitationProvider):
             paper_id = normalize_identifier(doi)
             titles = item.get("title") or []
             title = titles[0] if titles else ""
-            issued = item.get("issued", {}).get("date-parts", [[2010]])
-            year = issued[0][0] if issued and issued[0] else 2010
+            issued = item.get("issued", {}).get("date-parts", [[]])
+            year = issued[0][0] if issued and issued[0] else None
             citations = int(item.get("is-referenced-by-count") or 0)
             papers[paper_id] = IngestionPaper(
                 paper_id=paper_id,
                 title=title,
-                year=int(year or 2010),
+                year=int(year) if year else None,
                 citations=citations,
                 doi=doi,
                 source_ids={self.name: doi},
@@ -657,6 +784,7 @@ def ingest_from_internet(
     provider_stats: Dict[str, Dict[str, int]] = {}
 
     for provider in providers:
+        _merge_seed_metadata(all_papers, provider.fetch_seed_metadata(l1_norm))
         provider_edges, provider_papers, stats = _fetch_provider_graph(
             provider=provider,
             l1_norm=l1_norm,

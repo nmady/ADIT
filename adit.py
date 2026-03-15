@@ -5,8 +5,10 @@ import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
 from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
+
 
 # Public helper and stopword list for acronym derivation. Exported so tests
 # and lightweight test doubles can reuse the exact same logic without
@@ -48,7 +50,6 @@ def derive_acronym(theory_name: str) -> str:
 
 
 class ADIT:
-    pass
 
     def __init__(self, theory_name, l1_papers, transformer=None, acronym=None):
         """
@@ -67,6 +68,9 @@ class ADIT:
             "all-MiniLM-L6-v2"
         )  # For text embeddings
         self.classifier = RandomForestClassifier()
+        self.imputer = SimpleImputer(strategy="median")
+        # Stores training feature column order so predict uses the same schema.
+        self._feature_cols = None
 
     def build_ecosystem(self, citation_data):
         """
@@ -141,9 +145,22 @@ class ADIT:
 
         :param papers_data: Dict with paper info: {paper_id: {'title': str, 'abstract': str,
                                                           'keywords': str, 'citations': int,
-                                                          'year': int}}
+                                                          'year': int | None}}
         :return: DataFrame with features
         """
+
+        def _coerce_year(value):
+            """Return a numeric year or None when missing/invalid."""
+            if value is None or isinstance(value, bool):
+                return None
+            try:
+                year_value = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not np.isfinite(year_value):
+                return None
+            return year_value
+
         features = []
         concat_L1_abs = " ".join(
             [papers_data.get(p, {}).get("abstract", "") for p in self.l1_papers]
@@ -164,10 +181,12 @@ class ADIT:
 
         eigenfactor_scores = self.compute_eigenfactor()
 
-        # Determine min and max year for dynamic normalization
-        years = [papers_data.get(p, {}).get("year", 2010) for p in papers_data]
-        min_year = min(years) if years else 2010
-        max_year = max(years) if years else 2010
+        # Determine min and max year for dynamic normalization using only known years.
+        known_years = [
+            yr for yr in (_coerce_year(meta.get("year")) for meta in papers_data.values()) if yr is not None
+        ]
+        min_year = min(known_years) if known_years else 0.0
+        max_year = max(known_years) if known_years else 0.0
         year_range = max_year - min_year if max_year > min_year else 1
 
         for node, data in self.ecosystem.nodes(data=True):
@@ -177,7 +196,7 @@ class ADIT:
                 abstract = paper_info.get("abstract", "").lower()
                 keywords = paper_info.get("keywords", "").lower()
                 citation_count = paper_info.get("citations", 0)
-                year = paper_info.get("year", 2010)
+                year = _coerce_year(paper_info.get("year"))
 
                 # 1. Network feature: Eigenfactor_Eco (article-level Eigenfactor)
                 eigenfactor = eigenfactor_scores.get(node, 0.0)
@@ -196,8 +215,12 @@ class ADIT:
 
                 # 3. Citation count
 
-                # 4. Publication year (normalized dynamically to [0, 1])
-                pub_year_norm = (year - min_year) / year_range
+                # 4. Publication year (normalized dynamically to [0, 1]).
+                # Missing/invalid year is preserved as NaN (unknown).
+                if year is None or not known_years:
+                    pub_year_norm = np.nan
+                else:
+                    pub_year_norm = (year - min_year) / year_range
 
                 # 5. Abstract word count
                 word_count = len(abstract.split())
@@ -277,8 +300,15 @@ class ADIT:
         X = features_df[feature_cols]
         y = labels
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        self.classifier.fit(X_train, y_train)
-        y_pred = self.classifier.predict(X_test)
+
+        # Preserve feature order for inference and use median imputation for missing numeric values.
+        # This guards against column-order drift between training and later prediction calls.
+        self._feature_cols = feature_cols
+        X_train_imputed = self.imputer.fit_transform(X_train)
+        X_test_imputed = self.imputer.transform(X_test)
+
+        self.classifier.fit(X_train_imputed, y_train)
+        y_pred = self.classifier.predict(X_test_imputed)
         print("Classification Report:")
         print(classification_report(y_test, y_pred, zero_division=0))
         print("\nFeature Importance (top 5):")
@@ -298,9 +328,11 @@ class ADIT:
         :param features_df: DataFrame with features
         :return: Predictions (1: subscribes, 0: does not)
         """
-        feature_cols = [col for col in features_df.columns if col != "paper_id"]
+        # Prefer training-time schema; fall back only when predict is called before train.
+        feature_cols = self._feature_cols or [col for col in features_df.columns if col != "paper_id"]
         X = features_df[feature_cols]
-        return self.classifier.predict(X)
+        X_imputed = self.imputer.transform(X)
+        return self.classifier.predict(X_imputed)
 
 
 # Example usage with mock data
