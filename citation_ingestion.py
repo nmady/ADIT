@@ -62,7 +62,7 @@ class CitationProvider:
         return {}
 
 
-_CACHE_SCHEMA_VERSION = 2
+_CACHE_SCHEMA_VERSION = 3
 
 
 def _safe_get(url: str, timeout: int = 20) -> Optional[dict]:
@@ -135,13 +135,16 @@ def _write_cache(cache_dir: Path, key: str, payload: dict) -> None:
 
 
 def _paper_to_output_dict(paper: IngestionPaper) -> Dict[str, object]:
-    return {
+    output = {
         "title": paper.title,
         "abstract": paper.abstract,
         "keywords": paper.keywords,
         "citations": int(paper.citations or 0),
         "year": int(paper.year) if paper.year is not None else None,
     }
+    if paper.source_ids:
+        output["source_ids"] = dict(paper.source_ids)
+    return output
 
 
 def _merge_papers(existing: IngestionPaper, incoming: IngestionPaper) -> IngestionPaper:

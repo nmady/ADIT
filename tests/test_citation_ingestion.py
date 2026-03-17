@@ -21,6 +21,7 @@ class _FakeProvider(ci.CitationProvider):
                 citations=100,
                 year=2000,
                 doi="10.1000/xyz1",
+                source_ids={"fake": "seed:doi:10.1000/xyz1"},
             )
         }
 
@@ -38,6 +39,7 @@ class _FakeProvider(ci.CitationProvider):
                     year=2022,
                     citations=8,
                     doi="10.1000/abc",
+                    source_ids={"openalex": "https://openalex.org/W100"},
                 ),
                 "semantic_scholar:abc123": ci.IngestionPaper(
                     paper_id="semantic_scholar:abc123",
@@ -45,6 +47,7 @@ class _FakeProvider(ci.CitationProvider):
                     year=2022,
                     citations=12,
                     doi="10.1000/abc",
+                    source_ids={"semantic_scholar": "abc123"},
                 ),
             },
         )
@@ -105,6 +108,9 @@ def test_ingest_from_internet_dedupes_and_uses_cache(monkeypatch, tmp_path):
     assert len(result1.citation_data) == 1
     citing_id = next(iter(result1.citation_data.keys()))
     assert len(result1.citation_data[citing_id]) == 2
+    merged_entry = result1.papers_data[citing_id]
+    assert merged_entry["source_ids"]["openalex"] == "https://openalex.org/W100"
+    assert merged_entry["source_ids"]["semantic_scholar"] == "abc123"
 
     # Second run should come from cache and avoid calling provider again.
     result2 = ci.ingest_from_internet(
@@ -147,3 +153,4 @@ def test_ingest_from_internet_hydrates_l1_metadata_from_seed_lookup(monkeypatch,
     assert l1_entry["abstract"] == "Canonical theory text."
     assert l1_entry["citations"] == 100
     assert l1_entry["year"] == 2000
+    assert l1_entry["source_ids"] == {"fake": "seed:doi:10.1000/xyz1"}

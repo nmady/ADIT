@@ -71,7 +71,8 @@ class TestEdgeCases:
         assert len(features) > 0
         # Check defaults are used
         assert not pd.isna(features.loc[0, "citation_count"]), "Should default to 0"
-        assert not pd.isna(features.loc[0, "pub_year"]), "Should have valid year"
+        # Missing year is preserved as NaN by design.
+        assert pd.isna(features.loc[0, "pub_year"]), "Missing year should remain NaN"
 
     def test_zero_citations(self, mock_transformer, sample_citation_data):
         """Test paper with zero citations."""
@@ -149,6 +150,20 @@ class TestEdgeCases:
                 "citations": 30,
                 "year": 2000,
             },
+            "PaperC": {
+                "title": "Paper C",
+                "abstract": "Abstract",
+                "keywords": "keywords",
+                "citations": 10,
+                "year": 2000,
+            },
+            "PaperE": {
+                "title": "Paper E",
+                "abstract": "Abstract",
+                "keywords": "keywords",
+                "citations": 20,
+                "year": 2000,
+            },
             "TAM1": {
                 "title": "TAM",
                 "abstract": "TAM paper",
@@ -182,6 +197,20 @@ class TestEdgeCases:
                 "keywords": "keywords",
                 "citations": 30,
                 "year": 2025,  # very new
+            },
+            "PaperC": {
+                "title": "Paper C",
+                "abstract": "Abstract",
+                "keywords": "keywords",
+                "citations": 10,
+                "year": 1989,
+            },
+            "PaperE": {
+                "title": "Paper E",
+                "abstract": "Abstract",
+                "keywords": "keywords",
+                "citations": 20,
+                "year": 1995,
             },
             "TAM1": {
                 "title": "TAM",
