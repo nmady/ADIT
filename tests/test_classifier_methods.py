@@ -47,9 +47,12 @@ def test_train_classifier_excludes_paper_id_column(
     fit_spy = mocker.spy(adit.classifier, "fit")
     adit.train_classifier(features, labels)
 
-    # fit(X_train, y_train) should be called with only numeric feature columns.
+    # fit(X_train, y_train) should receive only numeric feature columns
+    # after paper_id is removed and values are transformed to ndarray.
     X_train_arg = fit_spy.call_args.args[0]
-    assert "paper_id" not in X_train_arg.columns
+    assert isinstance(X_train_arg, np.ndarray)
+    assert X_train_arg.ndim == 2
+    assert X_train_arg.shape[1] == len(features.columns) - 1
 
 
 def test_train_classifier_raises_on_label_length_mismatch(

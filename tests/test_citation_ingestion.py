@@ -154,3 +154,30 @@ def test_ingest_from_internet_hydrates_l1_metadata_from_seed_lookup(monkeypatch,
     assert l1_entry["citations"] == 100
     assert l1_entry["year"] == 2000
     assert l1_entry["source_ids"] == {"fake": "seed:doi:10.1000/xyz1"}
+
+
+def test_ingest_from_internet_metadata_includes_fetch_stats(monkeypatch, tmp_path):
+    provider = _FakeProvider()
+
+    def fake_build_providers(_sources):
+        return [provider]
+
+    monkeypatch.setattr(ci, "build_providers", fake_build_providers)
+
+    result = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["fake"],
+        depth="l2",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        max_l2=10,
+        max_l3=0,
+    )
+
+    assert "fetch_stats" in result.metadata
+    stats = result.metadata["fetch_stats"]
+    assert isinstance(stats["total_requests"], int)
+    assert isinstance(stats["total_failures"], int)
+    assert isinstance(stats["per_provider_failures"], dict)
+    assert stats["per_provider_failures"]["fake"] == 0

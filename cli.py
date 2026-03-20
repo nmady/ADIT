@@ -59,6 +59,10 @@ SAVE_INGESTED_PAPERS_OPTION = typer.Option(
 )
 OUTPUT_FEATURES_OPTION = typer.Option(None, help="Optional CSV path for extracted features.")
 OUTPUT_PREDICTIONS_OPTION = typer.Option(None, help="Optional CSV path for predictions.")
+ONLY_INGEST_OPTION = typer.Option(
+    False,
+    help="Load or fetch citation/paper inputs and exit before feature extraction and ML training.",
+)
 
 
 def _load_config(config_path: Optional[Path]) -> Dict[str, Any]:
@@ -144,6 +148,7 @@ def _resolve_cli_inputs(
     output_features: Optional[Path],
     output_predictions: Optional[Path],
     online: bool,
+    only_ingest: bool,
 ) -> Dict[str, Any]:
     l1_cfg = cfg.get("l1_papers")
     l1_cfg_str = ",".join(l1_cfg) if isinstance(l1_cfg, list) else None
@@ -181,6 +186,7 @@ def _resolve_cli_inputs(
         or (
             Path(cfg["save_ingested_papers_data"]) if cfg.get("save_ingested_papers_data") else None
         ),
+        "only_ingest": bool(only_ingest or cfg.get("only_ingest", False)),
     }
 
 
@@ -274,6 +280,7 @@ def run(
     save_ingested_papers_data: Optional[Path] = SAVE_INGESTED_PAPERS_OPTION,
     output_features: Optional[Path] = OUTPUT_FEATURES_OPTION,
     output_predictions: Optional[Path] = OUTPUT_PREDICTIONS_OPTION,
+    only_ingest: bool = ONLY_INGEST_OPTION,
 ) -> None:
     """Run ADIT using CLI values and/or a config file."""
     cfg = _load_config(config)
@@ -299,12 +306,19 @@ def run(
         output_features,
         output_predictions,
         online,
+        only_ingest,
     )
 
     if not params["theory_name"]:
         raise typer.BadParameter("theory_name is required (CLI arg or config).")
 
     citation_dict, papers_dict = _load_pipeline_inputs(params)
+
+    if params["only_ingest"]:
+        typer.echo(
+            "Ingestion-only mode enabled: skipped feature extraction and ML training/prediction."
+        )
+        return
 
     adit = ADIT(
         theory_name=params["theory_name"],

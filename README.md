@@ -55,6 +55,7 @@ python cli.py \
 	--depth l2l3 \
 	--key-constructs "usefulness,ease of use,behavioral intention" \
 	--cache-dir .cache/adit_ingestion \
+	--only-ingest \
 	--save-ingested-citation-data outputs/citation_data.json \
 	--save-ingested-papers-data outputs/papers_data.json \
 	--output-features outputs/features.csv
@@ -109,6 +110,7 @@ If `labels_data` is omitted, the CLI extracts features and skips training/predic
 - `--depth l2` retrieves direct citers of the L1 papers; `--depth l2l3` also retrieves references from L2 papers to populate L3.
 - `--cache-dir` stores cached ingestion results so repeated runs can reuse prior retrieval work.
 - `--refresh-cache` forces a fresh internet retrieval instead of reusing cached results.
+- `--only-ingest` runs ingestion and exits before feature extraction/training.
 - `--save-ingested-citation-data` and `--save-ingested-papers-data` let you persist normalized outputs for offline replay.
 - Tests do not rely on live provider calls; the internet ingestion path is covered with mocked fixtures.
 
@@ -224,8 +226,32 @@ Behavior and expectations:
 - During classifier train/predict, missing numeric feature values (including `pub_year`) are imputed with the training-set median.
 - `keywords` is currently treated as a plain string and searched with substring checks.
 - Extra fields are allowed and ignored by the current feature extractor.
+- Online-ingested entries may include `source_ids`, a provider-to-provider-id map used for provenance and debugging.
 - When running offline mode, this file is required via `--papers-data` (or `papers_data` in config).
 - In online mode, this file is generated when using `--save-ingested-papers-data`.
+
+### Ingestion Metadata
+
+Online ingestion returns a `metadata` object alongside `citation_data` and `papers_data`.
+This includes `fetch_stats`:
+
+```json
+{
+	"fetch_stats": {
+		"total_requests": 42,
+		"total_failures": 3,
+		"per_provider_failures": {
+			"openalex": 1,
+			"semantic_scholar": 2,
+			"crossref": 0
+		}
+	}
+}
+```
+
+- `total_requests` counts attempted HTTP fetches during the run.
+- `total_failures` counts failed HTTP fetches.
+- `per_provider_failures` breaks failures down by provider.
 
 ## Config reference
 

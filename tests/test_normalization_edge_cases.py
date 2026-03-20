@@ -76,8 +76,8 @@ def test_pub_year_exact_values_with_wide_range(mock_transformer):
     assert np.isclose(features.loc["PaperB", "pub_year"], 1.0)
 
 
-def test_pub_year_missing_year_defaults_to_2010(mock_transformer):
-    """Missing year should default to 2010 and still produce bounded normalized values."""
+def test_pub_year_missing_year_is_nan(mock_transformer):
+    """Missing publication year should remain NaN in extracted features."""
     adit = ADIT("TAM", ["TAM1"], transformer=mock_transformer)
     adit.build_ecosystem({"PaperA": ["TAM1"], "PaperB": ["TAM1"]})
 
@@ -87,7 +87,7 @@ def test_pub_year_missing_year_defaults_to_2010(mock_transformer):
             "abstract": "A",
             "keywords": "k",
             "citations": 1,
-            # missing year -> defaults to 2010
+            # missing year
         },
         "PaperB": {
             "title": "Paper B",
@@ -107,12 +107,11 @@ def test_pub_year_missing_year_defaults_to_2010(mock_transformer):
 
     features = adit.extract_features(papers_data).set_index("paper_id")
 
-    # min_year=2000, max_year=2020, range=20
-    # PaperA default year 2010 => 0.5; PaperB => 1.0
-    assert np.isclose(features.loc["PaperA", "pub_year"], 0.5)
+    assert np.isnan(features.loc["PaperA", "pub_year"])
     assert np.isclose(features.loc["PaperB", "pub_year"], 1.0)
-    assert (features["pub_year"] >= 0).all()
-    assert (features["pub_year"] <= 1).all()
+    known_years = features["pub_year"].dropna()
+    assert (known_years >= 0).all()
+    assert (known_years <= 1).all()
 
 
 def test_pub_year_no_nan_or_inf_for_single_l2_paper(mock_transformer):

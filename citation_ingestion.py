@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import re
 import time
 import urllib.parse
@@ -7,6 +8,9 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -62,15 +66,33 @@ class CitationProvider:
         return {}
 
 
-_CACHE_SCHEMA_VERSION = 3
+_CACHE_SCHEMA_VERSION = 4
+
+_INGEST_STATS = {
+    "total_requests": 0,
+    "total_failures": 0,
+    "per_provider_failures": {},
+}
 
 
-def _safe_get(url: str, timeout: int = 20) -> Optional[dict]:
+def _reset_ingest_stats(source_list: Sequence[str]) -> None:
+    _INGEST_STATS["total_requests"] = 0
+    _INGEST_STATS["total_failures"] = 0
+    _INGEST_STATS["per_provider_failures"] = {source: 0 for source in source_list}
+
+
+def _safe_get(url: str, timeout: int = 20, provider: Optional[str] = None) -> Optional[dict]:
+    _INGEST_STATS["total_requests"] += 1
     req = urllib.request.Request(url, headers={"User-Agent": "ADIT/0.1 ingestion"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
-    except Exception:
+    except Exception as error:
+        _INGEST_STATS["total_failures"] += 1
+        if provider:
+            failures = _INGEST_STATS["per_provider_failures"]
+            failures[provider] = int(failures.get(provider, 0)) + 1
+        logger.debug("Ingestion request failed: provider=%s url=%s error=%s", provider, url, error)
         return None
 
 
@@ -386,6 +408,11 @@ def _build_metadata(
         "sources": list(source_list),
         "depth": depth,
         "provider_stats": provider_stats,
+        "fetch_stats": {
+            "total_requests": int(_INGEST_STATS["total_requests"]),
+            "total_failures": int(_INGEST_STATS["total_failures"]),
+            "per_provider_failures": dict(_INGEST_STATS["per_provider_failures"]),
+        },
         "cache_key": cache_key,
         "alias_count": len(alias_map),
         "paper_count": len(papers_data),
@@ -407,12 +434,12 @@ class OpenAlexProvider(CitationProvider):
             doi = _doi_from_identifier(paper_id)
             if doi:
                 query = urllib.parse.urlencode({"filter": f"doi:{doi}", "per-page": 1})
-                result = _safe_get(f"https://api.openalex.org/works?{query}")
+                result = _safe_get(f"https://api.openalex.org/works?{query}", provider=self.name)
                 matches = (result or {}).get("results", [])
                 payload = matches[0] if matches else None
             elif paper_id.startswith("openalex:"):
                 token = paper_id.split(":", 1)[1]
-                payload = _safe_get(f"https://api.openalex.org/works/{token}")
+                payload = _safe_get(f"https://api.openalex.org/works/{token}", provider=self.name)
 
             if not payload:
                 continue
@@ -432,7 +459,7 @@ class OpenAlexProvider(CitationProvider):
         papers: Dict[str, IngestionPaper] = {}
         query = urllib.parse.quote(_query_terms(theory_name, key_constructs))
         url = f"https://api.openalex.org/works?search={query}&per-page={max(1, min(max_l2, 200))}"
-        payload = _safe_get(url)
+        payload = _safe_get(url, provider=self.name)
         if not payload:
             return citation_edges, papers
 
@@ -475,7 +502,7 @@ class OpenAlexProvider(CitationProvider):
 
             openalex_token = pid.split(":", 1)[1]
             url = f"https://api.openalex.org/works/{openalex_token}"
-            payload = _safe_get(url)
+            payload = _safe_get(url, provider=self.name)
             if not payload:
                 continue
 
@@ -512,13 +539,15 @@ class SemanticScholarProvider(CitationProvider):
                 encoded = urllib.parse.quote(doi, safe="")
                 payload = _safe_get(
                     "https://api.semanticscholar.org/graph/v1/paper/DOI:"
-                    f"{encoded}?fields=paperId,title,abstract,year,citationCount,externalIds"
+                    f"{encoded}?fields=paperId,title,abstract,year,citationCount,externalIds",
+                    provider=self.name,
                 )
             elif paper_id.startswith("semantic_scholar:"):
                 token = paper_id.split(":", 1)[1]
                 payload = _safe_get(
                     "https://api.semanticscholar.org/graph/v1/paper/"
-                    f"{token}?fields=paperId,title,abstract,year,citationCount,externalIds"
+                    f"{token}?fields=paperId,title,abstract,year,citationCount,externalIds",
+                    provider=self.name,
                 )
 
             if not payload:
@@ -543,7 +572,7 @@ class SemanticScholarProvider(CitationProvider):
             "https://api.semanticscholar.org/graph/v1/paper/search"
             f"?query={query}&limit={limit}&fields=paperId,title,year,citationCount,references.paperId,references.externalIds"
         )
-        payload = _safe_get(url)
+        payload = _safe_get(url, provider=self.name)
         if not payload:
             return edges, papers
 
@@ -586,7 +615,7 @@ class SemanticScholarProvider(CitationProvider):
                 "https://api.semanticscholar.org/graph/v1/paper/"
                 f"{token}?fields=references.paperId,references.title,references.year"
             )
-            payload = _safe_get(url)
+            payload = _safe_get(url, provider=self.name)
             if not payload:
                 continue
 
@@ -627,7 +656,8 @@ class CrossrefProvider(CitationProvider):
                 continue
 
             payload = _safe_get(
-                f"https://api.crossref.org/works/{urllib.parse.quote(doi, safe='')}"
+                f"https://api.crossref.org/works/{urllib.parse.quote(doi, safe='')}",
+                provider=self.name,
             )
             item = (payload or {}).get("message")
             if not item:
@@ -663,7 +693,7 @@ class CrossrefProvider(CitationProvider):
         query = urllib.parse.quote(_query_terms(theory_name, key_constructs))
         rows = max(1, min(max_l2, 100))
         url = f"https://api.crossref.org/works?query={query}&rows={rows}"
-        payload = _safe_get(url)
+        payload = _safe_get(url, provider=self.name)
         if not payload:
             return edges, papers
 
@@ -766,6 +796,7 @@ def ingest_from_internet(
     max_l3: int = 500,
 ) -> IngestionResult:
     source_list = ["openalex", "semantic_scholar", "crossref"] if not sources else list(sources)
+    _reset_ingest_stats(source_list)
     providers = build_providers(source_list)
 
     cache_root = cache_dir or Path(".cache") / "adit_ingestion"
