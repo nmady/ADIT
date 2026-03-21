@@ -1,8 +1,10 @@
 import hashlib
 import json
 import logging
+import math
 import random
 import re
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -95,11 +97,72 @@ _SAFE_GET_INITIAL_DELAY = 1.0
 _SAFE_GET_MAX_DELAY = 60.0
 _SAFE_GET_BACKOFF_FACTOR = 2.0
 
+# ---------------------------------------------------------------------------
+# Verbose terminal output
+# ---------------------------------------------------------------------------
+
+_VERBOSE: bool = False
+_VERBOSE_CLEAR_WIDTH = 80  # column width used when clearing a transient line
+
+
+def set_verbose(flag: bool) -> None:
+    """Enable or disable transient terminal progress messages."""
+    global _VERBOSE
+    _VERBOSE = bool(flag)
+
+
+def _vprint(msg: str) -> None:
+    """Print a permanent progress line to stderr when verbose mode is on."""
+    if not _VERBOSE:
+        return
+    sys.stderr.write(msg + "\n")
+    sys.stderr.flush()
+
+
+def _countdown_sleep(seconds: float, label: str) -> None:
+    """Sleep for *seconds*, ticking a live countdown to stderr each second.
+
+    The countdown is transient — each tick overwrites the previous line with
+    ``\\r`` so it does not clutter the terminal history.  The line is cleared
+    on completion.  Falls back to a plain ``time.sleep`` when verbose mode is
+    off or the delay is very short.
+    """
+    if not _VERBOSE or seconds < 1.0:
+        time.sleep(seconds)
+        return
+
+    remaining = seconds
+    while remaining > 0.0:
+        display_secs = math.ceil(remaining)
+        sys.stderr.write(f"\r  \u23f3 {label} \u2014 retrying in {display_secs}s...  ")
+        sys.stderr.flush()
+        chunk = min(1.0, remaining)
+        time.sleep(chunk)
+        remaining -= chunk
+
+    # Clear the transient line
+    sys.stderr.write("\r" + " " * _VERBOSE_CLEAR_WIDTH + "\r")
+    sys.stderr.flush()
+
+
 _INGEST_STATS = {
     "total_requests": 0,
     "total_failures": 0,
     "per_provider_failures": {},
 }
+
+
+def _http_error_body(exc: urllib.error.HTTPError) -> Optional[str]:
+    try:
+        body = exc.read()
+    except Exception:
+        return None
+
+    if not body:
+        return None
+    if isinstance(body, bytes):
+        return body.decode("utf-8", errors="replace").strip() or None
+    return str(body).strip() or None
 
 
 def _reset_ingest_stats(source_list: Sequence[str]) -> None:
@@ -124,27 +187,33 @@ def _safe_get(
     req = urllib.request.Request(url, headers={"User-Agent": "ADIT/0.1 ingestion"})
     delay = _SAFE_GET_INITIAL_DELAY
     last_error: Optional[Exception] = None
+    last_error_body: Optional[str] = None
 
     for attempt in range(max_retries):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
+            error_body = _http_error_body(exc)
+            last_error_body = error_body
             if exc.code in _PERMANENT_FAILURE_HTTP_CODES:
                 _INGEST_STATS["total_failures"] += 1
                 if provider:
                     failures = _INGEST_STATS["per_provider_failures"]
                     failures[provider] = int(failures.get(provider, 0)) + 1
                 logger.warning(
-                    "Permanent HTTP failure: provider=%s status=%s url=%s",
+                    "Permanent HTTP failure: provider=%s status=%s url=%s body=%s",
                     provider,
                     exc.code,
                     url,
+                    error_body,
                 )
+                _vprint(f"  [{provider or 'unknown'}] Permanent HTTP {exc.code} — skipping request")
                 return None
             last_error = exc
         except Exception as exc:
             last_error = exc
+            last_error_body = None
 
         if attempt < max_retries - 1:
             jitter = random.uniform(0.8, 1.2)
@@ -157,7 +226,16 @@ def _safe_get(
                 last_error,
                 sleep_time,
             )
-            time.sleep(sleep_time)
+            _vprint(
+                f"  [{provider or 'unknown'}] HTTP error "
+                f"{getattr(last_error, 'code', '?')} — "
+                f"attempt {attempt + 1}/{max_retries}, "
+                f"waiting {sleep_time:.0f}s before retry"
+            )
+            _countdown_sleep(
+                sleep_time,
+                f"[{provider or 'unknown'}] attempt {attempt + 2}/{max_retries}",
+            )
             delay *= _SAFE_GET_BACKOFF_FACTOR
 
     _INGEST_STATS["total_failures"] += 1
@@ -165,12 +243,14 @@ def _safe_get(
         failures = _INGEST_STATS["per_provider_failures"]
         failures[provider] = int(failures.get(provider, 0)) + 1
     logger.warning(
-        "Request failed after %d attempts: provider=%s url=%s final_error=%s",
+        "Request failed after %d attempts: provider=%s url=%s final_error=%s body=%s",
         max_retries,
         provider,
         url,
         last_error,
+        last_error_body,
     )
+    _vprint(f"  [{provider or 'unknown'}] All {max_retries} retries exhausted — skipping request")
     return None
 
 
@@ -419,6 +499,7 @@ def _fetch_provider_graph(
             seed = l1_papers_resolved.get(l1_id)
             raw_provider_id = seed.source_ids.get(provider.name) if seed else None
             if not raw_provider_id:
+                _vprint(f"  [{provider.name}] Skipping {l1_id} — no provider ID resolved")
                 completeness[l1_id] = {
                     provider.name: {
                         "status": "skipped",
@@ -430,8 +511,13 @@ def _fetch_provider_graph(
                 continue
 
             l1_native_id = normalize_identifier(raw_provider_id, source=provider.name)
+            _vprint(f"  [{provider.name}] Fetching citers for seed: {l1_id}")
             papers_for_l1, expected_count, status = provider.fetch_citers_for_l1(
                 l1_native_id, max_results=max_results
+            )
+            _vprint(
+                f"  [{provider.name}] \u2192 {len(papers_for_l1)}"
+                f"/{expected_count or '?'} papers ({status})"
             )
             completeness.setdefault(l1_id, {})[provider.name] = {
                 "status": status,
@@ -762,6 +848,30 @@ class SemanticScholarProvider(CitationProvider):
                     break
                 batch_limit = min(limit, remaining)
 
+            # Semantic Scholar enforces `offset + limit < 10000` and returns
+            # HTTP 400 if that boundary is crossed ("offset + limit must be < 10000").
+            # Compute the maximum allowed `limit` for the next request so we
+            # never issue a request where `offset + limit >= 10000`.
+            max_allowed = 9999 - offset
+            if max_allowed <= 0:
+                fetched = len(papers)
+                status = (
+                    "complete"
+                    if expected_count is not None and fetched >= expected_count
+                    else "partial"
+                )
+                return papers, expected_count or fetched, status
+
+            batch_limit = min(batch_limit, max_allowed)
+            if batch_limit <= 0:
+                fetched = len(papers)
+                status = (
+                    "complete"
+                    if expected_count is not None and fetched >= expected_count
+                    else "partial"
+                )
+                return papers, expected_count or fetched, status
+
             url = (
                 f"https://api.semanticscholar.org/graph/v1/paper/{token}/citations"
                 f"?fields=paperId,title,year,citationCount,externalIds,abstract"
@@ -1032,6 +1142,7 @@ def ingest_from_internet(
     max_l2: int = 200,
     max_l3: int = 500,
     exhaustive: bool = True,
+    verbose: bool = False,
 ) -> IngestionResult:
     """Ingest citation data from internet providers.
 
@@ -1039,10 +1150,17 @@ def ingest_from_internet(
         exhaustive: When ``True`` (default), providers that support cited-by
             traversal paginate until all citers are fetched.  When ``False``,
             retrieval is capped at *max_l2* results per L1/provider.
+        verbose: When ``True``, print live progress messages to stderr
+            (per-seed status, retry countdowns).
     """
+    set_verbose(verbose)
     source_list = ["openalex", "semantic_scholar", "crossref"] if not sources else list(sources)
     _reset_ingest_stats(source_list)
     providers = build_providers(source_list)
+    _vprint(
+        f"[ADIT] Starting ingestion: theory='{theory_name}', "
+        f"seeds={len(l1_papers)}, providers={source_list}"
+    )
 
     cache_root = cache_dir or Path(".cache") / "adit_ingestion"
     request_payload = _request_payload(
@@ -1067,6 +1185,7 @@ def ingest_from_internet(
     combined_completeness: Dict[str, Dict[str, object]] = {}
 
     for provider in providers:
+        _vprint(f"\n[ADIT] Querying provider: {provider.name}")
         _merge_seed_metadata(all_papers, provider.fetch_seed_metadata(l1_norm))
         provider_edges, provider_papers, stats = _fetch_provider_graph(
             provider=provider,
@@ -1103,5 +1222,6 @@ def ingest_from_internet(
         "metadata": metadata,
     }
     _write_cache(cache_root, key, result_payload)
+    _vprint(f"\n[ADIT] Done: {metadata['paper_count']} papers, {metadata['edge_count']} edges")
 
     return IngestionResult(citation_data=citation_data, papers_data=papers_data, metadata=metadata)

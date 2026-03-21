@@ -1,4 +1,7 @@
+import io
+import logging
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -380,3 +383,191 @@ def test_safe_get_exhausts_retries_and_returns_none(monkeypatch):
     assert result is None
     assert call_count[0] == 3
     assert ci._INGEST_STATS["total_failures"] == 1
+
+
+def test_safe_get_logs_http_error_body_on_permanent_failure(monkeypatch, caplog):
+    """_safe_get should include the server response body in permanent failure logs."""
+
+    def fake_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(
+            url="https://example.com/test",
+            code=400,
+            msg="bad request",
+            hdrs=None,
+            fp=io.BytesIO(b'{"error":"offset + limit must be < 10000"}'),
+        )
+
+    monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    ci._reset_ingest_stats(["test"])
+
+    with caplog.at_level(logging.WARNING):
+        result = ci._safe_get("https://example.com/test", provider="test")
+
+    assert result is None
+    assert "offset + limit must be < 10000" in caplog.text
+
+
+def test_semantic_citers_caps_limit_before_api_boundary(monkeypatch):
+    """Semantic Scholar pagination should cap page size so offset + limit stays below 10000."""
+    provider = ci.SemanticScholarProvider()
+    request_pairs = []
+
+    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES):
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qs(parsed.query)
+        offset = int(params["offset"][0])
+        limit = int(params["limit"][0])
+        request_pairs.append((offset, limit))
+        assert offset + limit < 10000
+
+        data = []
+        for index in range(limit):
+            paper_index = offset + index
+            data.append(
+                {
+                    "citingPaper": {
+                        "paperId": f"paper-{paper_index}",
+                        "title": f"Paper {paper_index}",
+                        "year": 2020,
+                        "citationCount": 1,
+                        "externalIds": {},
+                        "abstract": "",
+                    }
+                }
+            )
+
+        return {
+            "total": 12000,
+            "data": data,
+            "next": "has-more",
+        }
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    papers, expected_count, status = provider.fetch_citers_for_l1("semantic_scholar:seed")
+
+    assert request_pairs[-1] == (9000, 999)
+    assert len(request_pairs) == 10
+    assert len(papers) == 9999
+    assert expected_count == 12000
+    assert status == "partial"
+
+
+def test_semantic_citers_stop_without_requesting_at_offset_9999(monkeypatch):
+    """Semantic Scholar pagination should stop cleanly once the next request would cross the API ceiling."""
+    provider = ci.SemanticScholarProvider()
+    request_count = [0]
+    request_offsets = []
+
+    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES):
+        request_count[0] += 1
+        parsed = urllib.parse.urlparse(url)
+        params = urllib.parse.parse_qs(parsed.query)
+        offset = int(params["offset"][0])
+        limit = int(params["limit"][0])
+        request_offsets.append(offset)
+        assert request_count[0] <= 10
+        assert offset + limit < 10000
+        return {
+            "total": 10050,
+            "data": [
+                {
+                    "citingPaper": {
+                        "paperId": f"paper-{offset + index}",
+                        "title": f"Paper {offset + index}",
+                        "year": 2020,
+                        "citationCount": 1,
+                        "externalIds": {},
+                        "abstract": "",
+                    }
+                }
+                for index in range(limit)
+            ],
+            "next": "has-more",
+        }
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    papers, expected_count, status = provider.fetch_citers_for_l1("semantic_scholar:seed")
+
+    assert request_count[0] == 10
+    assert request_offsets[-1] == 9000
+    assert len(papers) == 9999
+    assert expected_count == 10050
+    assert status == "partial"
+
+
+# ---------------------------------------------------------------------------
+# Verbose progress output
+# ---------------------------------------------------------------------------
+
+
+def test_verbose_off_produces_no_output(monkeypatch, capsys):
+    """_vprint and _countdown_sleep should produce no output when verbose is off."""
+    ci.set_verbose(False)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+    ci._vprint("should not appear")
+    ci._countdown_sleep(2.0, "label")
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_verbose_countdown_writes_ticks_to_stderr(monkeypatch, capsys):
+    """_countdown_sleep should write countdown ticks to stderr and clear the line."""
+    ci.set_verbose(True)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+    ci._countdown_sleep(2.0, "test-provider attempt 1/3")
+    captured = capsys.readouterr()
+    ci.set_verbose(False)
+    assert "retrying in" in captured.err
+    # Final clear sequence leaves line ending with \r
+    assert captured.err.endswith("\r")
+
+
+def test_verbose_safe_get_prints_retry_message(monkeypatch, capsys):
+    """When verbose, _safe_get should print retry messages to stderr on transient failures."""
+    call_count = [0]
+
+    def fake_urlopen(req, timeout=None):
+        call_count[0] += 1
+        if call_count[0] < 2:
+            raise _make_http_error(429)
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = b'{"ok": true}'
+        return mock_resp
+
+    monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+    ci._reset_ingest_stats(["test"])
+    ci.set_verbose(True)
+
+    result = ci._safe_get("https://example.com/test", provider="test", max_retries=3)
+    captured = capsys.readouterr()
+    ci.set_verbose(False)
+
+    assert result == {"ok": True}
+    assert "attempt" in captured.err
+    assert "test" in captured.err
+
+
+def test_verbose_safe_get_prints_permanent_failure(monkeypatch, capsys):
+    """When verbose, _safe_get should print a skip message on permanent HTTP failures."""
+
+    def fake_urlopen(req, timeout=None):
+        raise _make_http_error(404)
+
+    monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    ci._reset_ingest_stats(["test"])
+    ci.set_verbose(True)
+
+    result = ci._safe_get("https://example.com/not-found", provider="test")
+    captured = capsys.readouterr()
+    ci.set_verbose(False)
+
+    assert result is None
+    assert "404" in captured.err
+    assert "skipping" in captured.err.lower()
