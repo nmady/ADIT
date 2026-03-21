@@ -1,4 +1,6 @@
+import urllib.error
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import citation_ingestion as ci
 
@@ -181,3 +183,200 @@ def test_ingest_from_internet_metadata_includes_fetch_stats(monkeypatch, tmp_pat
     assert isinstance(stats["total_failures"], int)
     assert isinstance(stats["per_provider_failures"], dict)
     assert stats["per_provider_failures"]["fake"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Cited-by traversal: exhaustive pagination
+# ---------------------------------------------------------------------------
+
+
+class _PagedCitedByProvider(ci.CitationProvider):
+    """Fake provider that supports cited-by traversal and returns 2 pages of citers."""
+
+    name = "paged"
+    capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=True)
+
+    def __init__(self):
+        self.citers_calls: list = []
+
+    def fetch_seed_metadata(self, l1_papers):
+        return {
+            l1: ci.IngestionPaper(
+                paper_id=l1,
+                title="Foundational",
+                citations=50,
+                year=2000,
+                doi="10.1000/xyz1",
+                source_ids={"paged": "PAGED001"},
+            )
+            for l1 in l1_papers
+        }
+
+    def fetch_citers_for_l1(self, l1_provider_id, max_results=None):
+        self.citers_calls.append(l1_provider_id)
+        page1 = {
+            "paged:P001": ci.IngestionPaper(
+                paper_id="paged:P001", title="Citer One", year=2021, citations=5
+            ),
+            "paged:P002": ci.IngestionPaper(
+                paper_id="paged:P002", title="Citer Two", year=2022, citations=3
+            ),
+        }
+        page2 = {
+            "paged:P003": ci.IngestionPaper(
+                paper_id="paged:P003", title="Citer Three", year=2023, citations=1
+            ),
+        }
+        all_papers = {**page1, **page2}
+        if max_results is not None:
+            truncated = dict(list(all_papers.items())[:max_results])
+            status = "partial" if len(truncated) < len(all_papers) else "complete"
+            return truncated, len(all_papers), status
+        return all_papers, len(all_papers), "complete"
+
+    def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
+        return {}, {}
+
+    def fetch_l3_references(self, l2_paper_ids, max_l3=500):
+        return {}, {}
+
+
+def test_ingest_exhaustive_fetches_all_pages(monkeypatch, tmp_path):
+    """Exhaustive mode should collect all citers across provider pages."""
+    provider = _PagedCitedByProvider()
+
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    result = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["paged"],
+        depth="l2",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        exhaustive=True,
+    )
+
+    # All 3 citers must appear in citation_data.
+    all_citing = set(result.citation_data.keys())
+    assert len(all_citing) == 3
+
+    # fetch_citers_for_l1 was called once, for the resolved L1 ID.
+    assert len(provider.citers_calls) == 1
+
+
+def test_ingest_sample_mode_caps_results(monkeypatch, tmp_path):
+    """Non-exhaustive mode should cap citers at max_l2."""
+    provider = _PagedCitedByProvider()
+
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    result = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["paged"],
+        depth="l2",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        exhaustive=False,
+        max_l2=2,
+    )
+
+    assert len(result.citation_data) <= 2
+
+
+def test_ingest_completeness_in_metadata(monkeypatch, tmp_path):
+    """metadata['completeness'] should report status per L1 per provider."""
+    provider = _PagedCitedByProvider()
+
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    result = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["paged"],
+        depth="l2",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        exhaustive=True,
+    )
+
+    assert "completeness" in result.metadata
+    completeness = result.metadata["completeness"]
+    # Should have an entry for the L1 paper.
+    assert len(completeness) == 1
+    l1_entry = next(iter(completeness.values()))
+    assert "paged" in l1_entry
+    assert l1_entry["paged"]["status"] == "complete"
+    assert l1_entry["paged"]["fetched"] == 3
+    assert l1_entry["paged"]["expected"] == 3
+
+
+# ---------------------------------------------------------------------------
+# _safe_get: retry on transient errors, stop on permanent errors
+# ---------------------------------------------------------------------------
+
+
+def _make_http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        url="https://example.com", code=code, msg="err", hdrs=None, fp=None
+    )
+
+
+def test_safe_get_retries_on_429_then_succeeds(monkeypatch):
+    """_safe_get should retry on HTTP 429 and return the response when the retry succeeds."""
+    call_count = [0]
+
+    def fake_urlopen(req, timeout=None):
+        call_count[0] += 1
+        if call_count[0] < 3:
+            raise _make_http_error(429)
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = b'{"ok": true}'
+        return mock_resp
+
+    monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+    ci._reset_ingest_stats(["test"])
+
+    result = ci._safe_get("https://example.com/test", provider="test")
+    assert result == {"ok": True}
+    assert call_count[0] == 3
+
+
+def test_safe_get_stops_immediately_on_permanent_failure(monkeypatch):
+    """_safe_get should not retry on HTTP 403 and should return None immediately."""
+    call_count = [0]
+
+    def fake_urlopen(req, timeout=None):
+        call_count[0] += 1
+        raise _make_http_error(403)
+
+    monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+    ci._reset_ingest_stats(["test"])
+
+    result = ci._safe_get("https://example.com/test", provider="test")
+    assert result is None
+    assert call_count[0] == 1  # No retries for permanent failures.
+    assert ci._INGEST_STATS["total_failures"] == 1
+
+
+def test_safe_get_exhausts_retries_and_returns_none(monkeypatch):
+    """_safe_get should return None after exhausting all retries on transient errors."""
+    call_count = [0]
+
+    def fake_urlopen(req, timeout=None):
+        call_count[0] += 1
+        raise _make_http_error(500)
+
+    monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+    ci._reset_ingest_stats(["test"])
+
+    result = ci._safe_get("https://example.com/test", provider="test", max_retries=3)
+    assert result is None
+    assert call_count[0] == 3
+    assert ci._INGEST_STATS["total_failures"] == 1

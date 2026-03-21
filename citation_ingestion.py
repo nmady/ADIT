@@ -1,8 +1,10 @@
 import hashlib
 import json
 import logging
+import random
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -17,6 +19,7 @@ class ProviderCapabilities:
     supports_doi_lookup: bool
     supports_reference_expansion: bool
     supports_citation_counts: bool
+    supports_cited_by_traversal: bool = False
 
 
 @dataclass
@@ -64,8 +67,33 @@ class CitationProvider:
     ) -> Dict[str, IngestionPaper]:
         return {}
 
+    def fetch_citers_for_l1(
+        self,
+        l1_provider_id: str,
+        max_results: Optional[int] = None,
+    ) -> Tuple[Dict[str, "IngestionPaper"], int, str]:
+        """Fetch all papers that cite this L1 paper via provider-native cited-by traversal.
 
-_CACHE_SCHEMA_VERSION = 4
+        Args:
+            l1_provider_id: Normalized provider ID (e.g. ``"openalex:W123"``).
+            max_results: Cap on returned citers; ``None`` exhausts all pages.
+
+        Returns:
+            ``(papers, expected_count, status)`` where *status* is one of
+            ``"complete"``, ``"partial"``, ``"failed"``, or ``"skipped"``.
+        """
+        raise NotImplementedError
+
+
+_CACHE_SCHEMA_VERSION = 5
+
+# HTTP codes that are safe to retry vs. those that indicate a permanent failure.
+_RETRYABLE_HTTP_CODES = frozenset({429, 500, 502, 503, 504})
+_PERMANENT_FAILURE_HTTP_CODES = frozenset({400, 401, 403, 404})
+_SAFE_GET_MAX_RETRIES = 5
+_SAFE_GET_INITIAL_DELAY = 1.0
+_SAFE_GET_MAX_DELAY = 60.0
+_SAFE_GET_BACKOFF_FACTOR = 2.0
 
 _INGEST_STATS = {
     "total_requests": 0,
@@ -80,19 +108,70 @@ def _reset_ingest_stats(source_list: Sequence[str]) -> None:
     _INGEST_STATS["per_provider_failures"] = {source: 0 for source in source_list}
 
 
-def _safe_get(url: str, timeout: int = 20, provider: Optional[str] = None) -> Optional[dict]:
+def _safe_get(
+    url: str,
+    timeout: int = 20,
+    provider: Optional[str] = None,
+    max_retries: int = _SAFE_GET_MAX_RETRIES,
+) -> Optional[dict]:
+    """Fetch a URL, retrying on transient errors with exponential backoff + jitter.
+
+    Retryable: network/timeout errors and HTTP 429/5xx.
+    Permanent failures: HTTP 400/401/403/404 — these return None immediately.
+    Exhausted retries: also return None and record to _INGEST_STATS.
+    """
     _INGEST_STATS["total_requests"] += 1
     req = urllib.request.Request(url, headers={"User-Agent": "ADIT/0.1 ingestion"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except Exception as error:
-        _INGEST_STATS["total_failures"] += 1
-        if provider:
-            failures = _INGEST_STATS["per_provider_failures"]
-            failures[provider] = int(failures.get(provider, 0)) + 1
-        logger.debug("Ingestion request failed: provider=%s url=%s error=%s", provider, url, error)
-        return None
+    delay = _SAFE_GET_INITIAL_DELAY
+    last_error: Optional[Exception] = None
+
+    for attempt in range(max_retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code in _PERMANENT_FAILURE_HTTP_CODES:
+                _INGEST_STATS["total_failures"] += 1
+                if provider:
+                    failures = _INGEST_STATS["per_provider_failures"]
+                    failures[provider] = int(failures.get(provider, 0)) + 1
+                logger.warning(
+                    "Permanent HTTP failure: provider=%s status=%s url=%s",
+                    provider,
+                    exc.code,
+                    url,
+                )
+                return None
+            last_error = exc
+        except Exception as exc:
+            last_error = exc
+
+        if attempt < max_retries - 1:
+            jitter = random.uniform(0.8, 1.2)
+            sleep_time = min(delay * jitter, _SAFE_GET_MAX_DELAY)
+            logger.debug(
+                "Retryable failure (attempt %d/%d): provider=%s error=%s sleeping=%.1fs",
+                attempt + 1,
+                max_retries,
+                provider,
+                last_error,
+                sleep_time,
+            )
+            time.sleep(sleep_time)
+            delay *= _SAFE_GET_BACKOFF_FACTOR
+
+    _INGEST_STATS["total_failures"] += 1
+    if provider:
+        failures = _INGEST_STATS["per_provider_failures"]
+        failures[provider] = int(failures.get(provider, 0)) + 1
+    logger.warning(
+        "Request failed after %d attempts: provider=%s url=%s final_error=%s",
+        max_retries,
+        provider,
+        url,
+        last_error,
+    )
+    return None
 
 
 def _norm_title(value: str) -> str:
@@ -315,18 +394,66 @@ def _merge_provider_outputs(
 def _fetch_provider_graph(
     provider: CitationProvider,
     l1_norm: Sequence[str],
+    l1_papers_resolved: Dict[str, IngestionPaper],
     theory_name: str,
     key_constructs: Optional[Sequence[str]],
     depth: str,
+    exhaustive: bool,
     max_l2: int,
     max_l3: int,
-) -> tuple[Dict[str, Set[str]], Dict[str, IngestionPaper], Dict[str, int]]:
-    l2_edges, l2_papers = provider.fetch_l2_and_metadata(
-        l1_papers=l1_norm,
-        theory_name=theory_name,
-        key_constructs=key_constructs,
-        max_l2=max_l2,
-    )
+) -> tuple[Dict[str, Set[str]], Dict[str, IngestionPaper], Dict[str, object]]:
+    """Fetch L2 (and optionally L3) papers for a provider.
+
+    When the provider supports cited-by traversal, each L1 seed is queried
+    individually using its resolved provider-native ID so all citers are
+    returned (no title/keyword gate).  Falls back to keyword search for
+    providers that don't support direct cited-by lookup (e.g. Crossref).
+    """
+    l2_edges: Dict[str, Set[str]] = {}
+    l2_papers: Dict[str, IngestionPaper] = {}
+    completeness: Dict[str, Dict[str, object]] = {}
+    max_results: Optional[int] = None if exhaustive else max_l2
+
+    if provider.capabilities.supports_cited_by_traversal:
+        for l1_id in l1_norm:
+            seed = l1_papers_resolved.get(l1_id)
+            raw_provider_id = seed.source_ids.get(provider.name) if seed else None
+            if not raw_provider_id:
+                completeness[l1_id] = {
+                    provider.name: {
+                        "status": "skipped",
+                        "reason": "no_provider_id",
+                        "fetched": 0,
+                        "expected": 0,
+                    }
+                }
+                continue
+
+            l1_native_id = normalize_identifier(raw_provider_id, source=provider.name)
+            papers_for_l1, expected_count, status = provider.fetch_citers_for_l1(
+                l1_native_id, max_results=max_results
+            )
+            completeness.setdefault(l1_id, {})[provider.name] = {
+                "status": status,
+                "fetched": len(papers_for_l1),
+                "expected": expected_count,
+            }
+            for paper_id, paper in papers_for_l1.items():
+                l2_edges.setdefault(paper_id, set()).add(l1_id)
+                if paper_id in l2_papers:
+                    l2_papers[paper_id] = _merge_papers(l2_papers[paper_id], paper)
+                else:
+                    l2_papers[paper_id] = paper
+    else:
+        # Keyword-search fallback: used for Crossref and any provider lacking cited-by support.
+        search_edges, search_papers = provider.fetch_l2_and_metadata(
+            l1_papers=l1_norm,
+            theory_name=theory_name,
+            key_constructs=key_constructs,
+            max_l2=max_l2,
+        )
+        l2_edges.update(search_edges)
+        l2_papers.update(search_papers)
 
     all_edges = dict(l2_edges)
     all_papers = dict(l2_papers)
@@ -340,11 +467,12 @@ def _fetch_provider_graph(
         _merge_provider_outputs(all_edges, all_papers, l3_edges, l3_papers)
         added_l3_edges = sum(len(cited) for cited in l3_edges.values())
 
-    stats = {
+    stats: Dict[str, object] = {
         "l2_nodes": len(l2_edges),
-        "l2_edges": sum(len(values) for values in l2_edges.values()),
+        "l2_edges": sum(len(v) for v in l2_edges.values()),
         "l3_edges": added_l3_edges,
         "papers": len(l2_papers),
+        "completeness": completeness,
     }
     return all_edges, all_papers, stats
 
@@ -368,6 +496,7 @@ def _request_payload(
     depth: str,
     max_l2: int,
     max_l3: int,
+    exhaustive: bool,
 ) -> dict:
     return {
         "cache_schema_version": _CACHE_SCHEMA_VERSION,
@@ -378,6 +507,7 @@ def _request_payload(
         "depth": depth,
         "max_l2": int(max_l2),
         "max_l3": int(max_l3),
+        "exhaustive": bool(exhaustive),
     }
 
 
@@ -397,11 +527,12 @@ def _load_cached_result(cache_root: Path, key: str, refresh: bool) -> Optional[I
 def _build_metadata(
     source_list: Sequence[str],
     depth: str,
-    provider_stats: Dict[str, Dict[str, int]],
+    provider_stats: Dict[str, object],
     cache_key: str,
     alias_map: Dict[str, str],
     papers_data: Dict[str, Dict[str, object]],
     citation_data: Dict[str, List[str]],
+    completeness: Dict[str, Dict[str, object]],
 ) -> Dict[str, object]:
     return {
         "sources": list(source_list),
@@ -412,6 +543,7 @@ def _build_metadata(
             "total_failures": int(_INGEST_STATS["total_failures"]),
             "per_provider_failures": dict(_INGEST_STATS["per_provider_failures"]),
         },
+        "completeness": completeness,
         "cache_key": cache_key,
         "alias_count": len(alias_map),
         "paper_count": len(papers_data),
@@ -421,7 +553,7 @@ def _build_metadata(
 
 class OpenAlexProvider(CitationProvider):
     name = "openalex"
-    capabilities = ProviderCapabilities(True, True, True)
+    capabilities = ProviderCapabilities(True, True, True, supports_cited_by_traversal=True)
 
     def fetch_seed_metadata(
         self,
@@ -446,6 +578,60 @@ class OpenAlexProvider(CitationProvider):
             papers[paper_id] = _paper_from_openalex_item(payload, paper_id)
             time.sleep(0.03)
         return papers
+
+    def fetch_citers_for_l1(
+        self,
+        l1_provider_id: str,
+        max_results: Optional[int] = None,
+    ) -> Tuple[Dict[str, IngestionPaper], int, str]:
+        """Fetch all papers citing this OpenAlex work via cursor-paginated cited-by traversal."""
+        papers: Dict[str, IngestionPaper] = {}
+        # Strip "openalex:" prefix to get bare work ID for the API filter.
+        work_id = l1_provider_id.split(":", 1)[-1] if ":" in l1_provider_id else l1_provider_id
+        cursor = "*"
+        expected_count: Optional[int] = None
+
+        while True:
+            per_page = 200
+            if max_results is not None:
+                remaining = max_results - len(papers)
+                if remaining <= 0:
+                    break
+                per_page = min(per_page, remaining)
+
+            params = urllib.parse.urlencode(
+                {
+                    "filter": f"cites:{work_id}",
+                    "per-page": per_page,
+                    "cursor": cursor,
+                    "select": "id,title,publication_year,cited_by_count,doi,abstract_inverted_index",
+                }
+            )
+            payload = _safe_get(f"https://api.openalex.org/works?{params}", provider=self.name)
+            if not payload:
+                status = "failed" if not papers else "partial"
+                return papers, expected_count or 0, status
+
+            if expected_count is None:
+                meta = payload.get("meta") or {}
+                expected_count = int(meta.get("count") or 0)
+
+            results = payload.get("results") or []
+            for item in results:
+                oa_id = item.get("id") or ""
+                paper_id = normalize_identifier(oa_id, source=self.name)
+                if paper_id:
+                    papers[paper_id] = _paper_from_openalex_item(item, paper_id)
+
+            next_cursor = (payload.get("meta") or {}).get("next_cursor")
+            if not next_cursor or not results:
+                break
+            cursor = next_cursor
+            time.sleep(0.03)
+
+        fetched = len(papers)
+        status = "complete" if (expected_count is None or fetched >= expected_count) else "partial"
+        return papers, expected_count or fetched, status
 
     def fetch_l2_and_metadata(
         self,
@@ -524,7 +710,7 @@ class OpenAlexProvider(CitationProvider):
 
 class SemanticScholarProvider(CitationProvider):
     name = "semantic_scholar"
-    capabilities = ProviderCapabilities(True, True, True)
+    capabilities = ProviderCapabilities(True, True, True, supports_cited_by_traversal=True)
 
     def fetch_seed_metadata(
         self,
@@ -555,6 +741,58 @@ class SemanticScholarProvider(CitationProvider):
             papers[paper_id] = _paper_from_semantic_item(payload, paper_id)
             time.sleep(0.05)
         return papers
+
+    def fetch_citers_for_l1(
+        self,
+        l1_provider_id: str,
+        max_results: Optional[int] = None,
+    ) -> Tuple[Dict[str, IngestionPaper], int, str]:
+        """Fetch all papers citing this S2 paper via offset-paginated citations endpoint."""
+        papers: Dict[str, IngestionPaper] = {}
+        token = l1_provider_id.split(":", 1)[-1] if ":" in l1_provider_id else l1_provider_id
+        offset = 0
+        limit = 1000
+        expected_count: Optional[int] = None
+
+        while True:
+            batch_limit = limit
+            if max_results is not None:
+                remaining = max_results - len(papers)
+                if remaining <= 0:
+                    break
+                batch_limit = min(limit, remaining)
+
+            url = (
+                f"https://api.semanticscholar.org/graph/v1/paper/{token}/citations"
+                f"?fields=paperId,title,year,citationCount,externalIds,abstract"
+                f"&limit={batch_limit}&offset={offset}"
+            )
+            payload = _safe_get(url, provider=self.name)
+            if not payload:
+                status = "failed" if not papers else "partial"
+                return papers, expected_count or 0, status
+
+            data = payload.get("data") or []
+            if expected_count is None and "total" in payload:
+                expected_count = int(payload.get("total") or 0)
+
+            for item_wrapper in data:
+                item = item_wrapper.get("citingPaper") or {}
+                pid_raw = item.get("paperId")
+                if not pid_raw:
+                    continue
+                paper_id = normalize_identifier(pid_raw, source=self.name)
+                papers[paper_id] = _paper_from_semantic_item(item, paper_id)
+
+            # S2 provides a "next" URL when more pages exist; absence or short page means done.
+            if not data or not payload.get("next"):
+                break
+            offset += len(data)
+            time.sleep(0.05)
+
+        fetched = len(papers)
+        status = "complete" if (expected_count is None or fetched >= expected_count) else "partial"
+        return papers, expected_count or fetched, status
 
     def fetch_l2_and_metadata(
         self,
@@ -793,7 +1031,15 @@ def ingest_from_internet(
     refresh: bool = False,
     max_l2: int = 200,
     max_l3: int = 500,
+    exhaustive: bool = True,
 ) -> IngestionResult:
+    """Ingest citation data from internet providers.
+
+    Args:
+        exhaustive: When ``True`` (default), providers that support cited-by
+            traversal paginate until all citers are fetched.  When ``False``,
+            retrieval is capped at *max_l2* results per L1/provider.
+    """
     source_list = ["openalex", "semantic_scholar", "crossref"] if not sources else list(sources)
     _reset_ingest_stats(source_list)
     providers = build_providers(source_list)
@@ -807,6 +1053,7 @@ def ingest_from_internet(
         depth,
         max_l2,
         max_l3,
+        exhaustive,
     )
     key = _cache_key(request_payload)
 
@@ -816,21 +1063,26 @@ def ingest_from_internet(
 
     all_edges: Dict[str, Set[str]] = {}
     l1_norm, all_papers = _seed_l1_papers(l1_papers)
-    provider_stats: Dict[str, Dict[str, int]] = {}
+    provider_stats: Dict[str, object] = {}
+    combined_completeness: Dict[str, Dict[str, object]] = {}
 
     for provider in providers:
         _merge_seed_metadata(all_papers, provider.fetch_seed_metadata(l1_norm))
         provider_edges, provider_papers, stats = _fetch_provider_graph(
             provider=provider,
             l1_norm=l1_norm,
+            l1_papers_resolved=all_papers,
             theory_name=theory_name,
             key_constructs=key_constructs,
             depth=depth,
+            exhaustive=exhaustive,
             max_l2=max_l2,
             max_l3=max_l3,
         )
         _merge_provider_outputs(all_edges, all_papers, provider_edges, provider_papers)
         provider_stats[provider.name] = stats
+        for l1_id, l1_completeness in stats.get("completeness", {}).items():
+            combined_completeness.setdefault(l1_id, {}).update(l1_completeness)
 
     citation_data, papers_data, alias_map = _dedupe_and_materialize(all_edges, all_papers)
 
@@ -842,6 +1094,7 @@ def ingest_from_internet(
         alias_map,
         papers_data,
         citation_data,
+        combined_completeness,
     )
 
     result_payload = {

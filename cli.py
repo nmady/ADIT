@@ -63,6 +63,15 @@ ONLY_INGEST_OPTION = typer.Option(
     False,
     help="Load or fetch citation/paper inputs and exit before feature extraction and ML training.",
 )
+EXHAUSTIVE_OPTION = typer.Option(
+    True,
+    "--exhaustive/--no-exhaustive",
+    help=(
+        "When enabled (default), providers that support cited-by traversal paginate "
+        "until all citers are fetched. Use --no-exhaustive to cap retrieval at max-l2 "
+        "results per L1/provider (faster but incomplete)."
+    ),
+)
 
 
 def _load_config(config_path: Optional[Path]) -> Dict[str, Any]:
@@ -149,6 +158,7 @@ def _resolve_cli_inputs(
     output_predictions: Optional[Path],
     online: bool,
     only_ingest: bool,
+    exhaustive: bool,
 ) -> Dict[str, Any]:
     l1_cfg = cfg.get("l1_papers")
     l1_cfg_str = ",".join(l1_cfg) if isinstance(l1_cfg, list) else None
@@ -187,6 +197,7 @@ def _resolve_cli_inputs(
             Path(cfg["save_ingested_papers_data"]) if cfg.get("save_ingested_papers_data") else None
         ),
         "only_ingest": bool(only_ingest or cfg.get("only_ingest", False)),
+        "exhaustive": bool(exhaustive if exhaustive is not None else cfg.get("exhaustive", True)),
     }
 
 
@@ -225,6 +236,7 @@ def _load_pipeline_inputs(params: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[
             refresh=params["refresh_cache"],
             max_l2=params["max_l2"],
             max_l3=params["max_l3"],
+            exhaustive=params.get("exhaustive", True),
         )
         typer.echo(
             "Online ingestion complete: "
@@ -281,6 +293,7 @@ def run(
     output_features: Optional[Path] = OUTPUT_FEATURES_OPTION,
     output_predictions: Optional[Path] = OUTPUT_PREDICTIONS_OPTION,
     only_ingest: bool = ONLY_INGEST_OPTION,
+    exhaustive: bool = EXHAUSTIVE_OPTION,
 ) -> None:
     """Run ADIT using CLI values and/or a config file."""
     cfg = _load_config(config)
@@ -307,6 +320,7 @@ def run(
         output_predictions,
         online,
         only_ingest,
+        exhaustive,
     )
 
     if not params["theory_name"]:
