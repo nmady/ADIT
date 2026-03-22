@@ -571,3 +571,153 @@ def test_verbose_safe_get_prints_permanent_failure(monkeypatch, capsys):
     assert result is None
     assert "404" in captured.err
     assert "skipping" in captured.err.lower()
+
+
+# ---------------------------------------------------------------------------
+# Retry-After header handling tests
+# ---------------------------------------------------------------------------
+
+
+def test_safe_get_429_retry_after_seconds_header(monkeypatch):
+    """_safe_get should honor Retry-After header with integer seconds on 429."""
+    call_count = [0]
+    sleep_calls = []
+
+    def fake_urlopen(req, timeout=None):
+        call_count[0] += 1
+        if call_count[0] < 3:
+            err = urllib.error.HTTPError(
+                url="https://example.com",
+                code=429,
+                msg="Too Many Requests",
+                hdrs={"Retry-After": "7"},
+                fp=None,
+            )
+            raise err
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = b'{"ok": true}'
+        return mock_resp
+
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(ci.time, "sleep", fake_sleep)
+    ci._reset_ingest_stats(["test"])
+
+    result = ci._safe_get("https://example.com/test", provider="test")
+
+    assert result == {"ok": True}
+    assert call_count[0] == 3
+    # Both retries should use 7s from Retry-After header
+    assert sleep_calls[0] == 7  # Actually _countdown_sleep, but monkeypatch handles both
+
+
+def test_safe_get_429_retry_after_respects_cap(monkeypatch):
+    """_safe_get should cap Retry-After at _SAFE_GET_RETRY_AFTER_MAX_SECONDS."""
+    call_count = [0]
+    sleep_calls = []
+
+    def fake_urlopen(req, timeout=None):
+        call_count[0] += 1
+        if call_count[0] < 2:
+            # Server requests 999 seconds, but we should cap at 300
+            err = urllib.error.HTTPError(
+                url="https://example.com",
+                code=429,
+                msg="Too Many Requests",
+                hdrs={"Retry-After": "999"},
+                fp=None,
+            )
+            raise err
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = b'{"ok": true}'
+        return mock_resp
+
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(ci.time, "sleep", fake_sleep)
+    ci._reset_ingest_stats(["test"])
+
+    result = ci._safe_get("https://example.com/test", provider="test")
+
+    assert result == {"ok": True}
+    # Should use capped value (300 seconds), not the 999 requested
+    assert sleep_calls[0] == ci._SAFE_GET_RETRY_AFTER_MAX_SECONDS
+
+
+def test_safe_get_429_retry_after_invalid_falls_back(monkeypatch):
+    """_safe_get should fall back to exponential backoff when Retry-After is invalid."""
+    call_count = [0]
+    sleep_calls = []
+
+    def fake_urlopen(req, timeout=None):
+        call_count[0] += 1
+        if call_count[0] < 3:
+            # Invalid header format
+            err = urllib.error.HTTPError(
+                url="https://example.com",
+                code=429,
+                msg="Too Many Requests",
+                hdrs={"Retry-After": "not-a-valid-value"},
+                fp=None,
+            )
+            raise err
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = b'{"ok": true}'
+        return mock_resp
+
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(ci.time, "sleep", fake_sleep)
+    ci._reset_ingest_stats(["test"])
+
+    result = ci._safe_get("https://example.com/test", provider="test")
+
+    assert result == {"ok": True}
+    # Should use exponential backoff: 1.0 to 1.2 (first attempt), ~2.0-2.4 (second)
+    # Just verify that it's not the invalid header value and retried successfully
+    assert call_count[0] == 3
+
+
+def test_safe_get_non_429_uses_exponential_backoff(monkeypatch):
+    """_safe_get should use exponential backoff for 5xx errors, not Retry-After."""
+    call_count = [0]
+    sleep_calls = []
+
+    def fake_urlopen(req, timeout=None):
+        call_count[0] += 1
+        if call_count[0] < 3:
+            # 503 Service Unavailable should use exponential backoff
+            raise _make_http_error(503)
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = b'{"ok": true}'
+        return mock_resp
+
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(ci.time, "sleep", fake_sleep)
+    ci._reset_ingest_stats(["test"])
+
+    result = ci._safe_get("https://example.com/test", provider="test")
+
+    assert result == {"ok": True}
+    # First retry: 1.0-1.2s range (with jitter)
+    # Second retry: 2.0-2.4s range (with jitter)
+    # Just verify retries happened and weren't instant
+    assert len(sleep_calls) == 2
+    assert all(s > 0 for s in sleep_calls)

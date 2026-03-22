@@ -22,6 +22,7 @@ key_constructs:
   - psychological need frustration
 cache_dir: .cache/adit_ingestion
 refresh_cache: true
+only_ingest: true
 max_l2: 100
 max_l3: 250
 save_ingested_citation_data: outputs/sdt_citation_data.json

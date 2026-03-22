@@ -96,6 +96,7 @@ _SAFE_GET_MAX_RETRIES = 5
 _SAFE_GET_INITIAL_DELAY = 1.0
 _SAFE_GET_MAX_DELAY = 60.0
 _SAFE_GET_BACKOFF_FACTOR = 2.0
+_SAFE_GET_RETRY_AFTER_MAX_SECONDS = 300  # cap on server-specified Retry-After waits
 
 # ---------------------------------------------------------------------------
 # Verbose terminal output
@@ -117,6 +118,44 @@ def _vprint(msg: str) -> None:
         return
     sys.stderr.write(msg + "\n")
     sys.stderr.flush()
+
+
+def _retry_after_seconds(exc: urllib.error.HTTPError) -> Optional[float]:
+    """Parse Retry-After header from HTTP response as seconds to wait.
+
+    Supports both formats:
+    - integer seconds (e.g. "120")
+    - HTTP-date format (RFC 7231, e.g. "Sun, 06 Nov 2022 08:49:37 GMT")
+
+    Returns None if header is absent or unparseable. If parsed and valid,
+    returns the float seconds to wait (caller will clamp to max cap).
+    """
+    try:
+        retry_after = exc.headers.get("Retry-After")
+        if not retry_after:
+            return None
+
+        # Try parsing as integer seconds first
+        try:
+            return float(int(retry_after))
+        except ValueError:
+            pass
+
+        # Try parsing as HTTP-date (RFC 7231)
+        # Format: "Sun, 06 Nov 2022 08:49:37 GMT"
+        try:
+            from email.utils import parsedate_to_datetime
+            from datetime import datetime, timezone
+
+            retry_datetime = parsedate_to_datetime(retry_after)
+            now = datetime.now(timezone.utc)
+            delta_seconds = (retry_datetime - now).total_seconds()
+            # Ensure we don't return negative or zero
+            return max(0.1, delta_seconds) if delta_seconds > 0 else None
+        except (ValueError, TypeError, AttributeError):
+            return None
+    except Exception:
+        return None
 
 
 def _countdown_sleep(seconds: float, label: str) -> None:
@@ -216,21 +255,35 @@ def _safe_get(
             last_error_body = None
 
         if attempt < max_retries - 1:
-            jitter = random.uniform(0.8, 1.2)
-            sleep_time = min(delay * jitter, _SAFE_GET_MAX_DELAY)
+            # Check if this is a 429 with a Retry-After header; otherwise use exponential backoff
+            sleep_time: Optional[float] = None
+            retry_strategy: str = "exponential backoff"
+
+            if isinstance(last_error, urllib.error.HTTPError) and last_error.code == 429:
+                retry_after = _retry_after_seconds(last_error)
+                if retry_after is not None:
+                    sleep_time = min(retry_after, _SAFE_GET_RETRY_AFTER_MAX_SECONDS)
+                    retry_strategy = f"Retry-After (server requested {retry_after:.0f}s, capped to {sleep_time:.0f}s)"
+
+            # Fall back to exponential backoff if Retry-After was not used
+            if sleep_time is None:
+                jitter = random.uniform(0.8, 1.2)
+                sleep_time = min(delay * jitter, _SAFE_GET_MAX_DELAY)
+
             logger.debug(
-                "Retryable failure (attempt %d/%d): provider=%s error=%s sleeping=%.1fs",
+                "Retryable failure (attempt %d/%d): provider=%s error=%s strategy=%s sleeping=%.1fs",
                 attempt + 1,
                 max_retries,
                 provider,
                 last_error,
+                retry_strategy,
                 sleep_time,
             )
             _vprint(
                 f"  [{provider or 'unknown'}] HTTP error "
                 f"{getattr(last_error, 'code', '?')} — "
                 f"attempt {attempt + 1}/{max_retries}, "
-                f"waiting {sleep_time:.0f}s before retry"
+                f"waiting {sleep_time:.0f}s ({retry_strategy}) before retry"
             )
             _countdown_sleep(
                 sleep_time,
