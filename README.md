@@ -271,7 +271,7 @@ A compact reference for keys accepted in config files (and equivalent CLI flags)
 - **cache_dir**: (path, default: .cache/adit_ingestion) — Directory to cache provider responses and merged ingestion payloads.
 - **refresh_cache**: (bool, default: false) — If true, ignore cached ingestion and force fresh retrieval.
 - **max_l2**: (int, default: 200) — Per-provider cap on L2 candidates requested from each source (effective per-provider limit may be lower due to provider caps).
-- **max_l3**: (int, default: 500) — Per-provider cap on L3 reference edges retrieved when expanding L2 → L3.
+- **max_l3**: (int or null, default: null/unlimited) — Optional per-provider cap on L3 reference edges retrieved when expanding L2 → L3. Omit or set to null for exhaustive L3 retrieval.
 - **save_ingested_citation_data**: (path, optional) — Persist normalized `citation_data.json` produced by online ingestion.
 - **save_ingested_papers_data**: (path, optional) — Persist normalized `papers_data.json` produced by online ingestion.
 - **output_features**: (path, optional) — CSV path to write extracted features.

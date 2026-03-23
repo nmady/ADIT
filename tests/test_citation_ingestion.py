@@ -57,7 +57,7 @@ class _FakeProvider(ci.CitationProvider):
             },
         )
 
-    def fetch_l3_references(self, l2_paper_ids, max_l3=500):
+    def fetch_l3_references(self, l2_paper_ids, max_l3=None):
         return (
             {"openalex:W100": {"doi:10.1000/l3a"}},
             {
@@ -241,7 +241,7 @@ class _PagedCitedByProvider(ci.CitationProvider):
     def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
         return {}, {}
 
-    def fetch_l3_references(self, l2_paper_ids, max_l3=500):
+    def fetch_l3_references(self, l2_paper_ids, max_l3=None):
         return {}, {}
 
 
@@ -532,6 +532,31 @@ def test_semantic_l3_requests_minimal_fields_and_uses_doi_ids(monkeypatch):
     assert papers["semantic_scholar:no-doi-ref"].source_ids == {"semantic_scholar": "no-doi-ref"}
     assert papers["doi:10.1000/l3a"].title == ""
     assert papers["doi:10.1000/l3a"].abstract == ""
+
+
+def test_semantic_l3_default_budget_fetches_all_available_refs(monkeypatch):
+    provider = ci.SemanticScholarProvider()
+
+    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES):
+        return {
+            "references": [
+                {"paperId": "r1", "externalIds": {}},
+                {"paperId": "r2", "externalIds": {}},
+                {"paperId": "r3", "externalIds": {}},
+            ]
+        }
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    edges, papers = provider.fetch_l3_references(["semantic_scholar:seed"])
+
+    assert edges["semantic_scholar:seed"] == {
+        "semantic_scholar:r1",
+        "semantic_scholar:r2",
+        "semantic_scholar:r3",
+    }
+    assert len(papers) == 3
 
 
 def test_openalex_l3_requests_minimal_edges_then_identity_hydration(monkeypatch):

@@ -265,6 +265,7 @@ def test_cli_online_mode_uses_ingestion_without_local_files(monkeypatch):
         assert kwargs["l1_papers"] == ["TAM1", "TAM2"]
         assert kwargs["depth"] == "l2"
         assert kwargs["sources"] == ["openalex", "crossref"]
+        assert kwargs["max_l3"] is None
         return SimpleNamespace(
             citation_data={"PaperA": ["TAM1"]},
             papers_data={
@@ -307,6 +308,54 @@ def test_cli_online_mode_uses_ingestion_without_local_files(monkeypatch):
     assert result.exit_code == 0, result.output
     assert "Online ingestion complete:" in result.output
     assert "Extracted 2 L2 feature rows." in result.output
+
+
+def test_cli_online_mode_honors_configured_max_l3_budget(tmp_path, monkeypatch):
+    """Config should pass an explicit max_l3 budget to ingestion."""
+    monkeypatch.setattr(cli, "ADIT", FakeADIT)
+
+    config_file = tmp_path / "online-config.json"
+    _write_json(
+        config_file,
+        {
+            "online": True,
+            "theory_name": "Technology Acceptance Model",
+            "l1_papers": ["TAM1", "TAM2"],
+            "sources": ["openalex", "crossref"],
+            "depth": "l2",
+            "max_l3": 25,
+        },
+    )
+
+    def fake_ingest(**kwargs):
+        assert kwargs["max_l3"] == 25
+        return SimpleNamespace(
+            citation_data={"PaperA": ["TAM1"]},
+            papers_data={
+                "PaperA": {
+                    "title": "A",
+                    "abstract": "a",
+                    "keywords": "k",
+                    "citations": 1,
+                    "year": 2010,
+                },
+                "TAM1": {
+                    "title": "TAM",
+                    "abstract": "foundation",
+                    "keywords": "tam",
+                    "citations": 100,
+                    "year": 1990,
+                },
+            },
+            metadata={"paper_count": 2, "edge_count": 1},
+        )
+
+    monkeypatch.setattr(cli, "ingest_from_internet", fake_ingest)
+
+    result = runner.invoke(cli.app, ["--config", str(config_file)], color=False)
+
+    assert result.exit_code == 0, result.output
+    assert "Online ingestion complete:" in result.output
 
 
 def test_cli_online_mode_rejects_invalid_depth(monkeypatch):

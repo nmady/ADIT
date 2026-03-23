@@ -46,8 +46,11 @@ MAX_L2_OPTION = typer.Option(
     help="Maximum L2 papers to retrieve per provider in online mode.",
 )
 MAX_L3_OPTION = typer.Option(
-    500,
-    help="Maximum L3 reference edges to retrieve per provider in online mode.",
+    None,
+    help=(
+        "Optional per-provider cap on L3 reference edges in online mode. "
+        "By default, all available L3 references are retrieved."
+    ),
 )
 SAVE_INGESTED_CITATION_OPTION = typer.Option(
     None,
@@ -157,7 +160,7 @@ def _resolve_cli_inputs(
     cache_dir: Optional[Path],
     refresh_cache: bool,
     max_l2: int,
-    max_l3: int,
+    max_l3: Optional[int],
     save_ingested_citation_data: Optional[Path],
     save_ingested_papers_data: Optional[Path],
     output_features: Optional[Path],
@@ -192,7 +195,7 @@ def _resolve_cli_inputs(
         "cache_dir": cache_dir or (Path(cfg["cache_dir"]) if cfg.get("cache_dir") else None),
         "refresh_cache": bool(refresh_cache or cfg.get("refresh_cache", False)),
         "max_l2": int(cfg.get("max_l2", max_l2)),
-        "max_l3": int(cfg.get("max_l3", max_l3)),
+        "max_l3": int(cfg["max_l3"]) if cfg.get("max_l3") is not None else max_l3,
         "save_ingested_citation_data": save_ingested_citation_data
         or (
             Path(cfg["save_ingested_citation_data"])
@@ -296,7 +299,7 @@ def run(
     cache_dir: Optional[Path] = CACHE_DIR_OPTION,
     refresh_cache: bool = REFRESH_CACHE_OPTION,
     max_l2: int = MAX_L2_OPTION,
-    max_l3: int = MAX_L3_OPTION,
+    max_l3: Optional[int] = MAX_L3_OPTION,
     save_ingested_citation_data: Optional[Path] = SAVE_INGESTED_CITATION_OPTION,
     save_ingested_papers_data: Optional[Path] = SAVE_INGESTED_PAPERS_OPTION,
     output_features: Optional[Path] = OUTPUT_FEATURES_OPTION,

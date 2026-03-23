@@ -59,7 +59,7 @@ class CitationProvider:
     def fetch_l3_references(
         self,
         l2_paper_ids: Sequence[str],
-        max_l3: int = 500,
+        max_l3: Optional[int] = None,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
         raise NotImplementedError
 
@@ -554,7 +554,7 @@ def _fetch_provider_graph(
     depth: str,
     exhaustive: bool,
     max_l2: int,
-    max_l3: int,
+    max_l3: Optional[int],
 ) -> tuple[Dict[str, Set[str]], Dict[str, IngestionPaper], Dict[str, object]]:
     """Fetch L2 (and optionally L3) papers for a provider.
 
@@ -655,7 +655,7 @@ def _request_payload(
     sources: Sequence[str],
     depth: str,
     max_l2: int,
-    max_l3: int,
+    max_l3: Optional[int],
     exhaustive: bool,
 ) -> dict:
     return {
@@ -666,7 +666,7 @@ def _request_payload(
         "sources": list(sources),
         "depth": depth,
         "max_l2": int(max_l2),
-        "max_l3": int(max_l3),
+        "max_l3": int(max_l3) if max_l3 is not None else None,
         "exhaustive": bool(exhaustive),
     }
 
@@ -833,14 +833,14 @@ class OpenAlexProvider(CitationProvider):
     def fetch_l3_references(
         self,
         l2_paper_ids: Sequence[str],
-        max_l3: int = 500,
+        max_l3: Optional[int] = None,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
         edges: Dict[str, Set[str]] = {}
         papers: Dict[str, IngestionPaper] = {}
-        budget = max(0, max_l3)
+        budget: Optional[int] = None if max_l3 is None else max(0, max_l3)
 
         for pid in l2_paper_ids:
-            if budget <= 0:
+            if budget is not None and budget <= 0:
                 break
             if not pid.startswith("openalex:"):
                 continue
@@ -853,7 +853,7 @@ class OpenAlexProvider(CitationProvider):
 
             refs = payload.get("referenced_works", []) or []
             for ref in refs:
-                if budget <= 0:
+                if budget is not None and budget <= 0:
                     break
                 ref_id = normalize_identifier(ref, source=self.name)
                 if not ref_id:
@@ -869,7 +869,8 @@ class OpenAlexProvider(CitationProvider):
                         source_ids={"openalex": source_id},
                     ),
                 )
-                budget -= 1
+                if budget is not None:
+                    budget -= 1
             time.sleep(0.03)
 
         # Identity hydration pass: keep the first step lightweight (edge discovery),
@@ -1049,14 +1050,14 @@ class SemanticScholarProvider(CitationProvider):
     def fetch_l3_references(
         self,
         l2_paper_ids: Sequence[str],
-        max_l3: int = 500,
+        max_l3: Optional[int] = None,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
         edges: Dict[str, Set[str]] = {}
         papers: Dict[str, IngestionPaper] = {}
-        budget = max(0, max_l3)
+        budget: Optional[int] = None if max_l3 is None else max(0, max_l3)
 
         for pid in l2_paper_ids:
-            if budget <= 0:
+            if budget is not None and budget <= 0:
                 break
             if not pid.startswith("semantic_scholar:"):
                 continue
@@ -1071,7 +1072,7 @@ class SemanticScholarProvider(CitationProvider):
                 continue
 
             for ref in payload.get("references", []) or []:
-                if budget <= 0:
+                if budget is not None and budget <= 0:
                     break
                 paper = _paper_from_semantic_reference(ref)
                 if not paper:
@@ -1079,7 +1080,8 @@ class SemanticScholarProvider(CitationProvider):
                 ref_id = paper.paper_id
                 edges.setdefault(pid, set()).add(ref_id)
                 papers.setdefault(ref_id, paper)
-                budget -= 1
+                if budget is not None:
+                    budget -= 1
             time.sleep(0.05)
 
         return edges, papers
@@ -1167,7 +1169,7 @@ class CrossrefProvider(CitationProvider):
     def fetch_l3_references(
         self,
         l2_paper_ids: Sequence[str],
-        max_l3: int = 500,
+        max_l3: Optional[int] = None,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
         return {}, {}
 
@@ -1237,7 +1239,7 @@ def ingest_from_internet(
     cache_dir: Optional[Path] = None,
     refresh: bool = False,
     max_l2: int = 200,
-    max_l3: int = 500,
+    max_l3: Optional[int] = None,
     exhaustive: bool = True,
     verbose: bool = False,
 ) -> IngestionResult:
