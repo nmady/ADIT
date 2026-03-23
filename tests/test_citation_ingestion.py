@@ -114,6 +114,7 @@ def test_ingest_from_internet_dedupes_and_uses_cache(monkeypatch, tmp_path):
     citing_id = next(iter(result1.citation_data.keys()))
     assert len(result1.citation_data[citing_id]) == 2
     merged_entry = result1.papers_data[citing_id]
+    assert merged_entry["doi"] == "10.1000/abc"
     assert merged_entry["source_ids"]["openalex"] == "https://openalex.org/W100"
     assert merged_entry["source_ids"]["semantic_scholar"] == "abc123"
 
@@ -497,6 +498,114 @@ def test_semantic_citers_stop_without_requesting_at_offset_9999(monkeypatch):
     assert len(papers) == 9999
     assert expected_count == 10050
     assert status == "partial"
+
+
+def test_semantic_l3_requests_minimal_fields_and_uses_doi_ids(monkeypatch):
+    provider = ci.SemanticScholarProvider()
+    requested_urls = []
+
+    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES):
+        requested_urls.append(url)
+        return {
+            "references": [
+                {
+                    "paperId": "abc123",
+                    "externalIds": {"DOI": "10.1000/l3a"},
+                },
+                {
+                    "paperId": "no-doi-ref",
+                    "externalIds": {},
+                },
+            ]
+        }
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    edges, papers = provider.fetch_l3_references(["semantic_scholar:seed"], max_l3=10)
+
+    assert requested_urls
+    assert requested_urls[0].endswith("?fields=references.paperId,references.externalIds")
+    assert edges["semantic_scholar:seed"] == {"doi:10.1000/l3a", "semantic_scholar:no-doi-ref"}
+    assert papers["doi:10.1000/l3a"].doi == "10.1000/l3a"
+    assert papers["doi:10.1000/l3a"].source_ids == {"semantic_scholar": "abc123"}
+    assert papers["semantic_scholar:no-doi-ref"].source_ids == {"semantic_scholar": "no-doi-ref"}
+    assert papers["doi:10.1000/l3a"].title == ""
+    assert papers["doi:10.1000/l3a"].abstract == ""
+
+
+def test_openalex_l3_requests_minimal_edges_then_identity_hydration(monkeypatch):
+    provider = ci.OpenAlexProvider()
+    requested_urls = []
+
+    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES):
+        requested_urls.append(url)
+        if url.endswith("?select=referenced_works"):
+            return {"referenced_works": ["https://openalex.org/W200"]}
+        if url.endswith("?select=id,doi,title,publication_year"):
+            return {
+                "id": "https://openalex.org/W200",
+                "doi": "https://doi.org/10.1000/l3a",
+                "title": "Hydrated L3",
+                "publication_year": 2018,
+            }
+        return None
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    edges, papers = provider.fetch_l3_references(["openalex:W100"], max_l3=10)
+
+    assert requested_urls == [
+        "https://api.openalex.org/works/W100?select=referenced_works",
+        "https://api.openalex.org/works/W200?select=id,doi,title,publication_year",
+    ]
+    assert edges == {"openalex:W100": {"openalex:W200"}}
+    assert papers["openalex:W200"].doi == "https://doi.org/10.1000/l3a"
+    assert papers["openalex:W200"].title == "Hydrated L3"
+    assert papers["openalex:W200"].year == 2018
+    assert papers["openalex:W200"].source_ids == {"openalex": "https://openalex.org/W200"}
+
+
+def test_dedupe_and_materialize_merges_l3_nodes_by_doi_and_preserves_sources():
+    all_edges = {
+        "semantic_scholar:l2": {"doi:10.1000/l3a"},
+        "crossref:l2": {"crossref:10.1000/l3a"},
+    }
+    all_papers = {
+        "semantic_scholar:l2": ci.IngestionPaper(
+            paper_id="semantic_scholar:l2",
+            title="Parent 1",
+            source_ids={"semantic_scholar": "l2"},
+        ),
+        "crossref:l2": ci.IngestionPaper(
+            paper_id="crossref:l2",
+            title="Parent 2",
+            source_ids={"crossref": "l2"},
+        ),
+        "doi:10.1000/l3a": ci.IngestionPaper(
+            paper_id="doi:10.1000/l3a",
+            doi="10.1000/l3a",
+            source_ids={"semantic_scholar": "abc123"},
+        ),
+        "crossref:10.1000/l3a": ci.IngestionPaper(
+            paper_id="crossref:10.1000/l3a",
+            doi="10.1000/l3a",
+            source_ids={"crossref": "10.1000/l3a"},
+        ),
+    }
+
+    citation_out, papers_out, alias_to_final = ci._dedupe_and_materialize(all_edges, all_papers)
+
+    assert alias_to_final["doi:10.1000/l3a"] == alias_to_final["crossref:10.1000/l3a"]
+    final_l3 = alias_to_final["doi:10.1000/l3a"]
+    assert papers_out[final_l3]["doi"] == "10.1000/l3a"
+    assert papers_out[final_l3]["source_ids"] == {
+        "semantic_scholar": "abc123",
+        "crossref": "10.1000/l3a",
+    }
+    assert final_l3 in citation_out[alias_to_final["semantic_scholar:l2"]]
+    assert final_l3 in citation_out[alias_to_final["crossref:l2"]]
 
 
 # ---------------------------------------------------------------------------

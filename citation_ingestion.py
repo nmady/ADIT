@@ -375,6 +375,8 @@ def _paper_to_output_dict(paper: IngestionPaper) -> Dict[str, object]:
         "citations": int(paper.citations or 0),
         "year": int(paper.year) if paper.year is not None else None,
     }
+    if paper.doi:
+        output["doi"] = paper.doi
     if paper.source_ids:
         output["source_ids"] = dict(paper.source_ids)
     return output
@@ -410,6 +412,25 @@ def _doi_from_identifier(identifier: str) -> Optional[str]:
     if identifier.startswith("doi:"):
         return identifier.split(":", 1)[1]
     return None
+
+
+def _paper_from_semantic_reference(ref: dict) -> Optional[IngestionPaper]:
+    ext_ids = ref.get("externalIds") or {}
+    doi = ext_ids.get("DOI")
+    paper_id_raw = ref.get("paperId")
+
+    if doi:
+        paper_id = normalize_identifier(doi)
+    elif paper_id_raw:
+        paper_id = normalize_identifier(paper_id_raw, source="semantic_scholar")
+    else:
+        return None
+
+    source_ids = {}
+    if paper_id_raw:
+        source_ids["semantic_scholar"] = str(paper_id_raw)
+
+    return IngestionPaper(paper_id=paper_id, doi=doi, source_ids=source_ids)
 
 
 def _reconstruct_openalex_abstract(inv_idx: dict) -> str:
@@ -825,7 +846,7 @@ class OpenAlexProvider(CitationProvider):
                 continue
 
             openalex_token = pid.split(":", 1)[1]
-            url = f"https://api.openalex.org/works/{openalex_token}"
+            url = f"https://api.openalex.org/works/{openalex_token}?select=referenced_works"
             payload = _safe_get(url, provider=self.name)
             if not payload:
                 continue
@@ -838,10 +859,40 @@ class OpenAlexProvider(CitationProvider):
                 if not ref_id:
                     continue
                 edges.setdefault(pid, set()).add(ref_id)
+                token = ref_id.split(":", 1)[1] if ref_id.startswith("openalex:") else ""
+                source_id = f"https://openalex.org/{token}" if token else str(ref)
                 papers.setdefault(
-                    ref_id, IngestionPaper(paper_id=ref_id, doi=_doi_from_identifier(ref_id))
+                    ref_id,
+                    IngestionPaper(
+                        paper_id=ref_id,
+                        doi=_doi_from_identifier(ref_id),
+                        source_ids={"openalex": source_id},
+                    ),
                 )
                 budget -= 1
+            time.sleep(0.03)
+
+        # Identity hydration pass: keep the first step lightweight (edge discovery),
+        # then fetch only minimal identity fields needed for cross-provider dedup.
+        for ref_id, existing in list(papers.items()):
+            if not ref_id.startswith("openalex:"):
+                continue
+
+            token = ref_id.split(":", 1)[1]
+            url = f"https://api.openalex.org/works/{token}?select=id,doi,title,publication_year"
+            payload = _safe_get(url, provider=self.name)
+            if not payload:
+                continue
+
+            year_raw = payload.get("publication_year")
+            hydrated = IngestionPaper(
+                paper_id=ref_id,
+                title=payload.get("title") or "",
+                year=int(year_raw) if year_raw else None,
+                doi=payload.get("doi"),
+                source_ids={"openalex": str(payload.get("id") or f"https://openalex.org/{token}")},
+            )
+            papers[ref_id] = _merge_papers(existing, hydrated)
             time.sleep(0.03)
 
         return edges, papers
@@ -1013,7 +1064,7 @@ class SemanticScholarProvider(CitationProvider):
             token = pid.split(":", 1)[1]
             url = (
                 "https://api.semanticscholar.org/graph/v1/paper/"
-                f"{token}?fields=references.paperId,references.title,references.year"
+                f"{token}?fields=references.paperId,references.externalIds"
             )
             payload = _safe_get(url, provider=self.name)
             if not payload:
@@ -1022,19 +1073,12 @@ class SemanticScholarProvider(CitationProvider):
             for ref in payload.get("references", []) or []:
                 if budget <= 0:
                     break
-                rid = ref.get("paperId")
-                if not rid:
+                paper = _paper_from_semantic_reference(ref)
+                if not paper:
                     continue
-                ref_id = normalize_identifier(rid, source=self.name)
+                ref_id = paper.paper_id
                 edges.setdefault(pid, set()).add(ref_id)
-                papers.setdefault(
-                    ref_id,
-                    IngestionPaper(
-                        paper_id=ref_id,
-                        title=ref.get("title") or ref_id,
-                        year=int(ref.get("year") or 2010),
-                    ),
-                )
+                papers.setdefault(ref_id, paper)
                 budget -= 1
             time.sleep(0.05)
 
