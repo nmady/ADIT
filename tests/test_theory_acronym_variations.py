@@ -155,7 +155,7 @@ class TestAcronymConsistencyInPipeline:
                 "year": 1962,
             },
         }
-        features = adit.extract_features(papers_data)
+        adit.extract_features(papers_data)
         assert adit.acronym == "di"
 
     def test_acronym_accessible_after_train_classifier(self, mock_transformer):

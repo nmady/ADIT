@@ -108,6 +108,9 @@ If `labels_data` is omitted, the CLI extracts features and skips training/predic
 - Supported v1 providers are `openalex`, `semantic_scholar`, and `crossref`.
 - Results from multiple providers are normalized and deduplicated before building the citation ecosystem.
 - `--depth l2` retrieves direct citers of the L1 papers; `--depth l2l3` also retrieves references from L2 papers to populate L3.
+- L2 contract: every admitted L2 paper must cite at least one L1 seed paper.
+- Title or theory-name matches alone are not sufficient for L2 inclusion.
+- Crossref is used for metadata enrichment of accepted papers and seed DOIs, not for L2 graph discovery.
 - `--cache-dir` stores cached ingestion results so repeated runs can reuse prior retrieval work.
 - `--refresh-cache` forces a fresh internet retrieval instead of reusing cached results.
 - `--only-ingest` runs ingestion and exits before feature extraction/training.
@@ -257,7 +260,7 @@ This includes `fetch_stats`:
 
 A compact reference for keys accepted in config files (and equivalent CLI flags). Types shown as (type, default).
 
-- **theory_name**: (string, required) — Human-readable theory name used for keyword matching and acronym derivation. CLI: `--theory-name`.
+- **theory_name**: (string, required) — Human-readable theory name used in supervised learning step and acronym derivation. CLI: `--theory-name`.
 - **acronym**: (string, optional) — Explicit acronym to search for (e.g., `TAM`). If omitted, derived from `theory_name`.
 - **l1_papers**: (list|string, required) — L1 seed papers. In YAML provide a list, or use comma-separated string on CLI. Example: `[TAM1, TAM2]` or `--l1-papers "TAM1,TAM2"`.
 - **l1_file**: (path, optional) — Path to newline-separated file of L1 paper IDs (alternative to `l1_papers`).
@@ -270,7 +273,7 @@ A compact reference for keys accepted in config files (and equivalent CLI flags)
 - **key_constructs**: (list|string, optional) — Additional keywords to bias provider search relevance. Accepts YAML lists or comma-separated strings.
 - **cache_dir**: (path, default: .cache/adit_ingestion) — Directory to cache provider responses and merged ingestion payloads.
 - **refresh_cache**: (bool, default: false) — If true, ignore cached ingestion and force fresh retrieval.
-- **max_l2**: (int, default: 200) — Per-provider cap on L2 candidates requested from each source (effective per-provider limit may be lower due to provider caps).
+- **max_l2**: (int, default: 200) — Per-provider cap on L2 retrieval. Admitted L2 papers must explicitly cite an L1 seed.
 - **max_l3**: (int or null, default: null/unlimited) — Optional per-provider cap on L3 reference edges retrieved when expanding L2 → L3. Omit or set to null for exhaustive L3 retrieval.
 - **save_ingested_citation_data**: (path, optional) — Persist normalized `citation_data.json` produced by online ingestion.
 - **save_ingested_papers_data**: (path, optional) — Persist normalized `papers_data.json` produced by online ingestion.
@@ -280,6 +283,7 @@ A compact reference for keys accepted in config files (and equivalent CLI flags)
 Notes:
 - Many config keys accept either YAML lists (recommended for examples) or comma-separated CLI strings — the CLI normalizes both formats.
 - `max_l2`/`max_l3` are applied per-provider; the final L2/L3 coverage is the union of provider outputs after deduplication.
+- Crossref contributes metadata enrichment for accepted papers, but does not add L2 graph nodes or edges.
 - Use `year: null` in `papers_data.json` to indicate unknown publication year; ADIT emits `pub_year` as `NaN` and imputes numeric features at training time.
 
 ## Adaptation Notes

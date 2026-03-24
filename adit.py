@@ -49,7 +49,6 @@ def derive_acronym(theory_name: str) -> str:
 
 
 class ADIT:
-
     def __init__(self, theory_name, l1_papers, transformer=None, acronym=None):
         """
         Initialize ADIT for a specific theory.

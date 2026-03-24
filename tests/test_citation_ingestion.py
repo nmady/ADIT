@@ -85,6 +85,55 @@ def test_build_providers_ignores_unknown_sources():
     assert names == ["openalex", "crossref"]
 
 
+def test_should_keep_openalex_item_requires_linked_l1():
+    assert ci._should_keep_openalex_item({}, ["doi:10.1000/l1"], "Theory") is True
+    assert ci._should_keep_openalex_item({"title": "Theory in title"}, [], "Theory") is False
+
+
+def test_should_keep_semantic_item_requires_linked_l1():
+    assert ci._should_keep_semantic_item({}, {"doi:10.1000/l1"}, "Theory") is True
+    assert ci._should_keep_semantic_item({"title": "Theory in title"}, set(), "Theory") is False
+
+
+def test_crossref_l2_discovery_is_disabled(monkeypatch):
+    provider = ci.CrossrefProvider()
+
+    safe_get_called = False
+
+    def fake_safe_get(*args, **kwargs):
+        nonlocal safe_get_called
+        safe_get_called = True
+        return {}
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+
+    edges, papers = provider.fetch_l2_and_metadata(
+        l1_papers=["doi:10.1000/l1"],
+        theory_name="Technology Acceptance Model",
+        key_constructs=["usefulness"],
+        max_l2=50,
+    )
+
+    assert edges == {}
+    assert papers == {}
+    assert safe_get_called is False
+
+
+def test_crossref_enrichment_targets_include_only_l2_with_dois():
+    all_papers = {
+        "openalex:W1": ci.IngestionPaper(paper_id="openalex:W1", doi="10.1000/a"),
+        "semantic_scholar:S2": ci.IngestionPaper(paper_id="semantic_scholar:S2", doi="10.1000/b"),
+        "openalex:W3": ci.IngestionPaper(paper_id="openalex:W3"),
+    }
+
+    targets = ci._crossref_enrichment_targets(
+        ["openalex:W1", "semantic_scholar:S2", "openalex:W3"],
+        all_papers,
+    )
+
+    assert targets == ["doi:10.1000/a", "doi:10.1000/b"]
+
+
 def test_ingest_from_internet_dedupes_and_uses_cache(monkeypatch, tmp_path):
     provider = _FakeProvider()
 
@@ -187,6 +236,54 @@ def test_ingest_from_internet_metadata_includes_fetch_stats(monkeypatch, tmp_pat
     assert isinstance(stats["total_failures"], int)
     assert isinstance(stats["per_provider_failures"], dict)
     assert stats["per_provider_failures"]["fake"] == 0
+
+
+def test_crossref_enriches_existing_l2_metadata_without_adding_l2_edges(monkeypatch, tmp_path):
+    fake_provider = _FakeProvider()
+    crossref_provider = ci.CrossrefProvider()
+
+    def fake_build_providers(_sources):
+        return [fake_provider, crossref_provider]
+
+    crossref_calls = []
+
+    def fake_crossref_seed_metadata(self, l1_papers):
+        crossref_calls.append(list(l1_papers))
+        if l1_papers == ["doi:10.1000/xyz1"]:
+            return {}
+        assert l1_papers == ["doi:10.1000/abc"]
+        return {
+            "doi:10.1000/abc": ci.IngestionPaper(
+                paper_id="doi:10.1000/abc",
+                title="Crossref Enriched Title",
+                citations=99,
+                year=2021,
+                doi="10.1000/abc",
+                source_ids={"crossref": "10.1000/abc"},
+            )
+        }
+
+    monkeypatch.setattr(ci, "build_providers", fake_build_providers)
+    monkeypatch.setattr(ci.CrossrefProvider, "fetch_seed_metadata", fake_crossref_seed_metadata)
+
+    result = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["fake", "crossref"],
+        depth="l2",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        max_l2=10,
+        max_l3=0,
+    )
+
+    assert result.metadata["provider_stats"]["crossref"]["l2_nodes"] == 0
+    assert result.metadata["provider_stats"]["crossref"]["l2_edges"] == 0
+    assert result.metadata["provider_stats"]["crossref"]["metadata_enriched"] == 1
+    assert crossref_calls == [["doi:10.1000/xyz1"], ["doi:10.1000/abc"]]
+
+    citing_id = next(iter(result.citation_data.keys()))
+    assert result.papers_data[citing_id]["source_ids"]["crossref"] == "10.1000/abc"
 
 
 # ---------------------------------------------------------------------------
