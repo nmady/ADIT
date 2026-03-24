@@ -7,7 +7,12 @@ from adit import ADIT
 def test_extract_features_columns_and_values(
     mock_transformer, sample_citation_data, sample_papers_data
 ):
-    adit = ADIT("TAM", ["TAM1"], transformer=mock_transformer)
+    adit = ADIT(
+        "TAM",
+        ["TAM1"],
+        transformer=mock_transformer,
+        key_constructs=["usefulness", "ease of use", "acceptance", "intention", "attitude"],
+    )
     adit.build_ecosystem(sample_citation_data)
 
     features = adit.extract_features(sample_papers_data)

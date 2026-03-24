@@ -100,7 +100,12 @@ class TestEdgeCases:
 
     def test_papers_without_constructs(self, mock_transformer, sample_citation_data):
         """Test paper that mentions no key constructs."""
-        adit = ADIT("TAM", ["TAM1"], transformer=mock_transformer)
+        adit = ADIT(
+            "TAM",
+            ["TAM1"],
+            transformer=mock_transformer,
+            key_constructs=["usefulness", "ease of use", "acceptance", "intention", "attitude"],
+        )
         adit.build_ecosystem(sample_citation_data)
 
         papers_data = {

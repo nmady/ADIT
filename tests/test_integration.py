@@ -10,7 +10,12 @@ def test_adit_full_pipeline(mock_transformer, sample_citation_data, sample_paper
     """Test the complete ADIT workflow: build → extract → train → predict."""
 
     # 1. Initialize ADIT with mocked transformer
-    adit = ADIT("TAM", ["TAM1", "TAM2"], transformer=mock_transformer)
+    adit = ADIT(
+        "TAM",
+        ["TAM1", "TAM2"],
+        transformer=mock_transformer,
+        key_constructs=["usefulness", "ease of use", "acceptance"],
+    )
 
     # 2. Build ecosystem
     adit.build_ecosystem(sample_citation_data)

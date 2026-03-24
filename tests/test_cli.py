@@ -18,10 +18,11 @@ class FakeADIT:
 
     last_instance = None
 
-    def __init__(self, theory_name, l1_papers, acronym=None):
+    def __init__(self, theory_name, l1_papers, acronym=None, key_constructs=None):
         self.theory_name = theory_name
         self.l1_papers = l1_papers
         self.acronym = acronym.lower() if acronym else derive_acronym(theory_name)
+        self.key_constructs = key_constructs or []
         self.trained = False
         FakeADIT.last_instance = self
 

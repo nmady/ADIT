@@ -49,17 +49,26 @@ def derive_acronym(theory_name: str) -> str:
 
 
 class ADIT:
-    def __init__(self, theory_name, l1_papers, transformer=None, acronym=None):
+    def __init__(
+        self,
+        theory_name,
+        l1_papers,
+        transformer=None,
+        acronym=None,
+        key_constructs=None,
+    ):
         """
         Initialize ADIT for a specific theory.
 
         :param theory_name: Name of the theory (e.g., 'TAM')
         :param l1_papers: List of originating paper IDs or titles
         :param acronym: Optional explicit acronym (e.g., 'TAM'). If omitted, derived from theory_name.
+        :param key_constructs: Optional user-provided constructs for construct features.
         """
         self.theory_name = theory_name
         self.acronym = acronym.lower() if acronym else derive_acronym(theory_name)
         self.l1_papers = l1_papers
+        self.key_constructs = self._normalize_constructs(key_constructs)
         self.ecosystem = nx.DiGraph()
         # Dependency injection: accept an optional transformer for easier testing
         self.transformer = transformer or SentenceTransformer(
@@ -138,6 +147,21 @@ class ADIT:
             return None
         return year_value
 
+    @staticmethod
+    def _normalize_constructs(key_constructs):
+        if not key_constructs:
+            return []
+
+        normalized = []
+        seen = set()
+        for item in key_constructs:
+            token = str(item).strip().lower()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            normalized.append(token)
+        return normalized
+
     def _compute_betweenness_scores(self):
         try:
             return nx.betweenness_centrality(self.ecosystem)
@@ -149,10 +173,9 @@ class ADIT:
             return dict.fromkeys(self.ecosystem.nodes(), 0.0)
 
     def _extract_construct_features(self, title, abstract):
-        key_constructs = ["usefulness", "ease of use", "acceptance", "intention", "attitude"]
         return {
             f"has_{construct.replace(' ', '_')}": int(construct in title or construct in abstract)
-            for construct in key_constructs
+            for construct in self.key_constructs
         }
 
     def _compute_semantic_similarity(self, theory_emb, abstract):

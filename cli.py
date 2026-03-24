@@ -145,6 +145,14 @@ def _resolve_labels(labels_data: Any, features: pd.DataFrame) -> List[int]:
     raise typer.BadParameter("labels_data must be either a JSON list or dict.")
 
 
+def _parse_key_constructs(raw_constructs: Any) -> List[str]:
+    if isinstance(raw_constructs, list):
+        return [str(item).strip() for item in raw_constructs if str(item).strip()]
+    if raw_constructs is None:
+        return []
+    return [item.strip() for item in str(raw_constructs).split(",") if item.strip()]
+
+
 def _resolve_cli_inputs(
     cfg: Dict[str, Any],
     theory_name: Optional[str],
@@ -228,11 +236,7 @@ def _load_pipeline_inputs(params: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[
                 item.strip() for item in str(raw_sources).split(",") if item.strip()
             ]
 
-        raw_constructs = params.get("key_constructs") or ""
-        if isinstance(raw_constructs, list):
-            constructs = [s.strip() for s in raw_constructs if s and s.strip()]
-        else:
-            constructs = [item.strip() for item in str(raw_constructs).split(",") if item.strip()]
+        constructs = _parse_key_constructs(params.get("key_constructs"))
 
         if params["depth"] not in {"l2", "l2l3"}:
             raise typer.BadParameter("depth must be either 'l2' or 'l2l3' in online mode.")
@@ -341,6 +345,7 @@ def run(
         raise typer.BadParameter("theory_name is required (CLI arg or config).")
 
     citation_dict, papers_dict = _load_pipeline_inputs(params)
+    constructs = _parse_key_constructs(params.get("key_constructs"))
 
     if params["only_ingest"]:
         typer.echo(
@@ -352,6 +357,7 @@ def run(
         theory_name=params["theory_name"],
         l1_papers=params["l1"],
         acronym=params["acronym"],
+        key_constructs=constructs,
     )
     adit.build_ecosystem(citation_dict)
     features = adit.extract_features(papers_dict)
