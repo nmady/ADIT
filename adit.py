@@ -125,6 +125,94 @@ class ADIT:
             eigenfactor_scores = dict.fromkeys(self.ecosystem.nodes(), 1.0)
         return eigenfactor_scores
 
+    @staticmethod
+    def _coerce_year(value):
+        """Return a numeric year or None when missing or invalid."""
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            year_value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(year_value):
+            return None
+        return year_value
+
+    def _compute_betweenness_scores(self):
+        try:
+            return nx.betweenness_centrality(self.ecosystem)
+        except Exception:
+            logging.warning(
+                "Betweenness centrality computation failed, using zero scores as fallback",
+                exc_info=True,
+            )
+            return dict.fromkeys(self.ecosystem.nodes(), 0.0)
+
+    def _extract_construct_features(self, title, abstract):
+        key_constructs = ["usefulness", "ease of use", "acceptance", "intention", "attitude"]
+        return {
+            f"has_{construct.replace(' ', '_')}": int(construct in title or construct in abstract)
+            for construct in key_constructs
+        }
+
+    def _compute_semantic_similarity(self, theory_emb, abstract):
+        paper_emb = self.transformer.encode(abstract)
+        norm_theory = np.linalg.norm(theory_emb)
+        norm_paper = np.linalg.norm(paper_emb)
+        if norm_theory > 0 and norm_paper > 0:
+            return np.dot(theory_emb, paper_emb) / (norm_theory * norm_paper)
+        return 0.0
+
+    def _build_feature_row(
+        self,
+        node,
+        papers_data,
+        eigenfactor_scores,
+        betweenness_scores,
+        theory_emb,
+        min_year,
+        year_range,
+        known_years,
+    ):
+        paper_info = papers_data.get(node, {})
+        title = paper_info.get("title", "").lower()
+        abstract = paper_info.get("abstract", "").lower()
+        keywords = paper_info.get("keywords", "").lower()
+        citation_count = paper_info.get("citations", 0)
+        year = self._coerce_year(paper_info.get("year"))
+
+        l2_papers_cited = sum(
+            eigenfactor_scores.get(ref, 0.0)
+            for ref in self.ecosystem.successors(node)
+            if self.ecosystem.nodes[ref].get("level") == "L2"
+        )
+        total_refs = len(list(self.ecosystem.successors(node)))
+        tar = (l2_papers_cited / max(total_refs, 1)) if total_refs > 0 else 0.0
+
+        pub_year_norm = np.nan if year is None or not known_years else (year - min_year) / year_range
+        theory_name = self.theory_name.lower()
+        acronym = self.acronym
+
+        return {
+            "paper_id": node,
+            "eigenfactor": eigenfactor_scores.get(node, 0.0),
+            "betweenness": betweenness_scores.get(node, 0.0),
+            "theory_attribution_ratio": tar,
+            "citation_count": citation_count,
+            "pub_year": pub_year_norm,
+            "abstract_word_count": len(abstract.split()),
+            "theory_in_title": int(theory_name in title),
+            "theory_in_keywords": int(theory_name in keywords),
+            "theory_in_abstract": int(theory_name in abstract),
+            "acronym_in_title": int(acronym in title),
+            "acronym_in_keywords": int(acronym in keywords),
+            "acronym_in_abstract": int(acronym in abstract),
+            **self._extract_construct_features(title, abstract),
+            "semantic_similarity": self._compute_semantic_similarity(theory_emb, abstract),
+            "in_degree": self.ecosystem.in_degree(node),
+            "out_degree": self.ecosystem.out_degree(node),
+        }
+
     def extract_features(self, papers_data):
         """
         Extract features for L2 papers combining hand-designed and modern NLP features.
@@ -147,42 +235,18 @@ class ADIT:
         :return: DataFrame with features
         """
 
-        def _coerce_year(value):
-            """Return a numeric year or None when missing/invalid."""
-            if value is None or isinstance(value, bool):
-                return None
-            try:
-                year_value = float(value)
-            except (TypeError, ValueError):
-                return None
-            if not np.isfinite(year_value):
-                return None
-            return year_value
-
         features = []
         concat_L1_abs = " ".join(
             [papers_data.get(p, {}).get("abstract", "") for p in self.l1_papers]
         )
         theory_emb = self.transformer.encode(concat_L1_abs)
-
-        # Compute network centrality measures
-        try:
-            betweenness_scores = nx.betweenness_centrality(self.ecosystem)
-        except Exception:
-            # If betweenness computation fails (resource limit or other issue),
-            # assign zero betweenness so downstream feature pipeline continues.
-            logging.warning(
-                "Betweenness centrality computation failed, using zero scores as fallback",
-                exc_info=True,
-            )
-            betweenness_scores = dict.fromkeys(self.ecosystem.nodes(), 0.0)
-
+        betweenness_scores = self._compute_betweenness_scores()
         eigenfactor_scores = self.compute_eigenfactor()
 
         # Determine min and max year for dynamic normalization using only known years.
         known_years = [
             yr
-            for yr in (_coerce_year(meta.get("year")) for meta in papers_data.values())
+            for yr in (self._coerce_year(meta.get("year")) for meta in papers_data.values())
             if yr is not None
         ]
         min_year = min(known_years) if known_years else 0.0
@@ -190,102 +254,20 @@ class ADIT:
         year_range = max_year - min_year if max_year > min_year else 1
 
         for node, data in self.ecosystem.nodes(data=True):
-            if data.get("level") == "L2":
-                paper_info = papers_data.get(node, {})
-                title = paper_info.get("title", "").lower()
-                abstract = paper_info.get("abstract", "").lower()
-                keywords = paper_info.get("keywords", "").lower()
-                citation_count = paper_info.get("citations", 0)
-                year = _coerce_year(paper_info.get("year"))
-
-                # 1. Network feature: Eigenfactor_Eco (article-level Eigenfactor)
-                eigenfactor = eigenfactor_scores.get(node, 0.0)
-
-                # 2. Network feature: Betweenness centrality (bridge importance)
-                betweenness = betweenness_scores.get(node, 0.0)
-
-                # 2. Theory-Attribution Ratio (TAR): fraction of references to L2 papers
-                l2_papers_cited = 0
-                total_refs = len(list(self.ecosystem.successors(node)))
-                for ref in self.ecosystem.successors(node):
-                    ref_data = self.ecosystem.nodes[ref]
-                    if ref_data.get("level") == "L2":
-                        l2_papers_cited += eigenfactor_scores.get(ref, 0.0)
-                tar = (l2_papers_cited / max(total_refs, 1)) if total_refs > 0 else 0.0
-
-                # 3. Citation count
-
-                # 4. Publication year (normalized dynamically to [0, 1]).
-                # Missing/invalid year is preserved as NaN (unknown).
-                if year is None or not known_years:
-                    pub_year_norm = np.nan
-                else:
-                    pub_year_norm = (year - min_year) / year_range
-
-                # 5. Abstract word count
-                word_count = len(abstract.split())
-
-                # 6-8. Theory name in title/keywords/abstract (binary)
-                theory_name = self.theory_name.lower()
-                theory_in_title = int(theory_name in title)
-                theory_in_keywords = int(theory_name in keywords)
-                theory_in_abstract = int(theory_name in abstract)
-
-                # 9-11. Theory acronym in title/keywords/abstract (binary)
-                acronym = self.acronym
-                acronym_in_title = int(acronym in title)
-                acronym_in_keywords = int(acronym in keywords)
-                acronym_in_abstract = int(acronym in abstract)
-
-                # 12. Key constructs - individual binary flags (example: TAM uses "usefulness", "ease of use")
-                key_constructs = [
-                    "usefulness",
-                    "ease of use",
-                    "acceptance",
-                    "intention",
-                    "attitude",
-                ]
-                construct_features = {}
-                for construct in key_constructs:
-                    feature_name = f"has_{construct.replace(' ', '_')}"
-                    construct_features[feature_name] = int(
-                        construct in title or construct in abstract
-                    )
-
-                # 13. Semantic similarity (modern NLP via embeddings)
-                paper_emb = self.transformer.encode(abstract)
-                norm_theory = np.linalg.norm(theory_emb)
-                norm_paper = np.linalg.norm(paper_emb)
-                if norm_theory > 0 and norm_paper > 0:
-                    semantic_similarity = np.dot(theory_emb, paper_emb) / (norm_theory * norm_paper)
-                else:
-                    semantic_similarity = 0.0
-
-                # 14-15. Network structure: in_degree and out_degree
-                in_degree = self.ecosystem.in_degree(node)
-                out_degree = self.ecosystem.out_degree(node)
-
-                features.append(
-                    {
-                        "paper_id": node,
-                        "eigenfactor": eigenfactor,
-                        "betweenness": betweenness,
-                        "theory_attribution_ratio": tar,
-                        "citation_count": citation_count,
-                        "pub_year": pub_year_norm,
-                        "abstract_word_count": word_count,
-                        "theory_in_title": theory_in_title,
-                        "theory_in_keywords": theory_in_keywords,
-                        "theory_in_abstract": theory_in_abstract,
-                        "acronym_in_title": acronym_in_title,
-                        "acronym_in_keywords": acronym_in_keywords,
-                        "acronym_in_abstract": acronym_in_abstract,
-                        **construct_features,  # Unpack individual construct flags
-                        "semantic_similarity": semantic_similarity,
-                        "in_degree": in_degree,
-                        "out_degree": out_degree,
-                    }
+            if data.get("level") != "L2":
+                continue
+            features.append(
+                self._build_feature_row(
+                    node,
+                    papers_data,
+                    eigenfactor_scores,
+                    betweenness_scores,
+                    theory_emb,
+                    min_year,
+                    year_range,
+                    known_years,
                 )
+            )
 
         return pd.DataFrame(features)
 

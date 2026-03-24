@@ -90,7 +90,6 @@ class CitationProvider:
 _CACHE_SCHEMA_VERSION = 5
 
 # HTTP codes that are safe to retry vs. those that indicate a permanent failure.
-_RETRYABLE_HTTP_CODES = frozenset({429, 500, 502, 503, 504})
 _PERMANENT_FAILURE_HTTP_CODES = frozenset({400, 401, 403, 404})
 _SAFE_GET_MAX_RETRIES = 5
 _SAFE_GET_INITIAL_DELAY = 1.0
@@ -210,6 +209,27 @@ def _reset_ingest_stats(source_list: Sequence[str]) -> None:
     _INGEST_STATS["per_provider_failures"] = dict.fromkeys(source_list, 0)
 
 
+def _record_request_failure(provider: Optional[str]) -> None:
+    _INGEST_STATS["total_failures"] += 1
+    if provider:
+        failures = _INGEST_STATS["per_provider_failures"]
+        failures[provider] = int(failures.get(provider, 0)) + 1
+
+
+def _compute_retry_sleep(last_error: Exception, delay: float) -> Tuple[float, str]:
+    if isinstance(last_error, urllib.error.HTTPError) and last_error.code == 429:
+        retry_after = _retry_after_seconds(last_error)
+        if retry_after is not None:
+            sleep_time = min(retry_after, _SAFE_GET_RETRY_AFTER_MAX_SECONDS)
+            strategy = (
+                f"Retry-After (server requested {retry_after:.0f}s, capped to {sleep_time:.0f}s)"
+            )
+            return sleep_time, strategy
+
+    jitter = random.uniform(0.8, 1.2)
+    return min(delay * jitter, _SAFE_GET_MAX_DELAY), "exponential backoff"
+
+
 def _safe_get(
     url: str,
     timeout: int = 20,
@@ -222,59 +242,37 @@ def _safe_get(
     Permanent failures: HTTP 400/401/403/404 — these return None immediately.
     Exhausted retries: also return None and record to _INGEST_STATS.
     """
-    # Simplify the request loop by delegating a single-attempt try/except to a helper.
     _INGEST_STATS["total_requests"] += 1
     req = urllib.request.Request(url, headers={"User-Agent": "ADIT/0.1 ingestion"})
     delay = _SAFE_GET_INITIAL_DELAY
     last_error: Optional[Exception] = None
     last_error_body: Optional[str] = None
 
-    def _attempt_single() -> Tuple[bool, Optional[dict], Optional[Exception], Optional[str]]:
+    for attempt in range(max_retries):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return True, json.loads(resp.read().decode("utf-8")), None, None
+                return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            return False, None, exc, _http_error_body(exc)
+            error_body = _http_error_body(exc)
+            last_error_body = error_body
+            if exc.code in _PERMANENT_FAILURE_HTTP_CODES:
+                _record_request_failure(provider)
+                logger.warning(
+                    "Permanent HTTP failure: provider=%s status=%s url=%s body=%s",
+                    provider,
+                    exc.code,
+                    url,
+                    error_body,
+                )
+                _vprint(f"  [{provider or 'unknown'}] Permanent HTTP {exc.code} — skipping request")
+                return None
+            last_error = exc
         except Exception as exc:
-            return False, None, exc, None
-
-    for attempt in range(max_retries):
-        success, result, err, err_body = _attempt_single()
-        if success:
-            return result
-
-        last_error = err
-        last_error_body = err_body
-
-        # If we received a permanent HTTP error, record and bail out early.
-        if isinstance(last_error, urllib.error.HTTPError) and last_error.code in _PERMANENT_FAILURE_HTTP_CODES:
-            _INGEST_STATS["total_failures"] += 1
-            if provider:
-                failures = _INGEST_STATS["per_provider_failures"]
-                failures[provider] = int(failures.get(provider, 0)) + 1
-            logger.warning(
-                "Permanent HTTP failure: provider=%s status=%s url=%s body=%s",
-                provider,
-                last_error.code,
-                url,
-                last_error_body,
-            )
-            _vprint(f"  [{provider or 'unknown'}] Permanent HTTP {last_error.code} — skipping request")
-            return None
+            last_error = exc
+            last_error_body = None
 
         if attempt < max_retries - 1:
-            sleep_time: Optional[float] = None
-            retry_strategy: str = "exponential backoff"
-
-            if isinstance(last_error, urllib.error.HTTPError) and last_error.code == 429:
-                retry_after = _retry_after_seconds(last_error)
-                if retry_after is not None:
-                    sleep_time = min(retry_after, _SAFE_GET_RETRY_AFTER_MAX_SECONDS)
-                    retry_strategy = f"Retry-After (server requested {retry_after:.0f}s, capped to {sleep_time:.0f}s)"
-
-            if sleep_time is None:
-                jitter = random.uniform(0.8, 1.2)
-                sleep_time = min(delay * jitter, _SAFE_GET_MAX_DELAY)
+            sleep_time, retry_strategy = _compute_retry_sleep(last_error, delay)
 
             logger.debug(
                 "Retryable failure (attempt %d/%d): provider=%s error=%s strategy=%s sleeping=%.1fs",
@@ -297,10 +295,7 @@ def _safe_get(
             )
             delay *= _SAFE_GET_BACKOFF_FACTOR
 
-    _INGEST_STATS["total_failures"] += 1
-    if provider:
-        failures = _INGEST_STATS["per_provider_failures"]
-        failures[provider] = int(failures.get(provider, 0)) + 1
+    _record_request_failure(provider)
     logger.warning(
         "Request failed after %d attempts: provider=%s url=%s final_error=%s body=%s",
         max_retries,
@@ -472,6 +467,58 @@ def _paper_from_openalex_item(item: dict, paper_id: str) -> IngestionPaper:
         doi=item.get("doi"),
         source_ids={"openalex": str(item.get("id", ""))},
     )
+
+
+def _openalex_reference_stub(ref_id: str, ref: str) -> IngestionPaper:
+    token = ref_id.split(":", 1)[1] if ref_id.startswith("openalex:") else ""
+    source_id = f"https://openalex.org/{token}" if token else str(ref)
+    return IngestionPaper(
+        paper_id=ref_id,
+        doi=_doi_from_identifier(ref_id),
+        source_ids={"openalex": source_id},
+    )
+
+
+def _openalex_hydrated_paper(ref_id: str, payload: dict) -> IngestionPaper:
+    year_raw = payload.get("publication_year")
+    token = ref_id.split(":", 1)[1]
+    return IngestionPaper(
+        paper_id=ref_id,
+        title=payload.get("title") or "",
+        year=int(year_raw) if year_raw else None,
+        doi=payload.get("doi"),
+        source_ids={"openalex": str(payload.get("id") or f"https://openalex.org/{token}")},
+    )
+
+
+def _semantic_fetch_status(
+    papers: Dict[str, IngestionPaper],
+    expected_count: Optional[int],
+) -> Tuple[int, str]:
+    fetched = len(papers)
+    status = "complete" if expected_count is not None and fetched >= expected_count else "partial"
+    return fetched, status
+
+
+def _semantic_batch_limit(
+    offset: int,
+    limit: int,
+    papers: Dict[str, IngestionPaper],
+    max_results: Optional[int],
+) -> Optional[int]:
+    batch_limit = limit
+    if max_results is not None:
+        remaining = max_results - len(papers)
+        if remaining <= 0:
+            return None
+        batch_limit = min(limit, remaining)
+
+    max_allowed = 9999 - offset
+    if max_allowed <= 0:
+        return None
+
+    batch_limit = min(batch_limit, max_allowed)
+    return batch_limit if batch_limit > 0 else None
 
 
 def _semantic_linked_l1(item: dict, l1_norm: Set[str]) -> Set[str]:
@@ -726,6 +773,58 @@ class OpenAlexProvider(CitationProvider):
     name = "openalex"
     capabilities = ProviderCapabilities(True, True, True, supports_cited_by_traversal=True)
 
+    def _collect_l3_reference_edges(
+        self,
+        l2_paper_ids: Sequence[str],
+        budget: Optional[int],
+    ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper], Optional[int]]:
+        edges: Dict[str, Set[str]] = {}
+        papers: Dict[str, IngestionPaper] = {}
+
+        for pid in l2_paper_ids:
+            if budget is not None and budget <= 0:
+                break
+            if not pid.startswith("openalex:"):
+                continue
+
+            openalex_token = pid.split(":", 1)[1]
+            url = f"https://api.openalex.org/works/{openalex_token}?select=referenced_works"
+            payload = _safe_get(url, provider=self.name)
+            if not payload:
+                continue
+
+            refs = payload.get("referenced_works", []) or []
+            for ref in refs:
+                if budget is not None and budget <= 0:
+                    break
+                ref_id = normalize_identifier(ref, source=self.name)
+                if not ref_id:
+                    continue
+                edges.setdefault(pid, set()).add(ref_id)
+                papers.setdefault(ref_id, _openalex_reference_stub(ref_id, ref))
+                if budget is not None:
+                    budget -= 1
+            time.sleep(0.03)
+
+        return edges, papers, budget
+
+    def _hydrate_l3_reference_papers(self, papers: Dict[str, IngestionPaper]) -> None:
+        # Identity hydration pass: keep the first step lightweight (edge discovery),
+        # then fetch only minimal identity fields needed for cross-provider dedup.
+        for ref_id, existing in list(papers.items()):
+            if not ref_id.startswith("openalex:"):
+                continue
+
+            token = ref_id.split(":", 1)[1]
+            url = f"https://api.openalex.org/works/{token}?select=id,doi,title,publication_year"
+            payload = _safe_get(url, provider=self.name)
+            if not payload:
+                continue
+
+            hydrated = _openalex_hydrated_paper(ref_id, payload)
+            papers[ref_id] = _merge_papers(existing, hydrated)
+            time.sleep(0.03)
+
     def fetch_seed_metadata(
         self,
         l1_papers: Sequence[str],
@@ -846,68 +945,9 @@ class OpenAlexProvider(CitationProvider):
         l2_paper_ids: Sequence[str],
         max_l3: Optional[int] = None,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
-        edges: Dict[str, Set[str]] = {}
-        papers: Dict[str, IngestionPaper] = {}
         budget: Optional[int] = None if max_l3 is None else max(0, max_l3)
-
-        for pid in l2_paper_ids:
-            if budget is not None and budget <= 0:
-                break
-            if not pid.startswith("openalex:"):
-                continue
-
-            openalex_token = pid.split(":", 1)[1]
-            url = f"https://api.openalex.org/works/{openalex_token}?select=referenced_works"
-            payload = _safe_get(url, provider=self.name)
-            if not payload:
-                continue
-
-            refs = payload.get("referenced_works", []) or []
-            for ref in refs:
-                if budget is not None and budget <= 0:
-                    break
-                ref_id = normalize_identifier(ref, source=self.name)
-                if not ref_id:
-                    continue
-                edges.setdefault(pid, set()).add(ref_id)
-                token = ref_id.split(":", 1)[1] if ref_id.startswith("openalex:") else ""
-                source_id = f"https://openalex.org/{token}" if token else str(ref)
-                papers.setdefault(
-                    ref_id,
-                    IngestionPaper(
-                        paper_id=ref_id,
-                        doi=_doi_from_identifier(ref_id),
-                        source_ids={"openalex": source_id},
-                    ),
-                )
-                if budget is not None:
-                    budget -= 1
-            time.sleep(0.03)
-
-        # Identity hydration pass delegated to a small helper to reduce function complexity
-        def _hydrate_openalex_papers(papers_map: Dict[str, IngestionPaper]) -> None:
-            for ref_id, existing in list(papers_map.items()):
-                if not ref_id.startswith("openalex:"):
-                    continue
-
-                token = ref_id.split(":", 1)[1]
-                url = f"https://api.openalex.org/works/{token}?select=id,doi,title,publication_year"
-                payload = _safe_get(url, provider=self.name)
-                if not payload:
-                    continue
-
-                year_raw = payload.get("publication_year")
-                hydrated = IngestionPaper(
-                    paper_id=ref_id,
-                    title=payload.get("title") or "",
-                    year=int(year_raw) if year_raw else None,
-                    doi=payload.get("doi"),
-                    source_ids={"openalex": str(payload.get("id") or f"https://openalex.org/{token}")},
-                )
-                papers_map[ref_id] = _merge_papers(existing, hydrated)
-                time.sleep(0.03)
-
-        _hydrate_openalex_papers(papers)
+        edges, papers, _ = self._collect_l3_reference_edges(l2_paper_ids, budget)
+        self._hydrate_l3_reference_papers(papers)
 
         return edges, papers
 
@@ -951,9 +991,6 @@ class SemanticScholarProvider(CitationProvider):
         l1_provider_id: str,
         max_results: Optional[int] = None,
     ) -> Tuple[Dict[str, IngestionPaper], int, str]:
-        # The method contains provider-specific pagination and boundary logic
-        # which is intentionally kept explicit; complexity is high but well-tested.
-        # noqa: C901
         """Fetch all papers citing this S2 paper via offset-paginated citations endpoint."""
         papers: Dict[str, IngestionPaper] = {}
         token = l1_provider_id.split(":", 1)[-1] if ":" in l1_provider_id else l1_provider_id
@@ -962,35 +999,9 @@ class SemanticScholarProvider(CitationProvider):
         expected_count: Optional[int] = None
 
         while True:
-            batch_limit = limit
-            if max_results is not None:
-                remaining = max_results - len(papers)
-                if remaining <= 0:
-                    break
-                batch_limit = min(limit, remaining)
-
-            # Semantic Scholar enforces `offset + limit < 10000` and returns
-            # HTTP 400 if that boundary is crossed ("offset + limit must be < 10000").
-            # Compute the maximum allowed `limit` for the next request so we
-            # never issue a request where `offset + limit >= 10000`.
-            max_allowed = 9999 - offset
-            if max_allowed <= 0:
-                fetched = len(papers)
-                status = (
-                    "complete"
-                    if expected_count is not None and fetched >= expected_count
-                    else "partial"
-                )
-                return papers, expected_count or fetched, status
-
-            batch_limit = min(batch_limit, max_allowed)
-            if batch_limit <= 0:
-                fetched = len(papers)
-                status = (
-                    "complete"
-                    if expected_count is not None and fetched >= expected_count
-                    else "partial"
-                )
+            batch_limit = _semantic_batch_limit(offset, limit, papers, max_results)
+            if batch_limit is None:
+                fetched, status = _semantic_fetch_status(papers, expected_count)
                 return papers, expected_count or fetched, status
 
             url = (
