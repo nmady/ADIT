@@ -8,6 +8,7 @@ sources:
   - openalex
   - semantic_scholar
   - crossref
+  - core
 depth: l2l3
 key_constructs:
   - usefulness

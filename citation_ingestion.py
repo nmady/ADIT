@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import random
 import re
 import sys
@@ -235,6 +236,7 @@ def _safe_get(
     timeout: int = 20,
     provider: Optional[str] = None,
     max_retries: int = _SAFE_GET_MAX_RETRIES,
+    headers: Optional[Dict[str, str]] = None,
 ) -> Optional[dict]:
     """Fetch a URL, retrying on transient errors with exponential backoff + jitter.
 
@@ -243,7 +245,10 @@ def _safe_get(
     Exhausted retries: also return None and record to _INGEST_STATS.
     """
     _INGEST_STATS["total_requests"] += 1
-    req = urllib.request.Request(url, headers={"User-Agent": "ADIT/0.1 ingestion"})
+    request_headers = {"User-Agent": "ADIT/0.1 ingestion"}
+    if headers:
+        request_headers.update(headers)
+    req = urllib.request.Request(url, headers=request_headers)
     delay = _SAFE_GET_INITIAL_DELAY
     last_error: Optional[Exception] = None
     last_error_body: Optional[str] = None
@@ -407,6 +412,12 @@ def _query_terms(theory_name: str, key_constructs: Optional[Sequence[str]]) -> s
     return " ".join([t for t in terms if t])
 
 
+def _core_auth_headers(api_key: Optional[str]) -> Dict[str, str]:
+    if not api_key:
+        return {}
+    return {"Authorization": f"Bearer {api_key}"}
+
+
 def _doi_from_identifier(identifier: str) -> Optional[str]:
     if not identifier:
         return None
@@ -565,6 +576,51 @@ def _paper_from_semantic_item(item: dict, paper_id: str) -> IngestionPaper:
         citations=int(item.get("citationCount") or 0),
         doi=ext_ids.get("DOI"),
         source_ids={"semantic_scholar": str(item.get("paperId", ""))},
+    )
+
+
+def _core_reference_candidates(ref: dict) -> List[str]:
+    candidates: List[str] = []
+    doi = ref.get("doi")
+    if doi:
+        candidates.append(normalize_identifier(str(doi)))
+
+    ref_id = ref.get("id")
+    if ref_id is not None:
+        candidates.append(normalize_identifier(str(ref_id), source="core"))
+    return [candidate for candidate in candidates if candidate]
+
+
+def _paper_from_core_item(item: dict, paper_id: str) -> IngestionPaper:
+    doi = item.get("doi")
+    core_id = item.get("id")
+    year_raw = item.get("yearPublished")
+    if year_raw is None:
+        year_raw = item.get("year_published")
+
+    citations_raw = item.get("citationCount")
+    if citations_raw is None:
+        citations_raw = item.get("citation_count")
+
+    subjects = item.get("subjects") or []
+    if isinstance(subjects, list):
+        keywords = ", ".join(str(subject) for subject in subjects if subject)
+    else:
+        keywords = str(subjects or "")
+
+    source_ids: Dict[str, str] = {}
+    if core_id is not None:
+        source_ids["core"] = str(core_id)
+
+    return IngestionPaper(
+        paper_id=paper_id,
+        title=str(item.get("title") or ""),
+        abstract=str(item.get("abstract") or ""),
+        keywords=keywords,
+        citations=int(citations_raw or 0),
+        year=int(year_raw) if year_raw else None,
+        doi=str(doi) if doi else None,
+        source_ids=source_ids,
     )
 
 
@@ -1172,10 +1228,163 @@ class CrossrefProvider(CitationProvider):
         return {}, {}
 
 
+class CoreProvider(CitationProvider):
+    name = "core"
+    capabilities = ProviderCapabilities(True, True, True, supports_cited_by_traversal=False)
+
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key
+
+    def _headers(self) -> Dict[str, str]:
+        return _core_auth_headers(self.api_key)
+
+    def _search_works(self, query: str, limit: int) -> List[dict]:
+        params = urllib.parse.urlencode({"q": query, "limit": max(1, min(limit, 100))})
+        payload = _safe_get(
+            f"https://api.core.ac.uk/v3/search/works/?{params}",
+            provider=self.name,
+            headers=self._headers(),
+        )
+        return list((payload or {}).get("results") or [])
+
+    def _work_by_identifier(self, identifier: str) -> Optional[dict]:
+        encoded = urllib.parse.quote(identifier, safe=":/.")
+        return _safe_get(
+            f"https://api.core.ac.uk/v3/works/{encoded}",
+            provider=self.name,
+            headers=self._headers(),
+        )
+
+    def _lookup_work(self, paper_id: str) -> Optional[dict]:
+        doi = _doi_from_identifier(paper_id)
+        if doi:
+            matches = self._search_works(f'doi:"{doi}"', limit=1)
+            return matches[0] if matches else None
+        if paper_id.startswith("core:"):
+            return self._work_by_identifier(paper_id.split(":", 1)[1])
+        return None
+
+    def _reference_to_paper(self, ref: dict) -> Optional[IngestionPaper]:
+        ref_doi = ref.get("doi")
+        ref_id = ref.get("id")
+        if ref_doi:
+            normalized_ref = normalize_identifier(str(ref_doi))
+        elif ref_id is not None:
+            normalized_ref = normalize_identifier(str(ref_id), source=self.name)
+        else:
+            normalized_ref = ""
+
+        if not normalized_ref:
+            return None
+
+        return IngestionPaper(
+            paper_id=normalized_ref,
+            title=str(ref.get("title") or ""),
+            doi=str(ref_doi) if ref_doi else None,
+            source_ids={"core": str(ref_id)} if ref_id is not None else {},
+        )
+
+    def fetch_seed_metadata(
+        self,
+        l1_papers: Sequence[str],
+    ) -> Dict[str, IngestionPaper]:
+        papers: Dict[str, IngestionPaper] = {}
+        for paper_id in l1_papers:
+            doi = _doi_from_identifier(paper_id)
+            payload: Optional[dict] = None
+
+            if doi:
+                matches = self._search_works(f'doi:"{doi}"', limit=1)
+                payload = matches[0] if matches else None
+            elif paper_id.startswith("core:"):
+                payload = self._work_by_identifier(paper_id.split(":", 1)[1])
+
+            if not payload:
+                continue
+
+            papers[paper_id] = _paper_from_core_item(payload, paper_id)
+            time.sleep(0.03)
+        return papers
+
+    def fetch_l2_and_metadata(
+        self,
+        l1_papers: Sequence[str],
+        theory_name: str,
+        key_constructs: Optional[Sequence[str]] = None,
+        max_l2: int = 200,
+    ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
+        edges: Dict[str, Set[str]] = {}
+        papers: Dict[str, IngestionPaper] = {}
+        l1_norm = {normalize_identifier(v) for v in l1_papers}
+
+        items = self._search_works(_query_terms(theory_name, key_constructs), limit=max_l2)
+        for item in items:
+            doi = item.get("doi")
+            core_id = item.get("id")
+            paper_id = ""
+            if doi:
+                paper_id = normalize_identifier(str(doi))
+            elif core_id is not None:
+                paper_id = normalize_identifier(str(core_id), source=self.name)
+            if not paper_id:
+                continue
+
+            linked_l1: Set[str] = set()
+            for ref in item.get("references") or []:
+                for candidate in _core_reference_candidates(ref):
+                    if candidate in l1_norm:
+                        linked_l1.add(candidate)
+
+            if not linked_l1:
+                continue
+
+            edges.setdefault(paper_id, set()).update(linked_l1)
+            papers[paper_id] = _paper_from_core_item(item, paper_id)
+            for ref in linked_l1:
+                papers.setdefault(ref, IngestionPaper(paper_id=ref, doi=_doi_from_identifier(ref)))
+            time.sleep(0.03)
+
+        return edges, papers
+
+    def fetch_l3_references(
+        self,
+        l2_paper_ids: Sequence[str],
+        max_l3: Optional[int] = None,
+    ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
+        edges: Dict[str, Set[str]] = {}
+        papers: Dict[str, IngestionPaper] = {}
+        budget: Optional[int] = None if max_l3 is None else max(0, max_l3)
+
+        for pid in l2_paper_ids:
+            if budget is not None and budget <= 0:
+                break
+
+            payload = self._lookup_work(pid)
+            if not payload:
+                continue
+
+            for ref in payload.get("references") or []:
+                if budget is not None and budget <= 0:
+                    break
+
+                paper = self._reference_to_paper(ref)
+                if not paper:
+                    continue
+
+                edges.setdefault(pid, set()).add(paper.paper_id)
+                papers.setdefault(paper.paper_id, paper)
+                if budget is not None:
+                    budget -= 1
+            time.sleep(0.03)
+
+        return edges, papers
+
+
 _PROVIDER_REGISTRY = {
     "openalex": OpenAlexProvider,
     "semantic_scholar": SemanticScholarProvider,
     "crossref": CrossrefProvider,
+    "core": CoreProvider,
 }
 
 
@@ -1186,7 +1395,10 @@ def build_providers(sources: Sequence[str]) -> List[CitationProvider]:
         provider_cls = _PROVIDER_REGISTRY.get(key)
         if provider_cls is None:
             continue
-        providers.append(provider_cls())
+        if key == "core":
+            providers.append(provider_cls(api_key=os.getenv("CORE_API_KEY")))
+        else:
+            providers.append(provider_cls())
     return providers
 
 
@@ -1251,7 +1463,9 @@ def ingest_from_internet(
             (per-seed status, retry countdowns).
     """
     set_verbose(verbose)
-    source_list = ["openalex", "semantic_scholar", "crossref"] if not sources else list(sources)
+    source_list = (
+        ["openalex", "semantic_scholar", "crossref", "core"] if not sources else list(sources)
+    )
     _reset_ingest_stats(source_list)
     providers = build_providers(source_list)
     _vprint(

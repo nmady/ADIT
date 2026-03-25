@@ -85,6 +85,32 @@ def test_build_providers_ignores_unknown_sources():
     assert names == ["openalex", "crossref"]
 
 
+def test_build_providers_core_reads_env_key(monkeypatch):
+    monkeypatch.setenv("CORE_API_KEY", "secret-key")
+    providers = ci.build_providers(["core"])
+
+    assert len(providers) == 1
+    assert providers[0].name == "core"
+    assert getattr(providers[0], "api_key", None) == "secret-key"
+
+
+def test_build_providers_core_without_env_key(monkeypatch):
+    monkeypatch.delenv("CORE_API_KEY", raising=False)
+    providers = ci.build_providers(["core"])
+
+    assert len(providers) == 1
+    assert providers[0].name == "core"
+    assert getattr(providers[0], "api_key", "missing") is None
+
+
+def test_core_auth_headers_is_empty_without_key():
+    assert ci._core_auth_headers(None) == {}
+
+
+def test_core_auth_headers_uses_bearer_key():
+    assert ci._core_auth_headers("abc123") == {"Authorization": "Bearer abc123"}
+
+
 def test_should_keep_openalex_item_requires_linked_l1():
     assert ci._should_keep_openalex_item({}, ["doi:10.1000/l1"], "Theory") is True
     assert ci._should_keep_openalex_item({"title": "Theory in title"}, [], "Theory") is False

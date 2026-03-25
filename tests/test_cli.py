@@ -359,6 +359,54 @@ def test_cli_online_mode_honors_configured_max_l3_budget(tmp_path, monkeypatch):
     assert "Online ingestion complete:" in result.output
 
 
+def test_cli_online_mode_default_sources_include_core(monkeypatch):
+    """Online mode without --sources should include CORE by default."""
+    monkeypatch.setattr(cli, "ADIT", FakeADIT)
+
+    def fake_ingest(**kwargs):
+        assert kwargs["sources"] == ["openalex", "semantic_scholar", "crossref", "core"]
+        return SimpleNamespace(
+            citation_data={"PaperA": ["TAM1"]},
+            papers_data={
+                "PaperA": {
+                    "title": "A",
+                    "abstract": "a",
+                    "keywords": "k",
+                    "citations": 1,
+                    "year": 2010,
+                },
+                "TAM1": {
+                    "title": "TAM",
+                    "abstract": "foundation",
+                    "keywords": "tam",
+                    "citations": 100,
+                    "year": 1990,
+                },
+            },
+            metadata={"paper_count": 2, "edge_count": 1},
+        )
+
+    monkeypatch.setattr(cli, "ingest_from_internet", fake_ingest)
+    monkeypatch.delenv("CORE_API_KEY", raising=False)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "--online",
+            "--theory-name",
+            "Technology Acceptance Model",
+            "--l1-papers",
+            "TAM1,TAM2",
+            "--depth",
+            "l2",
+        ],
+        color=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Warning: CORE selected without CORE_API_KEY." in result.output
+
+
 def test_cli_online_mode_rejects_invalid_depth(monkeypatch):
     """Online mode should validate supported depth values."""
     monkeypatch.setattr(cli, "ADIT", FakeADIT)

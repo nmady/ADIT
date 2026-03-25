@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,7 +30,7 @@ ONLINE_OPTION = typer.Option(
 )
 SOURCES_OPTION = typer.Option(
     None,
-    help="Comma-separated providers for online mode: openalex,semantic_scholar,crossref.",
+    help="Comma-separated providers for online mode: openalex,semantic_scholar,crossref,core.",
 )
 DEPTH_OPTION = typer.Option("l2l3", help="Online expansion depth: l2 or l2l3.")
 KEY_CONSTRUCTS_OPTION = typer.Option(
@@ -228,13 +229,21 @@ def _persist_json(path: Path, payload: Dict[str, Any], label: str) -> None:
 
 def _load_pipeline_inputs(params: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
     if params["online"]:
-        raw_sources = params.get("sources") or "openalex,semantic_scholar,crossref"
+        raw_sources = params.get("sources") or "openalex,semantic_scholar,crossref,core"
         if isinstance(raw_sources, list):
             selected_sources = [s.strip() for s in raw_sources if s and s.strip()]
         else:
             selected_sources = [
                 item.strip() for item in str(raw_sources).split(",") if item.strip()
             ]
+
+        if "core" in [source.lower() for source in selected_sources] and not os.getenv(
+            "CORE_API_KEY"
+        ):
+            typer.echo(
+                "Warning: CORE selected without CORE_API_KEY. Continuing in unauthenticated mode "
+                "with stricter rate limits and reduced full-text access.",
+            )
 
         constructs = _parse_key_constructs(params.get("key_constructs"))
 

@@ -51,7 +51,7 @@ python cli.py \
 	--theory-name "Technology Acceptance Model" \
 	--acronym TAM \
 	--l1-papers "10.2307/249008,10.1287/mnsc.35.8.982" \
-	--sources "openalex,semantic_scholar,crossref" \
+	--sources "openalex,semantic_scholar,crossref,core" \
 	--depth l2l3 \
 	--key-constructs "usefulness,ease of use,behavioral intention" \
 	--cache-dir .cache/adit_ingestion \
@@ -89,6 +89,7 @@ sources:
 	- openalex
 	- semantic_scholar
 	- crossref
+	- core
 depth: l2l3
 key_constructs:
 	- usefulness
@@ -105,7 +106,9 @@ If `labels_data` is omitted, the CLI extracts features and skips training/predic
 ### Online Ingestion Notes
 
 - Online mode is opt-in via `--online`; without it, the CLI still expects local `citation_data` and `papers_data` JSON files.
-- Supported v1 providers are `openalex`, `semantic_scholar`, and `crossref`.
+- Supported v1 providers are `openalex`, `semantic_scholar`, `crossref`, and `core`.
+- Default online sources are `openalex,semantic_scholar,crossref,core` when `--sources` is not provided.
+- CORE runs unauthenticated by default, but using `CORE_API_KEY` increases rate limits and improves access.
 - Results from multiple providers are normalized and deduplicated before building the citation ecosystem.
 - `--depth l2` retrieves direct citers of the L1 papers; `--depth l2l3` also retrieves references from L2 papers to populate L3.
 - L2 contract: every admitted L2 paper must cite at least one L1 seed paper.

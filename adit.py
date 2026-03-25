@@ -212,7 +212,9 @@ class ADIT:
         total_refs = len(list(self.ecosystem.successors(node)))
         tar = (l2_papers_cited / max(total_refs, 1)) if total_refs > 0 else 0.0
 
-        pub_year_norm = np.nan if year is None or not known_years else (year - min_year) / year_range
+        pub_year_norm = (
+            np.nan if year is None or not known_years else (year - min_year) / year_range
+        )
         theory_name = self.theory_name.lower()
         acronym = self.acronym
 
