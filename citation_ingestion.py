@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ProviderCapabilities:
+    """Declares which ingestion features a provider implementation supports."""
+
     supports_doi_lookup: bool
     supports_reference_expansion: bool
     supports_citation_counts: bool
@@ -28,6 +30,8 @@ class ProviderCapabilities:
 
 @dataclass
 class IngestionPaper:
+    """Canonical in-memory representation of a paper across all providers."""
+
     paper_id: str
     title: str = ""
     abstract: str = ""
@@ -40,6 +44,8 @@ class IngestionPaper:
 
 @dataclass
 class IngestionResult:
+    """Final normalized graph, paper metadata table, and run metadata."""
+
     citation_data: Dict[str, List[str]]
     papers_data: Dict[str, Dict[str, object]]
     metadata: Dict[str, object]
@@ -56,6 +62,7 @@ class CitationProvider:
         key_constructs: Optional[Sequence[str]] = None,
         max_l2: int = 200,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
+        """Return L2 citation edges and metadata for discovered papers."""
         raise NotImplementedError
 
     def fetch_l3_references(
@@ -65,12 +72,14 @@ class CitationProvider:
         resume_state: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
+        """Return L3 reference edges and metadata for provided L2 papers."""
         raise NotImplementedError
 
     def fetch_seed_metadata(
         self,
         l1_papers: Sequence[str],
     ) -> Dict[str, IngestionPaper]:
+        """Resolve provider metadata for the seed papers when available."""
         return {}
 
     def fetch_citers_for_l1(
@@ -199,6 +208,7 @@ _INGEST_STATS = {
 
 
 def _http_error_body(exc: urllib.error.HTTPError) -> Optional[str]:
+    """Extract and normalize text body from an HTTPError response."""
     try:
         body = exc.read()
     except Exception:
@@ -212,12 +222,14 @@ def _http_error_body(exc: urllib.error.HTTPError) -> Optional[str]:
 
 
 def _reset_ingest_stats(source_list: Sequence[str]) -> None:
+    """Reset per-run request and failure counters for metadata reporting."""
     _INGEST_STATS["total_requests"] = 0
     _INGEST_STATS["total_failures"] = 0
     _INGEST_STATS["per_provider_failures"] = dict.fromkeys(source_list, 0)
 
 
 def _record_request_failure(provider: Optional[str]) -> None:
+    """Increment global and per-provider failure counters."""
     _INGEST_STATS["total_failures"] += 1
     if provider:
         failures = _INGEST_STATS["per_provider_failures"]
@@ -225,6 +237,7 @@ def _record_request_failure(provider: Optional[str]) -> None:
 
 
 def _compute_retry_sleep(last_error: Exception, delay: float) -> Tuple[float, str]:
+    """Choose retry sleep duration and strategy label for logging."""
     if isinstance(last_error, urllib.error.HTTPError) and last_error.code == 429:
         retry_after = _retry_after_seconds(last_error)
         if retry_after is not None:
@@ -321,11 +334,13 @@ def _safe_get(
 
 
 def _norm_title(value: str) -> str:
+    """Normalize title text for fuzzy dedup merge keys."""
     cleaned = re.sub(r"\s+", " ", value.strip().lower())
     return re.sub(r"[^a-z0-9 ]", "", cleaned)
 
 
 def normalize_identifier(raw_id: str, source: Optional[str] = None) -> str:
+    """Canonicalize raw IDs (DOI/OpenAlex/etc.) into stable prefixed forms."""
     value = (raw_id or "").strip()
     if not value:
         return ""
@@ -351,6 +366,7 @@ def normalize_identifier(raw_id: str, source: Optional[str] = None) -> str:
 
 
 def _canonical_merge_key(paper: IngestionPaper) -> str:
+    """Build a provider-agnostic key used to merge duplicate papers."""
     if paper.doi:
         return normalize_identifier(paper.doi)
     title_key = _norm_title(paper.title)
@@ -360,11 +376,13 @@ def _canonical_merge_key(paper: IngestionPaper) -> str:
 
 
 def _cache_key(payload: dict) -> str:
+    """Create deterministic hash key for cache/checkpoint files."""
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=True)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def _read_cache(cache_dir: Path, key: str) -> Optional[dict]:
+    """Read cached request result payload, returning None on miss/corruption."""
     cache_file = cache_dir / f"{key}.json"
     if not cache_file.exists():
         return None
@@ -375,12 +393,14 @@ def _read_cache(cache_dir: Path, key: str) -> Optional[dict]:
 
 
 def _write_cache(cache_dir: Path, key: str, payload: dict) -> None:
+    """Write request result payload to cache."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"{key}.json"
     cache_file.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
 def _write_json_atomic(path: Path, payload: dict) -> None:
+    """Atomically write JSON by replacing target via temporary sibling file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
@@ -388,6 +408,7 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
 
 
 def _checkpoint_file(checkpoint_root: Path, key: str) -> Path:
+    """Compute checkpoint path for a specific request key."""
     return checkpoint_root / f"{key}.checkpoint.json"
 
 
@@ -396,6 +417,7 @@ def _is_pagination_state_stale(
     now_ts: Optional[float] = None,
     max_age_seconds: int = _PAGINATION_STATE_MAX_AGE_SECONDS,
 ) -> bool:
+    """Return True when saved pagination state is older than staleness window."""
     if not isinstance(seed_state, dict):
         return True
 
@@ -413,10 +435,12 @@ def _is_pagination_state_stale(
 
 
 def _serialize_edges(edges: Dict[str, Set[str]]) -> Dict[str, List[str]]:
+    """Convert set-based edge map to JSON-friendly sorted lists."""
     return {citing: sorted(cited) for citing, cited in edges.items()}
 
 
 def _deserialize_edges(raw_edges: Any) -> Dict[str, Set[str]]:
+    """Normalize persisted edges into in-memory set representation."""
     if not isinstance(raw_edges, dict):
         return {}
 
@@ -432,12 +456,14 @@ def _deserialize_edges(raw_edges: Any) -> Dict[str, Set[str]]:
 
 
 def _serialize_papers(papers: Dict[str, IngestionPaper]) -> Dict[str, Dict[str, object]]:
+    """Convert paper dataclasses into output-ready dictionaries."""
     return {paper_id: _paper_to_output_dict(paper) for paper_id, paper in papers.items()}
 
 
 def _serialize_provider_pagination_state(
     state: Dict[str, Dict[str, Dict[str, Any]]],
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Prepare provider L2 pagination resume state for checkpoint persistence."""
     serialized: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for provider_name, provider_state in state.items():
         if not isinstance(provider_name, str) or not isinstance(provider_state, dict):
@@ -462,6 +488,7 @@ def _serialize_provider_pagination_state(
 
 
 def _deserialize_papers(raw_papers: Any) -> Dict[str, IngestionPaper]:
+    """Parse persisted paper dictionaries into IngestionPaper objects."""
     if not isinstance(raw_papers, dict):
         return {}
 
@@ -513,6 +540,7 @@ def _deserialize_papers(raw_papers: Any) -> Dict[str, IngestionPaper]:
 def _deserialize_provider_pagination_state(
     raw_state: Any,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Load and sanitize provider L2 pagination state from checkpoint JSON."""
     if not isinstance(raw_state, dict):
         return {}
 
@@ -542,6 +570,7 @@ def _deserialize_provider_pagination_state(
 def _serialize_provider_l3_state(
     state: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Dict[str, Any]]:
+    """Prepare provider L3 resume state (edges/papers/index/budget) for JSON."""
     serialized: Dict[str, Dict[str, Any]] = {}
     for provider_name, provider_state in state.items():
         if not isinstance(provider_name, str) or not isinstance(provider_state, dict):
@@ -562,6 +591,7 @@ def _serialize_provider_l3_state(
 
 
 def _deserialize_provider_l3_state(raw_state: Any) -> Dict[str, Dict[str, Any]]:
+    """Load and sanitize provider L3 resume state from checkpoint JSON."""
     if not isinstance(raw_state, dict):
         return {}
 
@@ -589,6 +619,7 @@ def _load_checkpoint_state(
     key: str,
     reset_checkpoints: bool,
 ) -> Optional[Dict[str, Any]]:
+    """Load validated checkpoint payload for request key, if available."""
     checkpoint_path = _checkpoint_file(checkpoint_root, key)
     if reset_checkpoints and checkpoint_path.exists():
         try:
@@ -624,6 +655,7 @@ def _write_checkpoint_state(
     provider_pagination_state: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
     provider_l3_state: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> None:
+    """Persist the current ingestion snapshot used for crash-safe resume."""
     checkpoint_path = _checkpoint_file(checkpoint_root, key)
     payload = {
         "checkpoint_schema_version": _CHECKPOINT_SCHEMA_VERSION,
@@ -642,6 +674,7 @@ def _write_checkpoint_state(
 
 
 def _paper_to_output_dict(paper: IngestionPaper) -> Dict[str, object]:
+    """Convert internal paper model into output/cache JSON shape."""
     output = {
         "title": paper.title,
         "abstract": paper.abstract,
@@ -657,6 +690,7 @@ def _paper_to_output_dict(paper: IngestionPaper) -> Dict[str, object]:
 
 
 def _merge_papers(existing: IngestionPaper, incoming: IngestionPaper) -> IngestionPaper:
+    """Merge two paper records, preferring richer fields from incoming."""
     if incoming.title and len(incoming.title) > len(existing.title):
         existing.title = incoming.title
     if incoming.abstract and len(incoming.abstract) > len(existing.abstract):
@@ -674,6 +708,7 @@ def _merge_papers(existing: IngestionPaper, incoming: IngestionPaper) -> Ingesti
 
 
 def _query_terms(theory_name: str, key_constructs: Optional[Sequence[str]]) -> str:
+    """Build provider search query text from theory and constructs."""
     terms = [theory_name.strip()]
     if key_constructs:
         terms.extend([k.strip() for k in key_constructs if k.strip()])
@@ -681,18 +716,21 @@ def _query_terms(theory_name: str, key_constructs: Optional[Sequence[str]]) -> s
 
 
 def _core_auth_headers(api_key: Optional[str]) -> Dict[str, str]:
+    """Build CORE API auth headers if key is configured."""
     if not api_key:
         return {}
     return {"Authorization": f"Bearer {api_key}"}
 
 
 def _semantic_scholar_auth_headers(api_key: Optional[str]) -> Dict[str, str]:
+    """Build Semantic Scholar API auth headers if key is configured."""
     if not api_key:
         return {}
     return {"Authorization": f"Bearer {api_key}"}
 
 
 def _doi_from_identifier(identifier: str) -> Optional[str]:
+    """Extract bare DOI from a normalized identifier when possible."""
     if not identifier:
         return None
     if identifier.startswith("doi:"):
@@ -701,6 +739,7 @@ def _doi_from_identifier(identifier: str) -> Optional[str]:
 
 
 def _paper_from_semantic_reference(ref: dict) -> Optional[IngestionPaper]:
+    """Create a minimal paper model from a Semantic Scholar reference object."""
     ext_ids = ref.get("externalIds") or {}
     doi = ext_ids.get("DOI")
     paper_id_raw = ref.get("paperId")
@@ -720,6 +759,7 @@ def _paper_from_semantic_reference(ref: dict) -> Optional[IngestionPaper]:
 
 
 def _reconstruct_openalex_abstract(inv_idx: dict) -> str:
+    """Rebuild plain-text abstract from OpenAlex inverted index payload."""
     if not inv_idx:
         return ""
 
@@ -731,6 +771,7 @@ def _reconstruct_openalex_abstract(inv_idx: dict) -> str:
 
 
 def _openalex_linked_l1(item: dict, l1_norm: Set[str], theory_name: str) -> List[str]:
+    """Return normalized L1 papers explicitly cited by an OpenAlex result item."""
     refs = item.get("referenced_works", []) or []
     ref_norm = {normalize_identifier(ref, source="openalex") for ref in refs if ref}
     linked_l1 = sorted(ref_norm.intersection(l1_norm))
@@ -738,10 +779,12 @@ def _openalex_linked_l1(item: dict, l1_norm: Set[str], theory_name: str) -> List
 
 
 def _should_keep_openalex_item(item: dict, linked_l1: Sequence[str], theory_name: str) -> bool:
+    """Gate OpenAlex candidates to only those with explicit links to seed papers."""
     return bool(linked_l1)
 
 
 def _paper_from_openalex_item(item: dict, paper_id: str) -> IngestionPaper:
+    """Map an OpenAlex work payload to the shared paper model."""
     return IngestionPaper(
         paper_id=paper_id,
         title=item.get("title") or "",
@@ -755,6 +798,7 @@ def _paper_from_openalex_item(item: dict, paper_id: str) -> IngestionPaper:
 
 
 def _openalex_reference_stub(ref_id: str, ref: str) -> IngestionPaper:
+    """Create lightweight placeholder metadata for OpenAlex references."""
     token = ref_id.split(":", 1)[1] if ref_id.startswith("openalex:") else ""
     source_id = f"https://openalex.org/{token}" if token else str(ref)
     return IngestionPaper(
@@ -765,6 +809,7 @@ def _openalex_reference_stub(ref_id: str, ref: str) -> IngestionPaper:
 
 
 def _openalex_hydrated_paper(ref_id: str, payload: dict) -> IngestionPaper:
+    """Create enriched OpenAlex paper identity fields from hydration payload."""
     year_raw = payload.get("publication_year")
     token = ref_id.split(":", 1)[1]
     return IngestionPaper(
@@ -780,6 +825,7 @@ def _semantic_fetch_status(
     papers: Dict[str, IngestionPaper],
     expected_count: Optional[int],
 ) -> Tuple[int, str]:
+    """Compute fetch status label from observed and expected counts."""
     fetched = len(papers)
     status = "complete" if expected_count is not None and fetched >= expected_count else "partial"
     return fetched, status
@@ -791,6 +837,7 @@ def _semantic_batch_limit(
     papers: Dict[str, IngestionPaper],
     max_results: Optional[int],
 ) -> Optional[int]:
+    """Compute next S2 page size while honoring API and caller limits."""
     batch_limit = limit
     if max_results is not None:
         remaining = max_results - len(papers)
@@ -807,6 +854,7 @@ def _semantic_batch_limit(
 
 
 def _semantic_linked_l1(item: dict, l1_norm: Set[str]) -> Set[str]:
+    """Find seed papers cited by a Semantic Scholar candidate item."""
     linked_l1: Set[str] = set()
     for ref in item.get("references", []) or []:
         ref_pid = ref.get("paperId")
@@ -824,6 +872,7 @@ def _semantic_linked_l1(item: dict, l1_norm: Set[str]) -> Set[str]:
 
 
 def _should_keep_semantic_item(item: dict, linked_l1: Set[str], theory_name: str) -> bool:
+    """Gate Semantic Scholar candidates to explicit L1-citation matches."""
     return bool(linked_l1)
 
 
@@ -831,6 +880,7 @@ def _crossref_enrichment_targets(
     l2_paper_ids: Sequence[str],
     all_papers: Dict[str, IngestionPaper],
 ) -> List[str]:
+    """Select DOI-based papers eligible for Crossref metadata enrichment."""
     targets: Set[str] = set()
     for paper_id in l2_paper_ids:
         paper = all_papers.get(paper_id)
@@ -841,6 +891,7 @@ def _crossref_enrichment_targets(
 
 
 def _paper_from_semantic_item(item: dict, paper_id: str) -> IngestionPaper:
+    """Map a Semantic Scholar paper payload to the shared paper model."""
     ext_ids = item.get("externalIds") or {}
     return IngestionPaper(
         paper_id=paper_id,
@@ -854,6 +905,7 @@ def _paper_from_semantic_item(item: dict, paper_id: str) -> IngestionPaper:
 
 
 def _core_reference_candidates(ref: dict) -> List[str]:
+    """Extract normalized candidate identifiers from a CORE reference entry."""
     candidates: List[str] = []
     doi = ref.get("doi")
     if doi:
@@ -866,6 +918,7 @@ def _core_reference_candidates(ref: dict) -> List[str]:
 
 
 def _paper_from_core_item(item: dict, paper_id: str) -> IngestionPaper:
+    """Map a CORE work payload to the shared paper model."""
     doi = item.get("doi")
     core_id = item.get("id")
     year_raw = item.get("yearPublished")
@@ -899,6 +952,7 @@ def _paper_from_core_item(item: dict, paper_id: str) -> IngestionPaper:
 
 
 def _seed_l1_papers(l1_papers: Sequence[str]) -> tuple[List[str], Dict[str, IngestionPaper]]:
+    """Normalize seeds and create placeholder records merged later with provider metadata."""
     normalized = [normalize_identifier(value) for value in l1_papers if value]
     papers = {}
     for raw, norm in zip(l1_papers, normalized):
@@ -923,6 +977,7 @@ def _merge_provider_outputs(
     edges: Dict[str, Set[str]],
     papers: Dict[str, IngestionPaper],
 ) -> None:
+    """Merge provider edge/paper outputs into cumulative ingestion state."""
     for citing, cited in edges.items():
         all_edges.setdefault(citing, set()).update(cited)
     for pid, paper in papers.items():
@@ -1061,6 +1116,7 @@ def _merge_seed_metadata(
     all_papers: Dict[str, IngestionPaper],
     seed_papers: Dict[str, IngestionPaper],
 ) -> None:
+    """Ensure seed paper placeholders/metadata are present in global paper map."""
     for pid, paper in seed_papers.items():
         if pid in all_papers:
             all_papers[pid] = _merge_papers(all_papers[pid], paper)
@@ -1078,6 +1134,7 @@ def _request_payload(
     max_l3: Optional[int],
     exhaustive: bool,
 ) -> dict:
+    """Build stable request payload used to derive cache/checkpoint key."""
     return {
         "cache_schema_version": _CACHE_SCHEMA_VERSION,
         "theory_name": theory_name,
@@ -1092,6 +1149,7 @@ def _request_payload(
 
 
 def _load_cached_result(cache_root: Path, key: str, refresh: bool) -> Optional[IngestionResult]:
+    """Return cached ingestion result unless refresh is explicitly requested."""
     if refresh:
         return None
     cached = _read_cache(cache_root, key)
@@ -1115,6 +1173,7 @@ def _build_metadata(
     completeness: Dict[str, Dict[str, object]],
     checkpoint_stats: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
+    """Assemble final run metadata for output payload and cache."""
     metadata = {
         "sources": list(source_list),
         "depth": depth,
@@ -1144,6 +1203,7 @@ class OpenAlexProvider(CitationProvider):
         l2_paper_ids: Sequence[str],
         budget: Optional[int],
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper], Optional[int]]:
+        """Collect L3 reference edges from OpenAlex works while respecting budget."""
         edges: Dict[str, Set[str]] = {}
         papers: Dict[str, IngestionPaper] = {}
 
@@ -1175,6 +1235,7 @@ class OpenAlexProvider(CitationProvider):
         return edges, papers, budget
 
     def _hydrate_l3_reference_papers(self, papers: Dict[str, IngestionPaper]) -> None:
+        """Hydrate discovered OpenAlex L3 stubs with identity metadata fields."""
         # Identity hydration pass: keep the first step lightweight (edge discovery),
         # then fetch only minimal identity fields needed for cross-provider dedup.
         for ref_id, existing in list(papers.items()):
@@ -1195,6 +1256,7 @@ class OpenAlexProvider(CitationProvider):
         self,
         l1_papers: Sequence[str],
     ) -> Dict[str, IngestionPaper]:
+        """Resolve OpenAlex metadata for seed identifiers (DOI or OpenAlex ID)."""
         papers: Dict[str, IngestionPaper] = {}
         for paper_id in l1_papers:
             payload = None
@@ -1318,6 +1380,7 @@ class OpenAlexProvider(CitationProvider):
         key_constructs: Optional[Sequence[str]] = None,
         max_l2: int = 200,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
+        """Search OpenAlex and retain only candidates that cite an L1 seed."""
         citation_edges: Dict[str, Set[str]] = {}
         papers: Dict[str, IngestionPaper] = {}
         query = urllib.parse.quote(_query_terms(theory_name, key_constructs))
@@ -1355,6 +1418,7 @@ class OpenAlexProvider(CitationProvider):
         resume_state: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
+        """Expand L2 OpenAlex works to referenced papers with checkpoint-resume support."""
         edges = _deserialize_edges((resume_state or {}).get("edges"))
         papers = _deserialize_papers((resume_state or {}).get("papers"))
 
@@ -1434,15 +1498,18 @@ class SemanticScholarProvider(CitationProvider):
     capabilities = ProviderCapabilities(True, True, True, supports_cited_by_traversal=True)
 
     def __init__(self, api_key: Optional[str] = None):
+        """Initialize provider with optional API key for higher rate limits."""
         self.api_key = api_key
 
     def _headers(self) -> Dict[str, str]:
+        """Return request headers for Semantic Scholar calls."""
         return _semantic_scholar_auth_headers(self.api_key)
 
     def fetch_seed_metadata(
         self,
         l1_papers: Sequence[str],
     ) -> Dict[str, IngestionPaper]:
+        """Resolve Semantic Scholar metadata for DOI or S2 seed IDs."""
         papers: Dict[str, IngestionPaper] = {}
         for paper_id in l1_papers:
             payload = None
@@ -1573,6 +1640,7 @@ class SemanticScholarProvider(CitationProvider):
         key_constructs: Optional[Sequence[str]] = None,
         max_l2: int = 200,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
+        """Search Semantic Scholar and keep only papers citing L1 seeds."""
         edges: Dict[str, Set[str]] = {}
         papers: Dict[str, IngestionPaper] = {}
         query = urllib.parse.quote(_query_terms(theory_name, key_constructs))
@@ -1611,6 +1679,7 @@ class SemanticScholarProvider(CitationProvider):
         resume_state: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
+        """Expand L2 Semantic papers to references with checkpoint-resume support."""
         edges = _deserialize_edges((resume_state or {}).get("edges"))
         papers = _deserialize_papers((resume_state or {}).get("papers"))
 
@@ -1694,6 +1763,7 @@ class CrossrefProvider(CitationProvider):
         self,
         l1_papers: Sequence[str],
     ) -> Dict[str, IngestionPaper]:
+        """Fetch Crossref metadata for DOI seeds or DOI-normalized inputs."""
         papers: Dict[str, IngestionPaper] = {}
         for paper_id in l1_papers:
             doi = _doi_from_identifier(paper_id)
@@ -1741,6 +1811,7 @@ class CrossrefProvider(CitationProvider):
         l2_paper_ids: Sequence[str],
         max_l3: Optional[int] = None,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
+        """Crossref does not provide graph-safe reference expansion in this pipeline."""
         return {}, {}
 
 
@@ -1749,12 +1820,15 @@ class CoreProvider(CitationProvider):
     capabilities = ProviderCapabilities(True, True, True, supports_cited_by_traversal=False)
 
     def __init__(self, api_key: Optional[str] = None):
+        """Initialize provider with optional CORE API key."""
         self.api_key = api_key
 
     def _headers(self) -> Dict[str, str]:
+        """Return request headers for CORE API calls."""
         return _core_auth_headers(self.api_key)
 
     def _search_works(self, query: str, limit: int) -> List[dict]:
+        """Search CORE works endpoint with bounded page size."""
         params = urllib.parse.urlencode({"q": query, "limit": max(1, min(limit, 100))})
         payload = _safe_get(
             f"https://api.core.ac.uk/v3/search/works/?{params}",
@@ -1764,6 +1838,7 @@ class CoreProvider(CitationProvider):
         return list((payload or {}).get("results") or [])
 
     def _work_by_identifier(self, identifier: str) -> Optional[dict]:
+        """Fetch CORE work directly by provider-native identifier."""
         encoded = urllib.parse.quote(identifier, safe=":/.")
         return _safe_get(
             f"https://api.core.ac.uk/v3/works/{encoded}",
@@ -1772,6 +1847,7 @@ class CoreProvider(CitationProvider):
         )
 
     def _lookup_work(self, paper_id: str) -> Optional[dict]:
+        """Resolve a canonical paper identifier to a CORE work payload."""
         doi = _doi_from_identifier(paper_id)
         if doi:
             matches = self._search_works(f'doi:"{doi}"', limit=1)
@@ -1781,6 +1857,7 @@ class CoreProvider(CitationProvider):
         return None
 
     def _reference_to_paper(self, ref: dict) -> Optional[IngestionPaper]:
+        """Map CORE reference object to canonical paper model when identifiable."""
         ref_doi = ref.get("doi")
         ref_id = ref.get("id")
         if ref_doi:
@@ -1804,6 +1881,7 @@ class CoreProvider(CitationProvider):
         self,
         l1_papers: Sequence[str],
     ) -> Dict[str, IngestionPaper]:
+        """Resolve CORE metadata for DOI or CORE-ID seeds."""
         papers: Dict[str, IngestionPaper] = {}
         for paper_id in l1_papers:
             doi = _doi_from_identifier(paper_id)
@@ -1829,6 +1907,7 @@ class CoreProvider(CitationProvider):
         key_constructs: Optional[Sequence[str]] = None,
         max_l2: int = 200,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
+        """Search CORE and keep results that explicitly reference L1 seeds."""
         edges: Dict[str, Set[str]] = {}
         papers: Dict[str, IngestionPaper] = {}
         l1_norm = {normalize_identifier(v) for v in l1_papers}
@@ -1869,11 +1948,28 @@ class CoreProvider(CitationProvider):
         resume_state: Optional[Dict[str, Any]] = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
-        edges: Dict[str, Set[str]] = {}
-        papers: Dict[str, IngestionPaper] = {}
-        budget: Optional[int] = None if max_l3 is None else max(0, max_l3)
+        """Expand CORE L2 papers to references with checkpoint-resume support."""
+        edges = _deserialize_edges((resume_state or {}).get("edges"))
+        papers = _deserialize_papers((resume_state or {}).get("papers"))
 
-        for pid in l2_paper_ids:
+        start_index_raw = (resume_state or {}).get("next_l2_index")
+        try:
+            start_index = int(start_index_raw) if start_index_raw is not None else 0
+        except (TypeError, ValueError):
+            start_index = 0
+
+        if max_l3 is None:
+            budget = None
+        elif (resume_state or {}).get("budget_remaining") is not None:
+            try:
+                budget = max(0, int((resume_state or {}).get("budget_remaining")))
+            except (TypeError, ValueError):
+                budget = max(0, max_l3)
+        else:
+            budget = max(0, max_l3)
+
+        for idx in range(start_index, len(l2_paper_ids)):
+            pid = l2_paper_ids[idx]
             if budget is not None and budget <= 0:
                 break
 
@@ -1893,7 +1989,31 @@ class CoreProvider(CitationProvider):
                 papers.setdefault(paper.paper_id, paper)
                 if budget is not None:
                     budget -= 1
+
+            if progress_callback:
+                progress_callback(
+                    {
+                        "status": "in_progress",
+                        "next_l2_index": idx + 1,
+                        "budget_remaining": budget,
+                        "edges": _serialize_edges(edges),
+                        "papers": _serialize_papers(papers),
+                        "updated_at": time.time(),
+                    }
+                )
             time.sleep(0.03)
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "status": "complete",
+                    "next_l2_index": len(l2_paper_ids),
+                    "budget_remaining": budget,
+                    "edges": _serialize_edges(edges),
+                    "papers": _serialize_papers(papers),
+                    "updated_at": time.time(),
+                }
+            )
 
         return edges, papers
 
@@ -1907,6 +2027,7 @@ _PROVIDER_REGISTRY = {
 
 
 def build_providers(sources: Sequence[str]) -> List[CitationProvider]:
+    """Instantiate provider objects for requested source names."""
     providers: List[CitationProvider] = []
     for source in sources:
         key = source.strip().lower()
@@ -1926,6 +2047,7 @@ def _dedupe_and_materialize(
     all_edges: Dict[str, Set[str]],
     all_papers: Dict[str, IngestionPaper],
 ) -> Tuple[Dict[str, List[str]], Dict[str, Dict[str, object]], Dict[str, str]]:
+    """Deduplicate papers across providers and materialize final output structures."""
     merged_by_key: Dict[str, IngestionPaper] = {}
     key_to_final_id: Dict[str, str] = {}
 

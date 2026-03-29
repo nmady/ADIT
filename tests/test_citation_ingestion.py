@@ -2441,6 +2441,155 @@ def test_semantic_l3_resume_from_checkpoint(monkeypatch, tmp_path):
     assert "semantic_scholar" in resumed.metadata["checkpoint_stats"]["l3_resumed_providers"]
 
 
+def test_core_l3_resume_from_checkpoint(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+    crash_on_l3_second_parent = {"enabled": True}
+
+    class _CoreL3ResumeProvider(ci.CoreProvider):
+        name = "core"
+
+        def __init__(self):
+            super().__init__(api_key=None)
+
+        def fetch_seed_metadata(self, l1_papers):
+            return {
+                l1: ci.IngestionPaper(
+                    paper_id=l1,
+                    title="Seed",
+                    source_ids={"core": "seed-core-id"},
+                )
+                for l1 in l1_papers
+            }
+
+        def fetch_citers_for_l1(
+            self,
+            l1_provider_id,
+            max_results=None,
+            resume_state=None,
+            progress_callback=None,
+        ):
+            papers = {
+                "core:l2a": ci.IngestionPaper(
+                    paper_id="core:l2a",
+                    title="L2 A",
+                    year=2020,
+                    source_ids={"core": "l2a"},
+                ),
+                "core:l2b": ci.IngestionPaper(
+                    paper_id="core:l2b",
+                    title="L2 B",
+                    year=2021,
+                    source_ids={"core": "l2b"},
+                ),
+            }
+            return papers, 2, "complete"
+
+        def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
+            seed = ci.normalize_identifier(l1_papers[0])
+            edges = {
+                "core:l2a": {seed},
+                "core:l2b": {seed},
+            }
+            papers = {
+                "core:l2a": ci.IngestionPaper(
+                    paper_id="core:l2a",
+                    title="L2 A",
+                    year=2020,
+                    source_ids={"core": "l2a"},
+                ),
+                "core:l2b": ci.IngestionPaper(
+                    paper_id="core:l2b",
+                    title="L2 B",
+                    year=2021,
+                    source_ids={"core": "l2b"},
+                ),
+            }
+            return edges, papers
+
+        def _lookup_work(self, paper_id):
+            if paper_id == "core:l2a":
+                return {
+                    "references": [
+                        {
+                            "doi": "10.1000/corel3a",
+                            "id": "ref-a",
+                            "title": "Core L3 A",
+                        }
+                    ]
+                }
+            if paper_id == "core:l2b":
+                if crash_on_l3_second_parent["enabled"]:
+                    raise RuntimeError("core l3 simulated crash")
+                return {
+                    "references": [
+                        {
+                            "doi": "10.1000/corel3b",
+                            "id": "ref-b",
+                            "title": "Core L3 B",
+                        }
+                    ]
+                }
+            return None
+
+    provider = _CoreL3ResumeProvider()
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="core l3 simulated crash"):
+        ci.ingest_from_internet(
+            theory_name="My Fake Theory",
+            l1_papers=["doi:10.1000/seed"],
+            sources=["core"],
+            depth="l2l3",
+            cache_dir=cache_dir,
+            checkpoint_dir=checkpoint_dir,
+            refresh=True,
+        )
+
+    request_payload = ci._request_payload(
+        theory_name="My Fake Theory",
+        l1_papers=["doi:10.1000/seed"],
+        key_constructs=None,
+        sources=["core"],
+        depth="l2l3",
+        max_l2=200,
+        max_l3=None,
+        exhaustive=True,
+    )
+    key = ci._cache_key(request_payload)
+    state = ci._load_checkpoint_state(checkpoint_dir, key, reset_checkpoints=False)
+    assert state is not None
+    assert state["provider_l3_state"]["core"]["next_l2_index"] == 1
+
+    crash_on_l3_second_parent["enabled"] = False
+    resumed = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["doi:10.1000/seed"],
+        sources=["core"],
+        depth="l2l3",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    baseline_provider = _CoreL3ResumeProvider()
+    monkeypatch.setattr(ci, "build_providers", lambda _: [baseline_provider])
+    baseline = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["doi:10.1000/seed"],
+        sources=["core"],
+        depth="l2l3",
+        cache_dir=Path(tmp_path) / "baseline-cache",
+        checkpoint_dir=Path(tmp_path) / "baseline-checkpoints",
+        refresh=True,
+    )
+
+    assert resumed.citation_data == baseline.citation_data
+    assert resumed.papers_data == baseline.papers_data
+    assert "core" in resumed.metadata["checkpoint_stats"]["l3_resumed_providers"]
+
+
 class _ResumeCaptureProvider(ci.CitationProvider):
     name = "resume_capture"
     capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=True)

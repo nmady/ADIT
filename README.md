@@ -122,8 +122,8 @@ If `labels_data` is omitted, the CLI extracts features and skips training/predic
 - `--refresh-cache` forces a fresh internet retrieval instead of reusing cached results.
 - Checkpoint semantics (Phase 1): completion is persisted after each provider completes; resumed runs skip completed providers and continue remaining providers.
 - Phase 2 adds L2 mid-pagination resume for OpenAlex (cursor) and Semantic Scholar (offset), so interrupted cited-by traversal can continue from saved per-seed progress.
-- Phase 3 adds L3 resume for OpenAlex and Semantic Scholar, so interrupted L3 expansion can continue from saved provider progress.
-- CORE L3 resume is currently deferred; Crossref remains no-op for L3 by contract.
+- Phase 3.1 extends L3 resume to CORE, so interrupted L3 expansion can continue from saved provider progress for OpenAlex, Semantic Scholar, and CORE.
+- Crossref remains no-op for L3 by contract.
 - Per-seed pagination progress includes a staleness guard (6-hour window by default); stale progress is ignored and the seed is safely refetched.
 - `--only-ingest` runs ingestion and exits before feature extraction/training.
 - `--save-ingested-citation-data` and `--save-ingested-papers-data` let you persist normalized outputs for offline replay.
