@@ -62,6 +62,8 @@ class CitationProvider:
         self,
         l2_paper_ids: Sequence[str],
         max_l3: Optional[int] = None,
+        resume_state: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
         raise NotImplementedError
 
@@ -537,6 +539,51 @@ def _deserialize_provider_pagination_state(
     return output
 
 
+def _serialize_provider_l3_state(
+    state: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    serialized: Dict[str, Dict[str, Any]] = {}
+    for provider_name, provider_state in state.items():
+        if not isinstance(provider_name, str) or not isinstance(provider_state, dict):
+            continue
+
+        clean_state = dict(provider_state)
+        edges_raw = clean_state.get("edges")
+        if isinstance(edges_raw, dict):
+            clean_state["edges"] = _serialize_edges(_deserialize_edges(edges_raw))
+
+        papers_raw = clean_state.get("papers")
+        if isinstance(papers_raw, dict):
+            clean_state["papers"] = _serialize_papers(_deserialize_papers(papers_raw))
+
+        serialized[provider_name] = clean_state
+
+    return serialized
+
+
+def _deserialize_provider_l3_state(raw_state: Any) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(raw_state, dict):
+        return {}
+
+    output: Dict[str, Dict[str, Any]] = {}
+    for provider_name, provider_state in raw_state.items():
+        if not isinstance(provider_name, str) or not isinstance(provider_state, dict):
+            continue
+
+        clean_state = dict(provider_state)
+        edges_raw = clean_state.get("edges")
+        if isinstance(edges_raw, dict):
+            clean_state["edges"] = _serialize_edges(_deserialize_edges(edges_raw))
+
+        papers_raw = clean_state.get("papers")
+        if isinstance(papers_raw, dict):
+            clean_state["papers"] = _serialize_papers(_deserialize_papers(papers_raw))
+
+        output[provider_name] = clean_state
+
+    return output
+
+
 def _load_checkpoint_state(
     checkpoint_root: Path,
     key: str,
@@ -575,6 +622,7 @@ def _write_checkpoint_state(
     provider_stats: Dict[str, object],
     combined_completeness: Dict[str, Dict[str, object]],
     provider_pagination_state: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+    provider_l3_state: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> None:
     checkpoint_path = _checkpoint_file(checkpoint_root, key)
     payload = {
@@ -588,6 +636,7 @@ def _write_checkpoint_state(
         "provider_pagination_state": _serialize_provider_pagination_state(
             provider_pagination_state or {}
         ),
+        "provider_l3_state": _serialize_provider_l3_state(provider_l3_state or {}),
     }
     _write_json_atomic(checkpoint_path, payload)
 
@@ -895,6 +944,8 @@ def _fetch_provider_graph(
     max_l3: Optional[int],
     provider_seed_state: Optional[Dict[str, Dict[str, Any]]] = None,
     seed_progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    provider_l3_state: Optional[Dict[str, Any]] = None,
+    l3_progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> tuple[Dict[str, Set[str]], Dict[str, IngestionPaper], Dict[str, object]]:
     """Fetch L2 (and optionally L3) papers for a provider.
 
@@ -982,10 +1033,17 @@ def _fetch_provider_graph(
     added_l3_edges = 0
 
     if depth.lower() in {"l2l3", "l3", "2"}:
-        l3_edges, l3_papers = provider.fetch_l3_references(
-            l2_paper_ids=list(l2_edges.keys()),
-            max_l3=max_l3,
-        )
+        l3_call_kwargs: Dict[str, Any] = {
+            "l2_paper_ids": list(l2_edges.keys()),
+            "max_l3": max_l3,
+        }
+        l3_signature = inspect.signature(provider.fetch_l3_references)
+        if "resume_state" in l3_signature.parameters:
+            l3_call_kwargs["resume_state"] = provider_l3_state
+        if "progress_callback" in l3_signature.parameters and l3_progress_callback is not None:
+            l3_call_kwargs["progress_callback"] = l3_progress_callback
+
+        l3_edges, l3_papers = provider.fetch_l3_references(**l3_call_kwargs)
         _merge_provider_outputs(all_edges, all_papers, l3_edges, l3_papers)
         added_l3_edges = sum(len(cited) for cited in l3_edges.values())
 
@@ -1294,10 +1352,79 @@ class OpenAlexProvider(CitationProvider):
         self,
         l2_paper_ids: Sequence[str],
         max_l3: Optional[int] = None,
+        resume_state: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
-        budget: Optional[int] = None if max_l3 is None else max(0, max_l3)
-        edges, papers, _ = self._collect_l3_reference_edges(l2_paper_ids, budget)
+        edges = _deserialize_edges((resume_state or {}).get("edges"))
+        papers = _deserialize_papers((resume_state or {}).get("papers"))
+
+        start_index_raw = (resume_state or {}).get("next_l2_index")
+        try:
+            start_index = int(start_index_raw) if start_index_raw is not None else 0
+        except (TypeError, ValueError):
+            start_index = 0
+
+        if max_l3 is None:
+            budget = None
+        elif (resume_state or {}).get("budget_remaining") is not None:
+            try:
+                budget = max(0, int((resume_state or {}).get("budget_remaining")))
+            except (TypeError, ValueError):
+                budget = max(0, max_l3)
+        else:
+            budget = max(0, max_l3)
+
+        for idx in range(start_index, len(l2_paper_ids)):
+            pid = l2_paper_ids[idx]
+            if budget is not None and budget <= 0:
+                break
+            if not pid.startswith("openalex:"):
+                continue
+
+            openalex_token = pid.split(":", 1)[1]
+            url = f"https://api.openalex.org/works/{openalex_token}?select=referenced_works"
+            payload = _safe_get(url, provider=self.name)
+            if not payload:
+                continue
+
+            refs = payload.get("referenced_works", []) or []
+            for ref in refs:
+                if budget is not None and budget <= 0:
+                    break
+                ref_id = normalize_identifier(ref, source=self.name)
+                if not ref_id:
+                    continue
+                edges.setdefault(pid, set()).add(ref_id)
+                papers.setdefault(ref_id, _openalex_reference_stub(ref_id, ref))
+                if budget is not None:
+                    budget -= 1
+
+            if progress_callback:
+                progress_callback(
+                    {
+                        "status": "in_progress",
+                        "next_l2_index": idx + 1,
+                        "budget_remaining": budget,
+                        "edges": _serialize_edges(edges),
+                        "papers": _serialize_papers(papers),
+                        "updated_at": time.time(),
+                    }
+                )
+            time.sleep(0.03)
+
         self._hydrate_l3_reference_papers(papers)
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "status": "complete",
+                    "next_l2_index": len(l2_paper_ids),
+                    "budget_remaining": budget,
+                    "edges": _serialize_edges(edges),
+                    "papers": _serialize_papers(papers),
+                    "updated_at": time.time(),
+                }
+            )
 
         return edges, papers
 
@@ -1481,12 +1608,30 @@ class SemanticScholarProvider(CitationProvider):
         self,
         l2_paper_ids: Sequence[str],
         max_l3: Optional[int] = None,
+        resume_state: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
-        edges: Dict[str, Set[str]] = {}
-        papers: Dict[str, IngestionPaper] = {}
-        budget: Optional[int] = None if max_l3 is None else max(0, max_l3)
+        edges = _deserialize_edges((resume_state or {}).get("edges"))
+        papers = _deserialize_papers((resume_state or {}).get("papers"))
 
-        for pid in l2_paper_ids:
+        start_index_raw = (resume_state or {}).get("next_l2_index")
+        try:
+            start_index = int(start_index_raw) if start_index_raw is not None else 0
+        except (TypeError, ValueError):
+            start_index = 0
+
+        if max_l3 is None:
+            budget = None
+        elif (resume_state or {}).get("budget_remaining") is not None:
+            try:
+                budget = max(0, int((resume_state or {}).get("budget_remaining")))
+            except (TypeError, ValueError):
+                budget = max(0, max_l3)
+        else:
+            budget = max(0, max_l3)
+
+        for idx in range(start_index, len(l2_paper_ids)):
+            pid = l2_paper_ids[idx]
             if budget is not None and budget <= 0:
                 break
             if not pid.startswith("semantic_scholar:"):
@@ -1512,7 +1657,31 @@ class SemanticScholarProvider(CitationProvider):
                 papers.setdefault(ref_id, paper)
                 if budget is not None:
                     budget -= 1
+
+            if progress_callback:
+                progress_callback(
+                    {
+                        "status": "in_progress",
+                        "next_l2_index": idx + 1,
+                        "budget_remaining": budget,
+                        "edges": _serialize_edges(edges),
+                        "papers": _serialize_papers(papers),
+                        "updated_at": time.time(),
+                    }
+                )
             time.sleep(0.05)
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "status": "complete",
+                    "next_l2_index": len(l2_paper_ids),
+                    "budget_remaining": budget,
+                    "edges": _serialize_edges(edges),
+                    "papers": _serialize_papers(papers),
+                    "updated_at": time.time(),
+                }
+            )
 
         return edges, papers
 
@@ -1697,6 +1866,8 @@ class CoreProvider(CitationProvider):
         self,
         l2_paper_ids: Sequence[str],
         max_l3: Optional[int] = None,
+        resume_state: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
         edges: Dict[str, Set[str]] = {}
         papers: Dict[str, IngestionPaper] = {}
@@ -1847,6 +2018,8 @@ def ingest_from_internet(
         "executed_provider_names": [],
         "stale_state_ignored_count": 0,
         "stale_state_ignored_seeds": [],
+        "l3_resumed_providers": [],
+        "l3_resumed_parent_count": 0,
     }
 
     cached = _load_cached_result(cache_root, key, refresh)
@@ -1867,6 +2040,8 @@ def ingest_from_internet(
                 "executed_provider_names": [],
                 "stale_state_ignored_count": 0,
                 "stale_state_ignored_seeds": [],
+                "l3_resumed_providers": [],
+                "l3_resumed_parent_count": 0,
             }
         )
         metadata["checkpoint_stats"] = merged_stats
@@ -1880,6 +2055,7 @@ def ingest_from_internet(
     combined_completeness: Dict[str, Dict[str, object]] = {}
     completed_providers: Set[str] = set()
     provider_pagination_state: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    provider_l3_state: Dict[str, Dict[str, Any]] = {}
 
     checkpoint_root = checkpoint_dir or (cache_root / "checkpoints")
     checkpoint_state = _load_checkpoint_state(checkpoint_root, key, reset_checkpoints)
@@ -1905,6 +2081,9 @@ def ingest_from_internet(
         provider_pagination_state = _deserialize_provider_pagination_state(
             checkpoint_state.get("provider_pagination_state")
         )
+        provider_l3_state = _deserialize_provider_l3_state(
+            checkpoint_state.get("provider_l3_state")
+        )
 
         _vprint(f"[ADIT] Loaded checkpoint: {len(completed_providers)} completed provider(s)")
 
@@ -1918,6 +2097,7 @@ def ingest_from_internet(
             provider_stats,
             combined_completeness,
             provider_pagination_state,
+            provider_l3_state,
         )
 
     for provider in providers:
@@ -1951,6 +2131,7 @@ def ingest_from_internet(
             }
             completed_providers.add(provider.name)
             provider_pagination_state.pop(provider.name, None)
+            provider_l3_state.pop(provider.name, None)
             _persist_checkpoint_snapshot()
             continue
 
@@ -1973,8 +2154,23 @@ def ingest_from_internet(
         if stale_removed:
             _persist_checkpoint_snapshot()
 
+        provider_l3_run_state = provider_l3_state.setdefault(provider.name, {})
+        resumed_l3_index = provider_l3_run_state.get("next_l2_index")
+        if isinstance(resumed_l3_index, int) and resumed_l3_index > 0:
+            resumed_providers = checkpoint_stats.get("l3_resumed_providers")
+            if isinstance(resumed_providers, list) and provider.name not in resumed_providers:
+                resumed_providers.append(provider.name)
+            checkpoint_stats["l3_resumed_parent_count"] = (
+                int(checkpoint_stats.get("l3_resumed_parent_count", 0)) + resumed_l3_index
+            )
+
         def _seed_progress(seed_id: str, state: Dict[str, Any]) -> None:
             provider_state[seed_id] = dict(state)
+            _persist_checkpoint_snapshot()
+
+        def _l3_progress(state: Dict[str, Any]) -> None:
+            provider_l3_run_state.clear()
+            provider_l3_run_state.update(dict(state))
             _persist_checkpoint_snapshot()
 
         provider_edges, provider_papers, stats = _fetch_provider_graph(
@@ -1989,6 +2185,8 @@ def ingest_from_internet(
             max_l3=max_l3,
             provider_seed_state=provider_state,
             seed_progress_callback=_seed_progress,
+            provider_l3_state=provider_l3_run_state,
+            l3_progress_callback=_l3_progress,
         )
         _merge_provider_outputs(all_edges, all_papers, provider_edges, provider_papers)
         provider_stats[provider.name] = stats
@@ -1997,6 +2195,7 @@ def ingest_from_internet(
 
         completed_providers.add(provider.name)
         provider_pagination_state.pop(provider.name, None)
+        provider_l3_state.pop(provider.name, None)
         _persist_checkpoint_snapshot()
 
     citation_data, papers_data, alias_map = _dedupe_and_materialize(all_edges, all_papers)

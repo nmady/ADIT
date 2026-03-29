@@ -2191,6 +2191,256 @@ def test_semantic_mid_pagination_resume_from_checkpoint(monkeypatch, tmp_path):
     assert resumed.metadata["checkpoint_stats"]["hit"] is True
 
 
+def test_openalex_l3_resume_from_checkpoint(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+    crash_on_l3_second_parent = {"enabled": True}
+
+    def fake_safe_get(
+        url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES, headers=None
+    ):
+        if url.endswith("/works/WSEED"):
+            return {
+                "id": "https://openalex.org/WSEED",
+                "title": "Seed",
+                "publication_year": 2000,
+                "cited_by_count": 10,
+                "doi": "10.1000/seed",
+                "abstract_inverted_index": {},
+            }
+
+        if "api.openalex.org/works?" in url:
+            parsed = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qs(parsed.query)
+            if params.get("filter", [""])[0] != "cites:WSEED":
+                return None
+            return {
+                "meta": {"count": 2, "next_cursor": None},
+                "results": [
+                    {
+                        "id": "https://openalex.org/WL2A",
+                        "title": "L2 A",
+                        "publication_year": 2020,
+                        "cited_by_count": 1,
+                        "doi": "10.1000/l2a",
+                        "abstract_inverted_index": {},
+                    },
+                    {
+                        "id": "https://openalex.org/WL2B",
+                        "title": "L2 B",
+                        "publication_year": 2021,
+                        "cited_by_count": 1,
+                        "doi": "10.1000/l2b",
+                        "abstract_inverted_index": {},
+                    },
+                ],
+            }
+
+        if url.endswith("/works/WL2A?select=referenced_works"):
+            return {"referenced_works": ["https://openalex.org/WRA1"]}
+
+        if url.endswith("/works/WL2B?select=referenced_works"):
+            if crash_on_l3_second_parent["enabled"]:
+                raise RuntimeError("openalex l3 simulated crash")
+            return {"referenced_works": ["https://openalex.org/WRB1"]}
+
+        if url.endswith("/works/WRA1?select=id,doi,title,publication_year"):
+            return {
+                "id": "https://openalex.org/WRA1",
+                "doi": "https://doi.org/10.1000/l3a",
+                "title": "L3 A",
+                "publication_year": 2018,
+            }
+
+        if url.endswith("/works/WRB1?select=id,doi,title,publication_year"):
+            return {
+                "id": "https://openalex.org/WRB1",
+                "doi": "https://doi.org/10.1000/l3b",
+                "title": "L3 B",
+                "publication_year": 2019,
+            }
+
+        return None
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="openalex l3 simulated crash"):
+        ci.ingest_from_internet(
+            theory_name="My Fake Theory",
+            l1_papers=["openalex:WSEED"],
+            sources=["openalex"],
+            depth="l2l3",
+            cache_dir=cache_dir,
+            checkpoint_dir=checkpoint_dir,
+            refresh=True,
+        )
+
+    request_payload = ci._request_payload(
+        theory_name="My Fake Theory",
+        l1_papers=["openalex:WSEED"],
+        key_constructs=None,
+        sources=["openalex"],
+        depth="l2l3",
+        max_l2=200,
+        max_l3=None,
+        exhaustive=True,
+    )
+    key = ci._cache_key(request_payload)
+    state = ci._load_checkpoint_state(checkpoint_dir, key, reset_checkpoints=False)
+    assert state is not None
+    assert state["provider_l3_state"]["openalex"]["next_l2_index"] == 1
+
+    crash_on_l3_second_parent["enabled"] = False
+    resumed = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["openalex:WSEED"],
+        sources=["openalex"],
+        depth="l2l3",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    baseline = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["openalex:WSEED"],
+        sources=["openalex"],
+        depth="l2l3",
+        cache_dir=Path(tmp_path) / "baseline-cache",
+        checkpoint_dir=Path(tmp_path) / "baseline-checkpoints",
+        refresh=True,
+    )
+
+    assert resumed.citation_data == baseline.citation_data
+    assert resumed.papers_data == baseline.papers_data
+    assert "openalex" in resumed.metadata["checkpoint_stats"]["l3_resumed_providers"]
+
+
+def test_semantic_l3_resume_from_checkpoint(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+    crash_on_l3_second_parent = {"enabled": True}
+
+    def fake_safe_get(
+        url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES, headers=None
+    ):
+        if "/graph/v1/paper/seed1?fields=" in url:
+            return {
+                "paperId": "seed1",
+                "title": "Seed",
+                "abstract": "",
+                "year": 2000,
+                "citationCount": 0,
+                "externalIds": {},
+            }
+
+        if "/graph/v1/paper/seed1/citations" in url:
+            return {
+                "total": 2,
+                "data": [
+                    {
+                        "citingPaper": {
+                            "paperId": "l2a",
+                            "title": "L2 A",
+                            "year": 2020,
+                            "citationCount": 1,
+                            "externalIds": {},
+                            "abstract": "",
+                        }
+                    },
+                    {
+                        "citingPaper": {
+                            "paperId": "l2b",
+                            "title": "L2 B",
+                            "year": 2021,
+                            "citationCount": 1,
+                            "externalIds": {},
+                            "abstract": "",
+                        }
+                    },
+                ],
+            }
+
+        if "/graph/v1/paper/l2a?fields=references.paperId,references.externalIds" in url:
+            return {
+                "references": [
+                    {
+                        "paperId": "ref-a",
+                        "externalIds": {"DOI": "10.1000/l3a"},
+                    }
+                ]
+            }
+
+        if "/graph/v1/paper/l2b?fields=references.paperId,references.externalIds" in url:
+            if crash_on_l3_second_parent["enabled"]:
+                raise RuntimeError("semantic l3 simulated crash")
+            return {
+                "references": [
+                    {
+                        "paperId": "ref-b",
+                        "externalIds": {"DOI": "10.1000/l3b"},
+                    }
+                ]
+            }
+
+        return None
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="semantic l3 simulated crash"):
+        ci.ingest_from_internet(
+            theory_name="My Fake Theory",
+            l1_papers=["semantic_scholar:seed1"],
+            sources=["semantic_scholar"],
+            depth="l2l3",
+            cache_dir=cache_dir,
+            checkpoint_dir=checkpoint_dir,
+            refresh=True,
+        )
+
+    request_payload = ci._request_payload(
+        theory_name="My Fake Theory",
+        l1_papers=["semantic_scholar:seed1"],
+        key_constructs=None,
+        sources=["semantic_scholar"],
+        depth="l2l3",
+        max_l2=200,
+        max_l3=None,
+        exhaustive=True,
+    )
+    key = ci._cache_key(request_payload)
+    state = ci._load_checkpoint_state(checkpoint_dir, key, reset_checkpoints=False)
+    assert state is not None
+    assert state["provider_l3_state"]["semantic_scholar"]["next_l2_index"] == 1
+
+    crash_on_l3_second_parent["enabled"] = False
+    resumed = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["semantic_scholar:seed1"],
+        sources=["semantic_scholar"],
+        depth="l2l3",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    baseline = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["semantic_scholar:seed1"],
+        sources=["semantic_scholar"],
+        depth="l2l3",
+        cache_dir=Path(tmp_path) / "baseline-cache",
+        checkpoint_dir=Path(tmp_path) / "baseline-checkpoints",
+        refresh=True,
+    )
+
+    assert resumed.citation_data == baseline.citation_data
+    assert resumed.papers_data == baseline.papers_data
+    assert "semantic_scholar" in resumed.metadata["checkpoint_stats"]["l3_resumed_providers"]
+
+
 class _ResumeCaptureProvider(ci.CitationProvider):
     name = "resume_capture"
     capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=True)
