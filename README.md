@@ -121,7 +121,8 @@ If `labels_data` is omitted, the CLI extracts features and skips training/predic
 - `--reset-checkpoints` clears the current request's checkpoint state before ingestion starts.
 - `--refresh-cache` forces a fresh internet retrieval instead of reusing cached results.
 - Checkpoint semantics (Phase 1): completion is persisted after each provider completes; resumed runs skip completed providers and continue remaining providers.
-- Phase 1 checkpoints do not resume mid-provider pagination yet; interruptions during a provider rerun that provider on the next attempt.
+- Phase 2 adds L2 mid-pagination resume for OpenAlex (cursor) and Semantic Scholar (offset), so interrupted cited-by traversal can continue from saved per-seed progress.
+- L3 iteration resume is still out of scope; interruptions during L3 expansion rerun that provider segment.
 - `--only-ingest` runs ingestion and exits before feature extraction/training.
 - `--save-ingested-citation-data` and `--save-ingested-papers-data` let you persist normalized outputs for offline replay.
 - Tests do not rely on live provider calls; the internet ingestion path is covered with mocked fixtures.
@@ -270,6 +271,27 @@ This includes `fetch_stats`:
 - `total_failures` counts failed HTTP fetches.
 - `per_provider_failures` breaks failures down by provider.
 
+Ingestion metadata also includes `checkpoint_stats`:
+
+```json
+{
+	"checkpoint_stats": {
+		"hit": true,
+		"miss": false,
+		"cache_short_circuit": false,
+		"providers_skipped": 1,
+		"skipped_provider_names": ["openalex"],
+		"providers_executed": 2,
+		"executed_provider_names": ["semantic_scholar", "crossref"]
+	}
+}
+```
+
+- `hit`/`miss` indicate whether a checkpoint payload was restored for this run.
+- `cache_short_circuit` indicates the run returned from full-result cache before provider execution.
+- `providers_skipped` and `skipped_provider_names` report providers skipped because checkpoint state already marked them complete.
+- `providers_executed` and `executed_provider_names` report providers actually executed in this run.
+
 ## Config reference
 
 A compact reference for keys accepted in config files (and equivalent CLI flags). Types shown as (type, default).
@@ -286,6 +308,8 @@ A compact reference for keys accepted in config files (and equivalent CLI flags)
 - **depth**: (string, default: l2l3) — Ingestion expansion depth: `l2` or `l2l3`.
 - **key_constructs**: (list|string, optional) — Additional keywords to bias provider search relevance. Accepts YAML lists or comma-separated strings.
 - **cache_dir**: (path, default: .cache/adit_ingestion) — Directory to cache provider responses and merged ingestion payloads.
+- **checkpoint_dir**: (path, default: <cache_dir>/checkpoints) — Directory for resumable checkpoint state.
+- **reset_checkpoints**: (bool, default: false) — If true, clear checkpoint state for the current request before ingestion starts.
 - **refresh_cache**: (bool, default: false) — If true, ignore cached ingestion and force fresh retrieval.
 - **max_l2**: (int, default: 200) — Per-provider cap on L2 retrieval. Admitted L2 papers must explicitly cite an L1 seed.
 - **max_l3**: (int or null, default: null/unlimited) — Optional per-provider cap on L3 reference edges retrieved when expanding L2 → L3. Omit or set to null for exhaustive L3 retrieval.

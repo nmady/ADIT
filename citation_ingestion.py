@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -12,7 +13,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,8 @@ class CitationProvider:
         self,
         l1_provider_id: str,
         max_results: Optional[int] = None,
+        resume_state: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Tuple[Dict[str, "IngestionPaper"], int, str]:
         """Fetch all papers that cite this L1 paper via provider-native cited-by traversal.
 
@@ -89,7 +92,7 @@ class CitationProvider:
 
 
 _CACHE_SCHEMA_VERSION = 5
-_CHECKPOINT_SCHEMA_VERSION = 1
+_CHECKPOINT_SCHEMA_VERSION = 2
 
 # HTTP codes that are safe to retry vs. those that indicate a permanent failure.
 _PERMANENT_FAILURE_HTTP_CODES = frozenset({400, 401, 403, 404})
@@ -408,6 +411,32 @@ def _serialize_papers(papers: Dict[str, IngestionPaper]) -> Dict[str, Dict[str, 
     return {paper_id: _paper_to_output_dict(paper) for paper_id, paper in papers.items()}
 
 
+def _serialize_provider_pagination_state(
+    state: Dict[str, Dict[str, Dict[str, Any]]],
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    serialized: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for provider_name, provider_state in state.items():
+        if not isinstance(provider_name, str) or not isinstance(provider_state, dict):
+            continue
+
+        provider_serialized: Dict[str, Dict[str, Any]] = {}
+        for seed_id, seed_state in provider_state.items():
+            if not isinstance(seed_id, str) or not isinstance(seed_state, dict):
+                continue
+
+            clean_state = dict(seed_state)
+            papers = clean_state.get("papers")
+            if isinstance(papers, dict):
+                paper_objs = _deserialize_papers(papers)
+                clean_state["papers"] = _serialize_papers(paper_objs)
+
+            provider_serialized[seed_id] = clean_state
+
+        serialized[provider_name] = provider_serialized
+
+    return serialized
+
+
 def _deserialize_papers(raw_papers: Any) -> Dict[str, IngestionPaper]:
     if not isinstance(raw_papers, dict):
         return {}
@@ -457,6 +486,35 @@ def _deserialize_papers(raw_papers: Any) -> Dict[str, IngestionPaper]:
     return output
 
 
+def _deserialize_provider_pagination_state(
+    raw_state: Any,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    if not isinstance(raw_state, dict):
+        return {}
+
+    output: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for provider_name, provider_state in raw_state.items():
+        if not isinstance(provider_name, str) or not isinstance(provider_state, dict):
+            continue
+
+        provider_output: Dict[str, Dict[str, Any]] = {}
+        for seed_id, seed_state in provider_state.items():
+            if not isinstance(seed_id, str) or not isinstance(seed_state, dict):
+                continue
+
+            clean_state = dict(seed_state)
+            papers = clean_state.get("papers")
+            if isinstance(papers, dict):
+                paper_objs = _deserialize_papers(papers)
+                clean_state["papers"] = _serialize_papers(paper_objs)
+
+            provider_output[seed_id] = clean_state
+
+        output[provider_name] = provider_output
+
+    return output
+
+
 def _load_checkpoint_state(
     checkpoint_root: Path,
     key: str,
@@ -494,6 +552,7 @@ def _write_checkpoint_state(
     all_papers: Dict[str, IngestionPaper],
     provider_stats: Dict[str, object],
     combined_completeness: Dict[str, Dict[str, object]],
+    provider_pagination_state: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
 ) -> None:
     checkpoint_path = _checkpoint_file(checkpoint_root, key)
     payload = {
@@ -504,6 +563,9 @@ def _write_checkpoint_state(
         "all_papers": _serialize_papers(all_papers),
         "provider_stats": provider_stats,
         "combined_completeness": combined_completeness,
+        "provider_pagination_state": _serialize_provider_pagination_state(
+            provider_pagination_state or {}
+        ),
     }
     _write_json_atomic(checkpoint_path, payload)
 
@@ -809,6 +871,8 @@ def _fetch_provider_graph(
     exhaustive: bool,
     max_l2: int,
     max_l3: Optional[int],
+    provider_seed_state: Optional[Dict[str, Dict[str, Any]]] = None,
+    seed_progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> tuple[Dict[str, Set[str]], Dict[str, IngestionPaper], Dict[str, object]]:
     """Fetch L2 (and optionally L3) papers for a provider.
 
@@ -841,8 +905,29 @@ def _fetch_provider_graph(
 
             l1_native_id = normalize_identifier(raw_provider_id, source=provider.name)
             _vprint(f"  [{provider.name}] Fetching citers for seed: {l1_id}")
+
+            resume_state = None
+            if provider_seed_state and isinstance(provider_seed_state.get(l1_id), dict):
+                resume_state = provider_seed_state[l1_id]
+
+            progress_fn = None
+            if seed_progress_callback is not None:
+
+                def _on_progress(state: Dict[str, Any], seed: str = l1_id) -> None:
+                    seed_progress_callback(seed, state)
+
+                progress_fn = _on_progress
+
+            call_kwargs: Dict[str, Any] = {"max_results": max_results}
+            signature = inspect.signature(provider.fetch_citers_for_l1)
+            if "resume_state" in signature.parameters:
+                call_kwargs["resume_state"] = resume_state
+            if "progress_callback" in signature.parameters and progress_fn is not None:
+                call_kwargs["progress_callback"] = progress_fn
+
             papers_for_l1, expected_count, status = provider.fetch_citers_for_l1(
-                l1_native_id, max_results=max_results
+                l1_native_id,
+                **call_kwargs,
             )
             _vprint(
                 f"  [{provider.name}] \u2192 {len(papers_for_l1)}"
@@ -948,8 +1033,9 @@ def _build_metadata(
     papers_data: Dict[str, Dict[str, object]],
     citation_data: Dict[str, List[str]],
     completeness: Dict[str, Dict[str, object]],
+    checkpoint_stats: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
-    return {
+    metadata = {
         "sources": list(source_list),
         "depth": depth,
         "provider_stats": provider_stats,
@@ -964,6 +1050,9 @@ def _build_metadata(
         "paper_count": len(papers_data),
         "edge_count": sum(len(values) for values in citation_data.values()),
     }
+    if checkpoint_stats is not None:
+        metadata["checkpoint_stats"] = checkpoint_stats
+    return metadata
 
 
 class OpenAlexProvider(CitationProvider):
@@ -1050,13 +1139,21 @@ class OpenAlexProvider(CitationProvider):
         self,
         l1_provider_id: str,
         max_results: Optional[int] = None,
+        resume_state: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Tuple[Dict[str, IngestionPaper], int, str]:
         """Fetch all papers citing this OpenAlex work via cursor-paginated cited-by traversal."""
-        papers: Dict[str, IngestionPaper] = {}
+        papers = _deserialize_papers((resume_state or {}).get("papers"))
         # Strip "openalex:" prefix to get bare work ID for the API filter.
         work_id = l1_provider_id.split(":", 1)[-1] if ":" in l1_provider_id else l1_provider_id
-        cursor = "*"
+        cursor = str((resume_state or {}).get("cursor") or "*")
+        expected_count_raw = (resume_state or {}).get("expected_count")
         expected_count: Optional[int] = None
+        if expected_count_raw is not None:
+            try:
+                expected_count = int(expected_count_raw)
+            except (TypeError, ValueError):
+                expected_count = None
 
         while True:
             per_page = 200
@@ -1077,6 +1174,16 @@ class OpenAlexProvider(CitationProvider):
             payload = _safe_get(f"https://api.openalex.org/works?{params}", provider=self.name)
             if not payload:
                 status = "failed" if not papers else "partial"
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "status": status,
+                            "cursor": cursor,
+                            "expected_count": expected_count,
+                            "fetched_count": len(papers),
+                            "papers": _serialize_papers(papers),
+                        }
+                    )
                 return papers, expected_count or 0, status
 
             if expected_count is None:
@@ -1093,11 +1200,32 @@ class OpenAlexProvider(CitationProvider):
             next_cursor = (payload.get("meta") or {}).get("next_cursor")
             if not next_cursor or not results:
                 break
+
+            if progress_callback:
+                progress_callback(
+                    {
+                        "status": "in_progress",
+                        "cursor": next_cursor,
+                        "expected_count": expected_count,
+                        "fetched_count": len(papers),
+                        "papers": _serialize_papers(papers),
+                    }
+                )
             cursor = next_cursor
             time.sleep(0.03)
 
         fetched = len(papers)
         status = "complete" if (expected_count is None or fetched >= expected_count) else "partial"
+        if progress_callback:
+            progress_callback(
+                {
+                    "status": status,
+                    "cursor": None,
+                    "expected_count": expected_count or fetched,
+                    "fetched_count": fetched,
+                    "papers": _serialize_papers(papers),
+                }
+            )
         return papers, expected_count or fetched, status
 
     def fetch_l2_and_metadata(
@@ -1195,13 +1323,25 @@ class SemanticScholarProvider(CitationProvider):
         self,
         l1_provider_id: str,
         max_results: Optional[int] = None,
+        resume_state: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Tuple[Dict[str, IngestionPaper], int, str]:
         """Fetch all papers citing this S2 paper via offset-paginated citations endpoint."""
-        papers: Dict[str, IngestionPaper] = {}
+        papers = _deserialize_papers((resume_state or {}).get("papers"))
         token = l1_provider_id.split(":", 1)[-1] if ":" in l1_provider_id else l1_provider_id
-        offset = 0
+        offset_raw = (resume_state or {}).get("offset")
+        try:
+            offset = int(offset_raw) if offset_raw is not None else len(papers)
+        except (TypeError, ValueError):
+            offset = len(papers)
         limit = 1000
+        expected_count_raw = (resume_state or {}).get("expected_count")
         expected_count: Optional[int] = None
+        if expected_count_raw is not None:
+            try:
+                expected_count = int(expected_count_raw)
+            except (TypeError, ValueError):
+                expected_count = None
 
         while True:
             batch_limit = _semantic_batch_limit(offset, limit, papers, max_results)
@@ -1217,6 +1357,16 @@ class SemanticScholarProvider(CitationProvider):
             payload = _safe_get(url, provider=self.name, headers=self._headers())
             if not payload:
                 status = "failed" if not papers else "partial"
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "status": status,
+                            "offset": offset,
+                            "expected_count": expected_count,
+                            "fetched_count": len(papers),
+                            "papers": _serialize_papers(papers),
+                        }
+                    )
                 return papers, expected_count or 0, status
 
             data = payload.get("data") or []
@@ -1235,10 +1385,30 @@ class SemanticScholarProvider(CitationProvider):
             if not data or not payload.get("next"):
                 break
             offset += len(data)
+            if progress_callback:
+                progress_callback(
+                    {
+                        "status": "in_progress",
+                        "offset": offset,
+                        "expected_count": expected_count,
+                        "fetched_count": len(papers),
+                        "papers": _serialize_papers(papers),
+                    }
+                )
             time.sleep(0.05)
 
         fetched = len(papers)
         status = "complete" if (expected_count is None or fetched >= expected_count) else "partial"
+        if progress_callback:
+            progress_callback(
+                {
+                    "status": status,
+                    "offset": offset,
+                    "expected_count": expected_count or fetched,
+                    "fetched_count": fetched,
+                    "papers": _serialize_papers(papers),
+                }
+            )
         return papers, expected_count or fetched, status
 
     def fetch_l2_and_metadata(
@@ -1639,8 +1809,36 @@ def ingest_from_internet(
     )
     key = _cache_key(request_payload)
 
+    checkpoint_stats: Dict[str, object] = {
+        "hit": False,
+        "miss": True,
+        "cache_short_circuit": False,
+        "providers_skipped": 0,
+        "skipped_provider_names": [],
+        "providers_executed": 0,
+        "executed_provider_names": [],
+    }
+
     cached = _load_cached_result(cache_root, key, refresh)
     if cached:
+        metadata = dict(cached.metadata or {})
+        existing_checkpoint_stats = metadata.get("checkpoint_stats")
+        if not isinstance(existing_checkpoint_stats, dict):
+            existing_checkpoint_stats = {}
+        merged_stats = dict(existing_checkpoint_stats)
+        merged_stats.update(
+            {
+                "cache_short_circuit": True,
+                "hit": False,
+                "miss": True,
+                "providers_skipped": 0,
+                "skipped_provider_names": [],
+                "providers_executed": 0,
+                "executed_provider_names": [],
+            }
+        )
+        metadata["checkpoint_stats"] = merged_stats
+        cached.metadata = metadata
         return cached
 
     l1_norm, seed_papers = _seed_l1_papers(l1_papers)
@@ -1649,10 +1847,13 @@ def ingest_from_internet(
     provider_stats: Dict[str, object] = {}
     combined_completeness: Dict[str, Dict[str, object]] = {}
     completed_providers: Set[str] = set()
+    provider_pagination_state: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
     checkpoint_root = checkpoint_dir or (cache_root / "checkpoints")
     checkpoint_state = _load_checkpoint_state(checkpoint_root, key, reset_checkpoints)
     if checkpoint_state:
+        checkpoint_stats["hit"] = True
+        checkpoint_stats["miss"] = False
         all_edges = _deserialize_edges(checkpoint_state.get("all_edges"))
         all_papers = _deserialize_papers(checkpoint_state.get("all_papers"))
         _merge_seed_metadata(all_papers, seed_papers)
@@ -1667,18 +1868,39 @@ def ingest_from_internet(
 
         raw_completed = checkpoint_state.get("completed_providers")
         if isinstance(raw_completed, list):
-            completed_providers = {
-                value for value in raw_completed if isinstance(value, str)
-            }
+            completed_providers = {value for value in raw_completed if isinstance(value, str)}
 
-        _vprint(
-            f"[ADIT] Loaded checkpoint: {len(completed_providers)} completed provider(s)"
+        provider_pagination_state = _deserialize_provider_pagination_state(
+            checkpoint_state.get("provider_pagination_state")
+        )
+
+        _vprint(f"[ADIT] Loaded checkpoint: {len(completed_providers)} completed provider(s)")
+
+    def _persist_checkpoint_snapshot() -> None:
+        _write_checkpoint_state(
+            checkpoint_root,
+            key,
+            completed_providers,
+            all_edges,
+            all_papers,
+            provider_stats,
+            combined_completeness,
+            provider_pagination_state,
         )
 
     for provider in providers:
         if provider.name in completed_providers:
             _vprint(f"\n[ADIT] Skipping provider (checkpoint complete): {provider.name}")
+            skipped_names = checkpoint_stats["skipped_provider_names"]
+            if isinstance(skipped_names, list):
+                skipped_names.append(provider.name)
+            checkpoint_stats["providers_skipped"] = int(checkpoint_stats["providers_skipped"]) + 1
             continue
+
+        executed_names = checkpoint_stats["executed_provider_names"]
+        if isinstance(executed_names, list):
+            executed_names.append(provider.name)
+        checkpoint_stats["providers_executed"] = int(checkpoint_stats["providers_executed"]) + 1
 
         _vprint(f"\n[ADIT] Querying provider: {provider.name}")
         _merge_seed_metadata(all_papers, provider.fetch_seed_metadata(l1_norm))
@@ -1696,16 +1918,15 @@ def ingest_from_internet(
                 "completeness": {},
             }
             completed_providers.add(provider.name)
-            _write_checkpoint_state(
-                checkpoint_root,
-                key,
-                completed_providers,
-                all_edges,
-                all_papers,
-                provider_stats,
-                combined_completeness,
-            )
+            provider_pagination_state.pop(provider.name, None)
+            _persist_checkpoint_snapshot()
             continue
+
+        provider_state = provider_pagination_state.setdefault(provider.name, {})
+
+        def _seed_progress(seed_id: str, state: Dict[str, Any]) -> None:
+            provider_state[seed_id] = dict(state)
+            _persist_checkpoint_snapshot()
 
         provider_edges, provider_papers, stats = _fetch_provider_graph(
             provider=provider,
@@ -1717,6 +1938,8 @@ def ingest_from_internet(
             exhaustive=exhaustive,
             max_l2=max_l2,
             max_l3=max_l3,
+            provider_seed_state=provider_state,
+            seed_progress_callback=_seed_progress,
         )
         _merge_provider_outputs(all_edges, all_papers, provider_edges, provider_papers)
         provider_stats[provider.name] = stats
@@ -1724,15 +1947,8 @@ def ingest_from_internet(
             combined_completeness.setdefault(l1_id, {}).update(l1_completeness)
 
         completed_providers.add(provider.name)
-        _write_checkpoint_state(
-            checkpoint_root,
-            key,
-            completed_providers,
-            all_edges,
-            all_papers,
-            provider_stats,
-            combined_completeness,
-        )
+        provider_pagination_state.pop(provider.name, None)
+        _persist_checkpoint_snapshot()
 
     citation_data, papers_data, alias_map = _dedupe_and_materialize(all_edges, all_papers)
 
@@ -1745,6 +1961,7 @@ def ingest_from_internet(
         papers_data,
         citation_data,
         combined_completeness,
+        checkpoint_stats,
     )
 
     result_payload = {

@@ -851,7 +851,9 @@ def test_semantic_seed_metadata_passes_auth_headers_when_configured(monkeypatch)
     provider = ci.SemanticScholarProvider(api_key="secret-key")
     captured_headers = []
 
-    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES, headers=None):
+    def fake_safe_get(
+        url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES, headers=None
+    ):
         captured_headers.append(headers)
         return {
             "paperId": "abc123",
@@ -875,7 +877,9 @@ def test_semantic_citers_pass_auth_headers_when_configured(monkeypatch):
     provider = ci.SemanticScholarProvider(api_key="secret-key")
     captured_headers = []
 
-    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES, headers=None):
+    def fake_safe_get(
+        url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES, headers=None
+    ):
         captured_headers.append(headers)
         return {
             "total": 1,
@@ -908,7 +912,9 @@ def test_semantic_l2_search_passes_auth_headers_when_configured(monkeypatch):
     provider = ci.SemanticScholarProvider(api_key="secret-key")
     captured_headers = []
 
-    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES, headers=None):
+    def fake_safe_get(
+        url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES, headers=None
+    ):
         captured_headers.append(headers)
         return {
             "data": [
@@ -943,7 +949,9 @@ def test_semantic_l3_requests_pass_auth_headers_when_configured(monkeypatch):
     provider = ci.SemanticScholarProvider(api_key="secret-key")
     captured_headers = []
 
-    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES, headers=None):
+    def fake_safe_get(
+        url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES, headers=None
+    ):
         captured_headers.append(headers)
         return {
             "references": [
@@ -1866,3 +1874,317 @@ def test_checkpoint_crash_resume_matches_uninterrupted_baseline(monkeypatch, tmp
     assert resumed.citation_data == baseline.citation_data
     assert resumed.papers_data == baseline.papers_data
     assert resumed.metadata["provider_stats"] == baseline.metadata["provider_stats"]
+
+
+def test_checkpoint_stats_report_hit_miss_and_provider_skip(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+
+    provider_run1 = _CheckpointProvider("checkpoint_stats", "checkpoint_stats:L2")
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider_run1])
+
+    first = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["checkpoint_stats"],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    first_stats = first.metadata["checkpoint_stats"]
+    assert first_stats["hit"] is False
+    assert first_stats["miss"] is True
+    assert first_stats["providers_executed"] == 1
+    assert first_stats["executed_provider_names"] == ["checkpoint_stats"]
+    assert first_stats["providers_skipped"] == 0
+
+    provider_run2 = _CheckpointProvider(
+        "checkpoint_stats",
+        "checkpoint_stats:L2",
+        fail_on_call=True,
+    )
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider_run2])
+
+    second = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["checkpoint_stats"],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    second_stats = second.metadata["checkpoint_stats"]
+    assert second_stats["hit"] is True
+    assert second_stats["miss"] is False
+    assert second_stats["providers_skipped"] == 1
+    assert second_stats["skipped_provider_names"] == ["checkpoint_stats"]
+    assert second_stats["providers_executed"] == 0
+
+
+def test_checkpoint_stats_marks_cache_short_circuit(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+    provider = _CheckpointProvider("checkpoint_cache", "checkpoint_cache:L2")
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["checkpoint_cache"],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=False,
+    )
+
+    cached = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["checkpoint_cache"],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=False,
+    )
+
+    cached_stats = cached.metadata["checkpoint_stats"]
+    assert cached_stats["cache_short_circuit"] is True
+    assert cached_stats["providers_executed"] == 0
+
+
+def test_openalex_mid_pagination_resume_from_checkpoint(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+    crash_on_second_page = {"enabled": True}
+
+    def fake_safe_get(
+        url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES, headers=None
+    ):
+        if url.endswith("/works/WSEED"):
+            return {
+                "id": "https://openalex.org/WSEED",
+                "title": "Seed",
+                "publication_year": 2000,
+                "cited_by_count": 10,
+                "doi": "10.1000/seed",
+                "abstract_inverted_index": {},
+            }
+
+        if "api.openalex.org/works?" in url:
+            parsed = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qs(parsed.query)
+            if params.get("filter", [""])[0] != "cites:WSEED":
+                return None
+            cursor = params.get("cursor", ["*"])[0]
+
+            if cursor == "*":
+                return {
+                    "meta": {"count": 2, "next_cursor": "C2"},
+                    "results": [
+                        {
+                            "id": "https://openalex.org/WCITER1",
+                            "title": "Citer 1",
+                            "publication_year": 2020,
+                            "cited_by_count": 1,
+                            "doi": "10.1000/citer1",
+                            "abstract_inverted_index": {},
+                        }
+                    ],
+                }
+
+            if cursor == "C2":
+                if crash_on_second_page["enabled"]:
+                    raise RuntimeError("openalex simulated page crash")
+                return {
+                    "meta": {"count": 2, "next_cursor": None},
+                    "results": [
+                        {
+                            "id": "https://openalex.org/WCITER2",
+                            "title": "Citer 2",
+                            "publication_year": 2021,
+                            "cited_by_count": 1,
+                            "doi": "10.1000/citer2",
+                            "abstract_inverted_index": {},
+                        }
+                    ],
+                }
+
+        return None
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="openalex simulated page crash"):
+        ci.ingest_from_internet(
+            theory_name="Technology Acceptance Model",
+            l1_papers=["openalex:WSEED"],
+            sources=["openalex"],
+            depth="l2",
+            cache_dir=cache_dir,
+            checkpoint_dir=checkpoint_dir,
+            refresh=True,
+        )
+
+    request_payload = ci._request_payload(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["openalex:WSEED"],
+        key_constructs=None,
+        sources=["openalex"],
+        depth="l2",
+        max_l2=200,
+        max_l3=None,
+        exhaustive=True,
+    )
+    key = ci._cache_key(request_payload)
+    state = ci._load_checkpoint_state(checkpoint_dir, key, reset_checkpoints=False)
+    assert state is not None
+    assert state["provider_pagination_state"]["openalex"]["openalex:WSEED"]["cursor"] == "C2"
+
+    crash_on_second_page["enabled"] = False
+    resumed = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["openalex:WSEED"],
+        sources=["openalex"],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    baseline = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["openalex:WSEED"],
+        sources=["openalex"],
+        depth="l2",
+        cache_dir=Path(tmp_path) / "baseline-cache",
+        checkpoint_dir=Path(tmp_path) / "baseline-checkpoints",
+        refresh=True,
+    )
+
+    assert resumed.citation_data == baseline.citation_data
+    assert resumed.papers_data == baseline.papers_data
+    assert resumed.metadata["checkpoint_stats"]["hit"] is True
+
+
+def test_semantic_mid_pagination_resume_from_checkpoint(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+    crash_on_second_page = {"enabled": True}
+
+    def fake_safe_get(
+        url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES, headers=None
+    ):
+        if "/graph/v1/paper/seed1?fields=" in url:
+            return {
+                "paperId": "seed1",
+                "title": "Seed",
+                "abstract": "",
+                "year": 2000,
+                "citationCount": 0,
+                "externalIds": {},
+            }
+
+        if "/graph/v1/paper/seed1/citations" in url:
+            parsed = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qs(parsed.query)
+            offset = int(params.get("offset", ["0"])[0])
+
+            if offset == 0:
+                return {
+                    "total": 2,
+                    "next": "has-more",
+                    "data": [
+                        {
+                            "citingPaper": {
+                                "paperId": "citer-1",
+                                "title": "Citer 1",
+                                "year": 2020,
+                                "citationCount": 1,
+                                "externalIds": {},
+                                "abstract": "",
+                            }
+                        }
+                    ],
+                }
+
+            if offset == 1:
+                if crash_on_second_page["enabled"]:
+                    raise RuntimeError("semantic simulated page crash")
+                return {
+                    "total": 2,
+                    "data": [
+                        {
+                            "citingPaper": {
+                                "paperId": "citer-2",
+                                "title": "Citer 2",
+                                "year": 2021,
+                                "citationCount": 1,
+                                "externalIds": {},
+                                "abstract": "",
+                            }
+                        }
+                    ],
+                }
+
+        return None
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="semantic simulated page crash"):
+        ci.ingest_from_internet(
+            theory_name="Technology Acceptance Model",
+            l1_papers=["semantic_scholar:seed1"],
+            sources=["semantic_scholar"],
+            depth="l2",
+            cache_dir=cache_dir,
+            checkpoint_dir=checkpoint_dir,
+            refresh=True,
+        )
+
+    request_payload = ci._request_payload(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["semantic_scholar:seed1"],
+        key_constructs=None,
+        sources=["semantic_scholar"],
+        depth="l2",
+        max_l2=200,
+        max_l3=None,
+        exhaustive=True,
+    )
+    key = ci._cache_key(request_payload)
+    state = ci._load_checkpoint_state(checkpoint_dir, key, reset_checkpoints=False)
+    assert state is not None
+    assert (
+        state["provider_pagination_state"]["semantic_scholar"]["semantic_scholar:seed1"]["offset"]
+        == 1
+    )
+
+    crash_on_second_page["enabled"] = False
+    resumed = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["semantic_scholar:seed1"],
+        sources=["semantic_scholar"],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    baseline = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["semantic_scholar:seed1"],
+        sources=["semantic_scholar"],
+        depth="l2",
+        cache_dir=Path(tmp_path) / "baseline-cache",
+        checkpoint_dir=Path(tmp_path) / "baseline-checkpoints",
+        refresh=True,
+    )
+
+    assert resumed.citation_data == baseline.citation_data
+    assert resumed.papers_data == baseline.papers_data
+    assert resumed.metadata["checkpoint_stats"]["hit"] is True
