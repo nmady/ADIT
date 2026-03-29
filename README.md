@@ -55,6 +55,7 @@ python cli.py \
 	--depth l2l3 \
 	--key-constructs "usefulness,ease of use,behavioral intention" \
 	--cache-dir .cache/adit_ingestion \
+	--checkpoint-dir .cache/adit_ingestion/checkpoints \
 	--only-ingest \
 	--save-ingested-citation-data outputs/citation_data.json \
 	--save-ingested-papers-data outputs/papers_data.json \
@@ -116,7 +117,11 @@ If `labels_data` is omitted, the CLI extracts features and skips training/predic
 - Title or theory-name matches alone are not sufficient for L2 inclusion.
 - Crossref is used for metadata enrichment of accepted papers and seed DOIs, not for L2 graph discovery.
 - `--cache-dir` stores cached ingestion results so repeated runs can reuse prior retrieval work.
+- `--checkpoint-dir` stores provider-atomic progress snapshots for resumable ingestion (defaults to `<cache-dir>/checkpoints`).
+- `--reset-checkpoints` clears the current request's checkpoint state before ingestion starts.
 - `--refresh-cache` forces a fresh internet retrieval instead of reusing cached results.
+- Checkpoint semantics (Phase 1): completion is persisted after each provider completes; resumed runs skip completed providers and continue remaining providers.
+- Phase 1 checkpoints do not resume mid-provider pagination yet; interruptions during a provider rerun that provider on the next attempt.
 - `--only-ingest` runs ingestion and exits before feature extraction/training.
 - `--save-ingested-citation-data` and `--save-ingested-papers-data` let you persist normalized outputs for offline replay.
 - Tests do not rely on live provider calls; the internet ingestion path is covered with mocked fixtures.

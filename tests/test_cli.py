@@ -484,3 +484,105 @@ def test_cli_only_ingest_skips_adit_pipeline(monkeypatch):
     assert "Online ingestion complete:" in result.output
     assert "Ingestion-only mode enabled" in result.output
     assert "Extracted" not in result.output
+
+
+def test_cli_online_checkpoint_options_are_passed_to_ingestion(monkeypatch):
+    """CLI checkpoint flags should pass through to ingest_from_internet in online mode."""
+    monkeypatch.setattr(cli, "ADIT", FakeADIT)
+    captured_kwargs = {}
+
+    def fake_ingest(**kwargs):
+        captured_kwargs.update(kwargs)
+        return SimpleNamespace(
+            citation_data={"PaperA": ["TAM1"]},
+            papers_data={
+                "PaperA": {
+                    "title": "A",
+                    "abstract": "a",
+                    "keywords": "k",
+                    "citations": 1,
+                    "year": 2010,
+                },
+                "TAM1": {
+                    "title": "TAM",
+                    "abstract": "foundation",
+                    "keywords": "tam",
+                    "citations": 100,
+                    "year": 1990,
+                },
+            },
+            metadata={"paper_count": 2, "edge_count": 1},
+        )
+
+    monkeypatch.setattr(cli, "ingest_from_internet", fake_ingest)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "--online",
+            "--theory-name",
+            "Technology Acceptance Model",
+            "--l1-papers",
+            "TAM1,TAM2",
+            "--depth",
+            "l2",
+            "--checkpoint-dir",
+            "custom-checkpoints",
+            "--reset-checkpoints",
+        ],
+        color=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured_kwargs["checkpoint_dir"] == Path("custom-checkpoints")
+    assert captured_kwargs["reset_checkpoints"] is True
+
+
+def test_cli_online_checkpoint_config_values_are_resolved(tmp_path, monkeypatch):
+    """Config-file checkpoint settings should be resolved and passed to ingestion."""
+    monkeypatch.setattr(cli, "ADIT", FakeADIT)
+    captured_kwargs = {}
+
+    config_file = tmp_path / "online-config.json"
+    _write_json(
+        config_file,
+        {
+            "online": True,
+            "theory_name": "Technology Acceptance Model",
+            "l1_papers": ["TAM1", "TAM2"],
+            "depth": "l2",
+            "checkpoint_dir": "cfg-checkpoints",
+            "reset_checkpoints": True,
+        },
+    )
+
+    def fake_ingest(**kwargs):
+        captured_kwargs.update(kwargs)
+        return SimpleNamespace(
+            citation_data={"PaperA": ["TAM1"]},
+            papers_data={
+                "PaperA": {
+                    "title": "A",
+                    "abstract": "a",
+                    "keywords": "k",
+                    "citations": 1,
+                    "year": 2010,
+                },
+                "TAM1": {
+                    "title": "TAM",
+                    "abstract": "foundation",
+                    "keywords": "tam",
+                    "citations": 100,
+                    "year": 1990,
+                },
+            },
+            metadata={"paper_count": 2, "edge_count": 1},
+        )
+
+    monkeypatch.setattr(cli, "ingest_from_internet", fake_ingest)
+
+    result = runner.invoke(cli.app, ["--config", str(config_file)], color=False)
+
+    assert result.exit_code == 0, result.output
+    assert captured_kwargs["checkpoint_dir"] == Path("cfg-checkpoints")
+    assert captured_kwargs["reset_checkpoints"] is True

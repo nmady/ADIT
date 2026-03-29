@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import citation_ingestion as ci
+import pytest
 
 
 class _FakeProvider(ci.CitationProvider):
@@ -1645,3 +1646,223 @@ def test_safe_get_non_429_uses_exponential_backoff(monkeypatch):
     # Just verify retries happened and weren't instant
     assert len(sleep_calls) == 2
     assert all(s > 0 for s in sleep_calls)
+
+
+# ---------------------------------------------------------------------------
+# Resumable checkpoints (Phase 1: provider-atomic)
+# ---------------------------------------------------------------------------
+
+
+class _CheckpointProvider(ci.CitationProvider):
+    capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=False)
+
+    def __init__(
+        self,
+        name: str,
+        edge_id: str,
+        crash: bool = False,
+        fail_on_call: bool = False,
+    ):
+        self.name = name
+        self.edge_id = edge_id
+        self.crash = crash
+        self.fail_on_call = fail_on_call
+        self.seed_calls = 0
+        self.l2_calls = 0
+
+    def fetch_seed_metadata(self, l1_papers):
+        if self.fail_on_call:
+            raise AssertionError(f"{self.name} should have been skipped via checkpoint")
+        self.seed_calls += 1
+        return {
+            l1_papers[0]: ci.IngestionPaper(
+                paper_id=l1_papers[0],
+                title=f"Seed from {self.name}",
+                source_ids={self.name: f"seed-{self.name}"},
+            )
+        }
+
+    def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
+        if self.fail_on_call:
+            raise AssertionError(f"{self.name} should have been skipped via checkpoint")
+        self.l2_calls += 1
+        if self.crash:
+            raise RuntimeError(f"simulated crash in {self.name}")
+        return (
+            {self.edge_id: {l1_papers[0]}},
+            {
+                self.edge_id: ci.IngestionPaper(
+                    paper_id=self.edge_id,
+                    title=f"{self.name} L2",
+                    year=2020,
+                    citations=1,
+                )
+            },
+        )
+
+    def fetch_l3_references(self, l2_paper_ids, max_l3=None):
+        return {}, {}
+
+
+def test_checkpoint_resume_skips_completed_provider(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+
+    provider_run1 = _CheckpointProvider("checkpoint_a", "checkpoint_a:L2")
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider_run1])
+
+    result1 = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["checkpoint_a"],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+    assert provider_run1.seed_calls == 1
+    assert provider_run1.l2_calls == 1
+
+    checkpoint_file = checkpoint_dir / f"{result1.metadata['cache_key']}.checkpoint.json"
+    assert checkpoint_file.exists()
+
+    provider_run2 = _CheckpointProvider(
+        "checkpoint_a",
+        "checkpoint_a:L2",
+        fail_on_call=True,
+    )
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider_run2])
+
+    result2 = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["checkpoint_a"],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    assert result2.citation_data == result1.citation_data
+    assert result2.papers_data == result1.papers_data
+
+
+def test_checkpoint_reset_forces_refetch(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+    provider = _CheckpointProvider("checkpoint_reset", "checkpoint_reset:L2")
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["checkpoint_reset"],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+    assert provider.l2_calls == 1
+
+    ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["checkpoint_reset"],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+        reset_checkpoints=True,
+    )
+    assert provider.l2_calls == 2
+
+
+def test_checkpoint_corruption_is_ignored(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+    provider = _CheckpointProvider("checkpoint_corrupt", "checkpoint_corrupt:L2")
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    request_payload = ci._request_payload(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        key_constructs=None,
+        sources=["checkpoint_corrupt"],
+        depth="l2",
+        max_l2=200,
+        max_l3=None,
+        exhaustive=True,
+    )
+    key = ci._cache_key(request_payload)
+    checkpoint_path = checkpoint_dir / f"{key}.checkpoint.json"
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text("not valid json", encoding="utf-8")
+
+    result = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["checkpoint_corrupt"],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    assert result.metadata["provider_stats"]["checkpoint_corrupt"]["l2_nodes"] == 1
+    assert provider.l2_calls == 1
+
+
+def test_checkpoint_crash_resume_matches_uninterrupted_baseline(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+
+    provider_a_first = _CheckpointProvider("checkpoint_a", "checkpoint_a:L2")
+    provider_b_crash = _CheckpointProvider("checkpoint_b", "checkpoint_b:L2", crash=True)
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider_a_first, provider_b_crash])
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        ci.ingest_from_internet(
+            theory_name="Technology Acceptance Model",
+            l1_papers=["10.1000/xyz1"],
+            sources=["checkpoint_a", "checkpoint_b"],
+            depth="l2",
+            cache_dir=cache_dir,
+            checkpoint_dir=checkpoint_dir,
+            refresh=True,
+        )
+
+    provider_a_resume = _CheckpointProvider(
+        "checkpoint_a",
+        "checkpoint_a:L2",
+        fail_on_call=True,
+    )
+    provider_b_resume = _CheckpointProvider("checkpoint_b", "checkpoint_b:L2")
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider_a_resume, provider_b_resume])
+
+    resumed = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["checkpoint_a", "checkpoint_b"],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    baseline_a = _CheckpointProvider("checkpoint_a", "checkpoint_a:L2")
+    baseline_b = _CheckpointProvider("checkpoint_b", "checkpoint_b:L2")
+    monkeypatch.setattr(ci, "build_providers", lambda _: [baseline_a, baseline_b])
+
+    baseline = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["checkpoint_a", "checkpoint_b"],
+        depth="l2",
+        cache_dir=Path(tmp_path) / "baseline-cache",
+        checkpoint_dir=Path(tmp_path) / "baseline-checkpoints",
+        refresh=True,
+    )
+
+    assert resumed.citation_data == baseline.citation_data
+    assert resumed.papers_data == baseline.papers_data
+    assert resumed.metadata["provider_stats"] == baseline.metadata["provider_stats"]

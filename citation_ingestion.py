@@ -12,7 +12,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,7 @@ class CitationProvider:
 
 
 _CACHE_SCHEMA_VERSION = 5
+_CHECKPOINT_SCHEMA_VERSION = 1
 
 # HTTP codes that are safe to retry vs. those that indicate a permanent failure.
 _PERMANENT_FAILURE_HTTP_CODES = frozenset({400, 401, 403, 404})
@@ -371,6 +372,140 @@ def _write_cache(cache_dir: Path, key: str, payload: dict) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / f"{key}.json"
     cache_file.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _checkpoint_file(checkpoint_root: Path, key: str) -> Path:
+    return checkpoint_root / f"{key}.checkpoint.json"
+
+
+def _serialize_edges(edges: Dict[str, Set[str]]) -> Dict[str, List[str]]:
+    return {citing: sorted(cited) for citing, cited in edges.items()}
+
+
+def _deserialize_edges(raw_edges: Any) -> Dict[str, Set[str]]:
+    if not isinstance(raw_edges, dict):
+        return {}
+
+    output: Dict[str, Set[str]] = {}
+    for citing, cited in raw_edges.items():
+        if not isinstance(citing, str):
+            continue
+        if isinstance(cited, list):
+            output[citing] = {str(item) for item in cited if isinstance(item, str)}
+        else:
+            output[citing] = set()
+    return output
+
+
+def _serialize_papers(papers: Dict[str, IngestionPaper]) -> Dict[str, Dict[str, object]]:
+    return {paper_id: _paper_to_output_dict(paper) for paper_id, paper in papers.items()}
+
+
+def _deserialize_papers(raw_papers: Any) -> Dict[str, IngestionPaper]:
+    if not isinstance(raw_papers, dict):
+        return {}
+
+    output: Dict[str, IngestionPaper] = {}
+    for paper_id, payload in raw_papers.items():
+        if not isinstance(paper_id, str) or not isinstance(payload, dict):
+            continue
+
+        year_raw = payload.get("year")
+        year: Optional[int] = None
+        if year_raw is not None:
+            try:
+                year = int(year_raw)
+            except (TypeError, ValueError):
+                year = None
+
+        citations_raw = payload.get("citations")
+        try:
+            citations = int(citations_raw or 0)
+        except (TypeError, ValueError):
+            citations = 0
+
+        source_ids_raw = payload.get("source_ids")
+        source_ids: Dict[str, str] = {}
+        if isinstance(source_ids_raw, dict):
+            source_ids = {
+                str(k): str(v)
+                for k, v in source_ids_raw.items()
+                if isinstance(k, str) and isinstance(v, str)
+            }
+
+        doi_raw = payload.get("doi")
+        doi = str(doi_raw) if isinstance(doi_raw, str) and doi_raw else None
+
+        output[paper_id] = IngestionPaper(
+            paper_id=paper_id,
+            title=str(payload.get("title") or ""),
+            abstract=str(payload.get("abstract") or ""),
+            keywords=str(payload.get("keywords") or ""),
+            citations=citations,
+            year=year,
+            doi=doi,
+            source_ids=source_ids,
+        )
+
+    return output
+
+
+def _load_checkpoint_state(
+    checkpoint_root: Path,
+    key: str,
+    reset_checkpoints: bool,
+) -> Optional[Dict[str, Any]]:
+    checkpoint_path = _checkpoint_file(checkpoint_root, key)
+    if reset_checkpoints and checkpoint_path.exists():
+        try:
+            checkpoint_path.unlink()
+        except OSError:
+            return None
+
+    if not checkpoint_path.exists():
+        return None
+
+    try:
+        payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("checkpoint_schema_version") != _CHECKPOINT_SCHEMA_VERSION:
+        return None
+    if payload.get("request_key") != key:
+        return None
+    return payload
+
+
+def _write_checkpoint_state(
+    checkpoint_root: Path,
+    key: str,
+    completed_providers: Set[str],
+    all_edges: Dict[str, Set[str]],
+    all_papers: Dict[str, IngestionPaper],
+    provider_stats: Dict[str, object],
+    combined_completeness: Dict[str, Dict[str, object]],
+) -> None:
+    checkpoint_path = _checkpoint_file(checkpoint_root, key)
+    payload = {
+        "checkpoint_schema_version": _CHECKPOINT_SCHEMA_VERSION,
+        "request_key": key,
+        "completed_providers": sorted(completed_providers),
+        "all_edges": _serialize_edges(all_edges),
+        "all_papers": _serialize_papers(all_papers),
+        "provider_stats": provider_stats,
+        "combined_completeness": combined_completeness,
+    }
+    _write_json_atomic(checkpoint_path, payload)
 
 
 def _paper_to_output_dict(paper: IngestionPaper) -> Dict[str, object]:
@@ -1468,6 +1603,8 @@ def ingest_from_internet(
     max_l3: Optional[int] = None,
     exhaustive: bool = True,
     verbose: bool = False,
+    checkpoint_dir: Optional[Path] = None,
+    reset_checkpoints: bool = False,
 ) -> IngestionResult:
     """Ingest citation data from internet providers.
 
@@ -1506,12 +1643,43 @@ def ingest_from_internet(
     if cached:
         return cached
 
+    l1_norm, seed_papers = _seed_l1_papers(l1_papers)
     all_edges: Dict[str, Set[str]] = {}
-    l1_norm, all_papers = _seed_l1_papers(l1_papers)
+    all_papers: Dict[str, IngestionPaper] = dict(seed_papers)
     provider_stats: Dict[str, object] = {}
     combined_completeness: Dict[str, Dict[str, object]] = {}
+    completed_providers: Set[str] = set()
+
+    checkpoint_root = checkpoint_dir or (cache_root / "checkpoints")
+    checkpoint_state = _load_checkpoint_state(checkpoint_root, key, reset_checkpoints)
+    if checkpoint_state:
+        all_edges = _deserialize_edges(checkpoint_state.get("all_edges"))
+        all_papers = _deserialize_papers(checkpoint_state.get("all_papers"))
+        _merge_seed_metadata(all_papers, seed_papers)
+
+        raw_provider_stats = checkpoint_state.get("provider_stats")
+        if isinstance(raw_provider_stats, dict):
+            provider_stats = raw_provider_stats
+
+        raw_completeness = checkpoint_state.get("combined_completeness")
+        if isinstance(raw_completeness, dict):
+            combined_completeness = raw_completeness
+
+        raw_completed = checkpoint_state.get("completed_providers")
+        if isinstance(raw_completed, list):
+            completed_providers = {
+                value for value in raw_completed if isinstance(value, str)
+            }
+
+        _vprint(
+            f"[ADIT] Loaded checkpoint: {len(completed_providers)} completed provider(s)"
+        )
 
     for provider in providers:
+        if provider.name in completed_providers:
+            _vprint(f"\n[ADIT] Skipping provider (checkpoint complete): {provider.name}")
+            continue
+
         _vprint(f"\n[ADIT] Querying provider: {provider.name}")
         _merge_seed_metadata(all_papers, provider.fetch_seed_metadata(l1_norm))
 
@@ -1527,6 +1695,16 @@ def ingest_from_internet(
                 "metadata_enriched": len(crossref_papers),
                 "completeness": {},
             }
+            completed_providers.add(provider.name)
+            _write_checkpoint_state(
+                checkpoint_root,
+                key,
+                completed_providers,
+                all_edges,
+                all_papers,
+                provider_stats,
+                combined_completeness,
+            )
             continue
 
         provider_edges, provider_papers, stats = _fetch_provider_graph(
@@ -1544,6 +1722,17 @@ def ingest_from_internet(
         provider_stats[provider.name] = stats
         for l1_id, l1_completeness in stats.get("completeness", {}).items():
             combined_completeness.setdefault(l1_id, {}).update(l1_completeness)
+
+        completed_providers.add(provider.name)
+        _write_checkpoint_state(
+            checkpoint_root,
+            key,
+            completed_providers,
+            all_edges,
+            all_papers,
+            provider_stats,
+            combined_completeness,
+        )
 
     citation_data, papers_data, alias_map = _dedupe_and_materialize(all_edges, all_papers)
 

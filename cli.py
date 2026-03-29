@@ -38,9 +38,20 @@ KEY_CONSTRUCTS_OPTION = typer.Option(
     help="Optional comma-separated key constructs to improve online retrieval relevance.",
 )
 CACHE_DIR_OPTION = typer.Option(None, help="Optional cache directory for online ingestion.")
+CHECKPOINT_DIR_OPTION = typer.Option(
+    None,
+    help=(
+        "Optional checkpoint directory for incremental online-ingestion progress snapshots. "
+        "Defaults to <cache-dir>/checkpoints."
+    ),
+)
 REFRESH_CACHE_OPTION = typer.Option(
     False,
     help="Ignore ingestion cache and force fresh network retrieval in online mode.",
+)
+RESET_CHECKPOINTS_OPTION = typer.Option(
+    False,
+    help="Clear existing checkpoint state for this request before online ingestion starts.",
 )
 MAX_L2_OPTION = typer.Option(
     200,
@@ -167,7 +178,9 @@ def _resolve_cli_inputs(
     depth: str,
     key_constructs: Optional[str],
     cache_dir: Optional[Path],
+    checkpoint_dir: Optional[Path],
     refresh_cache: bool,
+    reset_checkpoints: bool,
     max_l2: int,
     max_l3: Optional[int],
     save_ingested_citation_data: Optional[Path],
@@ -202,7 +215,10 @@ def _resolve_cli_inputs(
         "depth": (depth or cfg.get("depth") or "l2l3").lower(),
         "key_constructs": key_constructs or cfg.get("key_constructs"),
         "cache_dir": cache_dir or (Path(cfg["cache_dir"]) if cfg.get("cache_dir") else None),
+        "checkpoint_dir": checkpoint_dir
+        or (Path(cfg["checkpoint_dir"]) if cfg.get("checkpoint_dir") else None),
         "refresh_cache": bool(refresh_cache or cfg.get("refresh_cache", False)),
+        "reset_checkpoints": bool(reset_checkpoints or cfg.get("reset_checkpoints", False)),
         "max_l2": int(cfg.get("max_l2", max_l2)),
         "max_l3": int(cfg["max_l3"]) if cfg.get("max_l3") is not None else max_l3,
         "save_ingested_citation_data": save_ingested_citation_data
@@ -257,7 +273,9 @@ def _load_pipeline_inputs(params: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[
             sources=selected_sources,
             depth=params["depth"],
             cache_dir=params["cache_dir"],
+            checkpoint_dir=params.get("checkpoint_dir"),
             refresh=params["refresh_cache"],
+            reset_checkpoints=params.get("reset_checkpoints", False),
             max_l2=params["max_l2"],
             max_l3=params["max_l3"],
             exhaustive=params.get("exhaustive", True),
@@ -310,7 +328,9 @@ def run(
     depth: str = DEPTH_OPTION,
     key_constructs: Optional[str] = KEY_CONSTRUCTS_OPTION,
     cache_dir: Optional[Path] = CACHE_DIR_OPTION,
+    checkpoint_dir: Optional[Path] = CHECKPOINT_DIR_OPTION,
     refresh_cache: bool = REFRESH_CACHE_OPTION,
+    reset_checkpoints: bool = RESET_CHECKPOINTS_OPTION,
     max_l2: int = MAX_L2_OPTION,
     max_l3: Optional[int] = MAX_L3_OPTION,
     save_ingested_citation_data: Optional[Path] = SAVE_INGESTED_CITATION_OPTION,
@@ -337,7 +357,9 @@ def run(
         depth,
         key_constructs,
         cache_dir,
+        checkpoint_dir,
         refresh_cache,
+        reset_checkpoints,
         max_l2,
         max_l3,
         save_ingested_citation_data,
