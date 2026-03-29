@@ -674,6 +674,33 @@ def test_ingest_l3_budget_caps_reference_edges(monkeypatch, tmp_path):
     assert len(l3_cited) == 2
 
 
+def test_ingest_l3_zero_budget_adds_no_l3_edges(monkeypatch, tmp_path):
+    """max_l3=0 with depth=l2l3 should preserve only L2 edges."""
+    provider = _L3BudgetProvider()
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    result = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["l3budget"],
+        depth="l2l3",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        exhaustive=True,
+        max_l3=0,
+    )
+
+    assert provider.max_l3_calls == [0]
+    assert result.metadata["provider_stats"]["l3budget"]["l3_edges"] == 0
+    l3_cited = {
+        cited_id
+        for cited_set in result.citation_data.values()
+        for cited_id in cited_set
+        if cited_id.startswith("l3budget:R")
+    }
+    assert len(l3_cited) == 0
+
+
 # ---------------------------------------------------------------------------
 # _safe_get: retry on transient errors, stop on permanent errors
 # ---------------------------------------------------------------------------
@@ -1089,6 +1116,270 @@ def test_openalex_l3_requests_minimal_edges_then_identity_hydration(monkeypatch)
     assert papers["openalex:W200"].title == "Hydrated L3"
     assert papers["openalex:W200"].year == 2018
     assert papers["openalex:W200"].source_ids == {"openalex": "https://openalex.org/W200"}
+
+
+def test_openalex_l3_default_budget_fetches_all_available_refs(monkeypatch):
+    provider = ci.OpenAlexProvider()
+
+    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES):
+        if url.endswith("W100?select=referenced_works"):
+            return {
+                "referenced_works": [
+                    "https://openalex.org/W201",
+                    "https://openalex.org/W202",
+                    "https://openalex.org/W203",
+                ]
+            }
+        if url.endswith("W201?select=id,doi,title,publication_year"):
+            return {
+                "id": "https://openalex.org/W201",
+                "doi": "https://doi.org/10.1000/oa201",
+                "title": "OA Ref 201",
+                "publication_year": 2016,
+            }
+        if url.endswith("W202?select=id,doi,title,publication_year"):
+            return {
+                "id": "https://openalex.org/W202",
+                "doi": "https://doi.org/10.1000/oa202",
+                "title": "OA Ref 202",
+                "publication_year": 2017,
+            }
+        if url.endswith("W203?select=id,doi,title,publication_year"):
+            return {
+                "id": "https://openalex.org/W203",
+                "doi": "https://doi.org/10.1000/oa203",
+                "title": "OA Ref 203",
+                "publication_year": 2018,
+            }
+        return None
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    edges, papers = provider.fetch_l3_references(["openalex:W100"])
+
+    assert edges["openalex:W100"] == {
+        "openalex:W201",
+        "openalex:W202",
+        "openalex:W203",
+    }
+    assert len(papers) == 3
+
+
+def test_openalex_l3_budget_caps_reference_edges(monkeypatch):
+    provider = ci.OpenAlexProvider()
+    hydrated_ids = []
+
+    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES):
+        if url.endswith("W100?select=referenced_works"):
+            return {
+                "referenced_works": [
+                    "https://openalex.org/W201",
+                    "https://openalex.org/W202",
+                    "https://openalex.org/W203",
+                ]
+            }
+        if "?select=id,doi,title,publication_year" in url:
+            token = url.split("/works/")[-1].split("?")[0]
+            hydrated_ids.append(token)
+            return {
+                "id": f"https://openalex.org/{token}",
+                "doi": f"https://doi.org/10.1000/{token.lower()}",
+                "title": f"Hydrated {token}",
+                "publication_year": 2019,
+            }
+        return None
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    edges, papers = provider.fetch_l3_references(["openalex:W100"], max_l3=2)
+
+    assert len(edges["openalex:W100"]) == 2
+    assert len(papers) == 2
+    assert sorted(hydrated_ids) == ["W201", "W202"]
+
+
+def test_core_l3_default_budget_fetches_all_available_refs(monkeypatch):
+    provider = ci.CoreProvider()
+
+    def fake_lookup_work(pid):
+        assert pid == "doi:10.1000/l2"
+        return {
+            "references": [
+                {"id": 1, "doi": "10.1000/core-r1", "title": "Core Ref 1"},
+                {"id": 2, "doi": "10.1000/core-r2", "title": "Core Ref 2"},
+                {"id": 3, "doi": "10.1000/core-r3", "title": "Core Ref 3"},
+            ]
+        }
+
+    monkeypatch.setattr(provider, "_lookup_work", fake_lookup_work)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    edges, papers = provider.fetch_l3_references(["doi:10.1000/l2"])
+
+    assert edges["doi:10.1000/l2"] == {
+        "doi:10.1000/core-r1",
+        "doi:10.1000/core-r2",
+        "doi:10.1000/core-r3",
+    }
+    assert len(papers) == 3
+
+
+def test_core_l3_budget_caps_reference_edges(monkeypatch):
+    provider = ci.CoreProvider()
+
+    def fake_lookup_work(pid):
+        assert pid == "doi:10.1000/l2"
+        return {
+            "references": [
+                {"id": 1, "doi": "10.1000/core-r1", "title": "Core Ref 1"},
+                {"id": 2, "doi": "10.1000/core-r2", "title": "Core Ref 2"},
+                {"id": 3, "doi": "10.1000/core-r3", "title": "Core Ref 3"},
+            ]
+        }
+
+    monkeypatch.setattr(provider, "_lookup_work", fake_lookup_work)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    edges, papers = provider.fetch_l3_references(["doi:10.1000/l2"], max_l3=2)
+
+    assert len(edges["doi:10.1000/l2"]) == 2
+    assert len(papers) == 2
+
+
+def test_crossref_l3_contract_returns_empty_graph():
+    provider = ci.CrossrefProvider()
+    edges, papers = provider.fetch_l3_references(["doi:10.1000/l2"], max_l3=10)
+    assert edges == {}
+    assert papers == {}
+
+
+class _MultiProviderA(ci.CitationProvider):
+    name = "multi_a"
+    capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=True)
+
+    def fetch_seed_metadata(self, l1_papers):
+        return {
+            l1: ci.IngestionPaper(
+                paper_id=l1,
+                title="Seed A",
+                source_ids={"multi_a": "SEED-A"},
+            )
+            for l1 in l1_papers
+        }
+
+    def fetch_citers_for_l1(self, l1_provider_id, max_results=None):
+        papers = {
+            "multi_a:L2A": ci.IngestionPaper(
+                paper_id="multi_a:L2A", title="L2 A", year=2020, citations=5
+            )
+        }
+        return papers, 1, "complete"
+
+    def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
+        return {}, {}
+
+    def fetch_l3_references(self, l2_paper_ids, max_l3=None):
+        candidates = ["multi_a:R1", "multi_a:R2", "multi_a:R3"]
+        budget = len(candidates) if max_l3 is None else max(0, max_l3)
+        edges = {"multi_a:L2A": set(candidates[:budget])}
+        papers = {
+            rid: ci.IngestionPaper(paper_id=rid, title=rid, year=2018, citations=1)
+            for rid in candidates[:budget]
+        }
+        return edges, papers
+
+
+class _MultiProviderB(ci.CitationProvider):
+    name = "multi_b"
+    capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=True)
+
+    def fetch_seed_metadata(self, l1_papers):
+        return {
+            l1: ci.IngestionPaper(
+                paper_id=l1,
+                title="Seed B",
+                source_ids={"multi_b": "SEED-B"},
+            )
+            for l1 in l1_papers
+        }
+
+    def fetch_citers_for_l1(self, l1_provider_id, max_results=None):
+        papers = {
+            "multi_b:L2B": ci.IngestionPaper(
+                paper_id="multi_b:L2B", title="L2 B", year=2021, citations=4
+            )
+        }
+        return papers, 1, "complete"
+
+    def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
+        return {}, {}
+
+    def fetch_l3_references(self, l2_paper_ids, max_l3=None):
+        candidates = ["multi_b:R1", "multi_b:R2", "multi_b:R3"]
+        budget = len(candidates) if max_l3 is None else max(0, max_l3)
+        edges = {"multi_b:L2B": set(candidates[:budget])}
+        papers = {
+            rid: ci.IngestionPaper(paper_id=rid, title=rid, year=2019, citations=1)
+            for rid in candidates[:budget]
+        }
+        return edges, papers
+
+
+def test_ingest_l3_multi_provider_uncapped_aggregates_union(monkeypatch, tmp_path):
+    providers = [_MultiProviderA(), _MultiProviderB()]
+    monkeypatch.setattr(ci, "build_providers", lambda _: providers)
+
+    result = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["multi_a", "multi_b"],
+        depth="l2l3",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        exhaustive=True,
+        max_l3=None,
+    )
+
+    assert result.metadata["provider_stats"]["multi_a"]["l3_edges"] == 3
+    assert result.metadata["provider_stats"]["multi_b"]["l3_edges"] == 3
+
+    l3_ids = {
+        cited_id
+        for cited_set in result.citation_data.values()
+        for cited_id in cited_set
+        if cited_id.startswith("multi_a:R") or cited_id.startswith("multi_b:R")
+    }
+    assert len(l3_ids) == 6
+
+
+def test_ingest_l3_multi_provider_capped_is_deterministic(monkeypatch, tmp_path):
+    providers = [_MultiProviderA(), _MultiProviderB()]
+    monkeypatch.setattr(ci, "build_providers", lambda _: providers)
+
+    result = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["multi_a", "multi_b"],
+        depth="l2l3",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        exhaustive=True,
+        max_l3=2,
+    )
+
+    # max_l3 is currently applied per provider in the orchestrator flow.
+    assert result.metadata["provider_stats"]["multi_a"]["l3_edges"] == 2
+    assert result.metadata["provider_stats"]["multi_b"]["l3_edges"] == 2
+
+    l3_ids = {
+        cited_id
+        for cited_set in result.citation_data.values()
+        for cited_id in cited_set
+        if cited_id.startswith("multi_a:R") or cited_id.startswith("multi_b:R")
+    }
+    assert len(l3_ids) == 4
 
 
 def test_dedupe_and_materialize_merges_l3_nodes_by_doi_and_preserves_sources():
