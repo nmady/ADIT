@@ -123,6 +123,7 @@ If `labels_data` is omitted, the CLI extracts features and skips training/predic
 - Checkpoint semantics (Phase 1): completion is persisted after each provider completes; resumed runs skip completed providers and continue remaining providers.
 - Phase 2 adds L2 mid-pagination resume for OpenAlex (cursor) and Semantic Scholar (offset), so interrupted cited-by traversal can continue from saved per-seed progress.
 - L3 iteration resume is still out of scope; interruptions during L3 expansion rerun that provider segment.
+- Per-seed pagination progress includes a staleness guard (6-hour window by default); stale progress is ignored and the seed is safely refetched.
 - `--only-ingest` runs ingestion and exits before feature extraction/training.
 - `--save-ingested-citation-data` and `--save-ingested-papers-data` let you persist normalized outputs for offline replay.
 - Tests do not rely on live provider calls; the internet ingestion path is covered with mocked fixtures.
@@ -291,6 +292,7 @@ Ingestion metadata also includes `checkpoint_stats`:
 - `cache_short_circuit` indicates the run returned from full-result cache before provider execution.
 - `providers_skipped` and `skipped_provider_names` report providers skipped because checkpoint state already marked them complete.
 - `providers_executed` and `executed_provider_names` report providers actually executed in this run.
+- `stale_state_ignored_count` and `stale_state_ignored_seeds` report stale per-seed pagination checkpoints that were discarded before execution.
 
 ## Config reference
 

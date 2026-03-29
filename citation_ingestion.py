@@ -101,6 +101,7 @@ _SAFE_GET_INITIAL_DELAY = 1.0
 _SAFE_GET_MAX_DELAY = 60.0
 _SAFE_GET_BACKOFF_FACTOR = 2.0
 _SAFE_GET_RETRY_AFTER_MAX_SECONDS = 300  # cap on server-specified Retry-After waits
+_PAGINATION_STATE_MAX_AGE_SECONDS = 6 * 60 * 60
 
 # ---------------------------------------------------------------------------
 # Verbose terminal output
@@ -386,6 +387,27 @@ def _write_json_atomic(path: Path, payload: dict) -> None:
 
 def _checkpoint_file(checkpoint_root: Path, key: str) -> Path:
     return checkpoint_root / f"{key}.checkpoint.json"
+
+
+def _is_pagination_state_stale(
+    seed_state: Dict[str, Any],
+    now_ts: Optional[float] = None,
+    max_age_seconds: int = _PAGINATION_STATE_MAX_AGE_SECONDS,
+) -> bool:
+    if not isinstance(seed_state, dict):
+        return True
+
+    updated_at = seed_state.get("updated_at")
+    if updated_at is None:
+        return False
+
+    try:
+        updated_ts = float(updated_at)
+    except (TypeError, ValueError):
+        return True
+
+    current = time.time() if now_ts is None else float(now_ts)
+    return (current - updated_ts) > max_age_seconds
 
 
 def _serialize_edges(edges: Dict[str, Set[str]]) -> Dict[str, List[str]]:
@@ -1182,6 +1204,7 @@ class OpenAlexProvider(CitationProvider):
                             "expected_count": expected_count,
                             "fetched_count": len(papers),
                             "papers": _serialize_papers(papers),
+                            "updated_at": time.time(),
                         }
                     )
                 return papers, expected_count or 0, status
@@ -1209,6 +1232,7 @@ class OpenAlexProvider(CitationProvider):
                         "expected_count": expected_count,
                         "fetched_count": len(papers),
                         "papers": _serialize_papers(papers),
+                        "updated_at": time.time(),
                     }
                 )
             cursor = next_cursor
@@ -1224,6 +1248,7 @@ class OpenAlexProvider(CitationProvider):
                     "expected_count": expected_count or fetched,
                     "fetched_count": fetched,
                     "papers": _serialize_papers(papers),
+                    "updated_at": time.time(),
                 }
             )
         return papers, expected_count or fetched, status
@@ -1365,6 +1390,7 @@ class SemanticScholarProvider(CitationProvider):
                             "expected_count": expected_count,
                             "fetched_count": len(papers),
                             "papers": _serialize_papers(papers),
+                            "updated_at": time.time(),
                         }
                     )
                 return papers, expected_count or 0, status
@@ -1393,6 +1419,7 @@ class SemanticScholarProvider(CitationProvider):
                         "expected_count": expected_count,
                         "fetched_count": len(papers),
                         "papers": _serialize_papers(papers),
+                        "updated_at": time.time(),
                     }
                 )
             time.sleep(0.05)
@@ -1407,6 +1434,7 @@ class SemanticScholarProvider(CitationProvider):
                     "expected_count": expected_count or fetched,
                     "fetched_count": fetched,
                     "papers": _serialize_papers(papers),
+                    "updated_at": time.time(),
                 }
             )
         return papers, expected_count or fetched, status
@@ -1817,6 +1845,8 @@ def ingest_from_internet(
         "skipped_provider_names": [],
         "providers_executed": 0,
         "executed_provider_names": [],
+        "stale_state_ignored_count": 0,
+        "stale_state_ignored_seeds": [],
     }
 
     cached = _load_cached_result(cache_root, key, refresh)
@@ -1835,6 +1865,8 @@ def ingest_from_internet(
                 "skipped_provider_names": [],
                 "providers_executed": 0,
                 "executed_provider_names": [],
+                "stale_state_ignored_count": 0,
+                "stale_state_ignored_seeds": [],
             }
         )
         metadata["checkpoint_stats"] = merged_stats
@@ -1923,6 +1955,23 @@ def ingest_from_internet(
             continue
 
         provider_state = provider_pagination_state.setdefault(provider.name, {})
+        stale_removed = False
+        for seed_id, seed_state in list(provider_state.items()):
+            if _is_pagination_state_stale(seed_state):
+                provider_state.pop(seed_id, None)
+                stale_removed = True
+                stale_seeds = checkpoint_stats.get("stale_state_ignored_seeds")
+                if isinstance(stale_seeds, list):
+                    stale_seeds.append(f"{provider.name}:{seed_id}")
+                checkpoint_stats["stale_state_ignored_count"] = (
+                    int(checkpoint_stats.get("stale_state_ignored_count", 0)) + 1
+                )
+                _vprint(
+                    f"  [{provider.name}] Ignoring stale pagination checkpoint for seed: {seed_id}"
+                )
+
+        if stale_removed:
+            _persist_checkpoint_snapshot()
 
         def _seed_progress(seed_id: str, state: Dict[str, Any]) -> None:
             provider_state[seed_id] = dict(state)

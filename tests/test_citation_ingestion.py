@@ -1,5 +1,6 @@
 import io
 import logging
+import time
 import urllib.error
 import urllib.parse
 from pathlib import Path
@@ -162,7 +163,7 @@ def test_crossref_l2_discovery_is_disabled(monkeypatch):
 
     edges, papers = provider.fetch_l2_and_metadata(
         l1_papers=["doi:10.1000/l1"],
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         key_constructs=["usefulness"],
         max_l2=50,
     )
@@ -196,7 +197,7 @@ def test_ingest_from_internet_dedupes_and_uses_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(ci, "build_providers", fake_build_providers)
 
     result1 = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["fake"],
         depth="l2l3",
@@ -222,7 +223,7 @@ def test_ingest_from_internet_dedupes_and_uses_cache(monkeypatch, tmp_path):
 
     # Second run should come from cache and avoid calling provider again.
     result2 = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["fake"],
         depth="l2l3",
@@ -246,7 +247,7 @@ def test_ingest_from_internet_hydrates_l1_metadata_from_seed_lookup(monkeypatch,
     monkeypatch.setattr(ci, "build_providers", fake_build_providers)
 
     result = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["fake"],
         depth="l2",
@@ -273,7 +274,7 @@ def test_ingest_from_internet_metadata_includes_fetch_stats(monkeypatch, tmp_pat
     monkeypatch.setattr(ci, "build_providers", fake_build_providers)
 
     result = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["fake"],
         depth="l2",
@@ -320,7 +321,7 @@ def test_crossref_enriches_existing_l2_metadata_without_adding_l2_edges(monkeypa
     monkeypatch.setattr(ci.CrossrefProvider, "fetch_seed_metadata", fake_crossref_seed_metadata)
 
     result = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["fake", "crossref"],
         depth="l2",
@@ -402,7 +403,7 @@ def test_ingest_exhaustive_fetches_all_pages(monkeypatch, tmp_path):
     monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
 
     result = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["paged"],
         depth="l2",
@@ -426,7 +427,7 @@ def test_ingest_sample_mode_caps_results(monkeypatch, tmp_path):
     monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
 
     result = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["paged"],
         depth="l2",
@@ -446,7 +447,7 @@ def test_ingest_completeness_in_metadata(monkeypatch, tmp_path):
     monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
 
     result = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["paged"],
         depth="l2",
@@ -473,7 +474,7 @@ def test_ingest_sample_mode_marks_completeness_partial(monkeypatch, tmp_path):
     monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
 
     result = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["paged"],
         depth="l2",
@@ -537,7 +538,7 @@ def test_ingest_completeness_partial_when_provider_stops_early(monkeypatch, tmp_
     monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
 
     result = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["earlystop"],
         depth="l2",
@@ -628,7 +629,7 @@ def test_ingest_l3_without_budget_fetches_all_available_refs(monkeypatch, tmp_pa
     monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
 
     result = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["l3budget"],
         depth="l2l3",
@@ -654,7 +655,7 @@ def test_ingest_l3_budget_caps_reference_edges(monkeypatch, tmp_path):
     monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
 
     result = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["l3budget"],
         depth="l2l3",
@@ -681,7 +682,7 @@ def test_ingest_l3_zero_budget_adds_no_l3_edges(monkeypatch, tmp_path):
     monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
 
     result = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["l3budget"],
         depth="l2l3",
@@ -1341,7 +1342,7 @@ def test_ingest_l3_multi_provider_uncapped_aggregates_union(monkeypatch, tmp_pat
     monkeypatch.setattr(ci, "build_providers", lambda _: providers)
 
     result = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["multi_a", "multi_b"],
         depth="l2l3",
@@ -1368,7 +1369,7 @@ def test_ingest_l3_multi_provider_capped_is_deterministic(monkeypatch, tmp_path)
     monkeypatch.setattr(ci, "build_providers", lambda _: providers)
 
     result = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["multi_a", "multi_b"],
         depth="l2l3",
@@ -1720,7 +1721,7 @@ def test_checkpoint_resume_skips_completed_provider(monkeypatch, tmp_path):
     monkeypatch.setattr(ci, "build_providers", lambda _: [provider_run1])
 
     result1 = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["checkpoint_a"],
         depth="l2",
@@ -1742,7 +1743,7 @@ def test_checkpoint_resume_skips_completed_provider(monkeypatch, tmp_path):
     monkeypatch.setattr(ci, "build_providers", lambda _: [provider_run2])
 
     result2 = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["checkpoint_a"],
         depth="l2",
@@ -1762,7 +1763,7 @@ def test_checkpoint_reset_forces_refetch(monkeypatch, tmp_path):
     monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
 
     ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["checkpoint_reset"],
         depth="l2",
@@ -1773,7 +1774,7 @@ def test_checkpoint_reset_forces_refetch(monkeypatch, tmp_path):
     assert provider.l2_calls == 1
 
     ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["checkpoint_reset"],
         depth="l2",
@@ -1792,7 +1793,7 @@ def test_checkpoint_corruption_is_ignored(monkeypatch, tmp_path):
     monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
 
     request_payload = ci._request_payload(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         key_constructs=None,
         sources=["checkpoint_corrupt"],
@@ -1807,7 +1808,7 @@ def test_checkpoint_corruption_is_ignored(monkeypatch, tmp_path):
     checkpoint_path.write_text("not valid json", encoding="utf-8")
 
     result = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["checkpoint_corrupt"],
         depth="l2",
@@ -1830,7 +1831,7 @@ def test_checkpoint_crash_resume_matches_uninterrupted_baseline(monkeypatch, tmp
 
     with pytest.raises(RuntimeError, match="simulated crash"):
         ci.ingest_from_internet(
-            theory_name="Technology Acceptance Model",
+            theory_name="My Fake Theory",
             l1_papers=["10.1000/xyz1"],
             sources=["checkpoint_a", "checkpoint_b"],
             depth="l2",
@@ -1848,7 +1849,7 @@ def test_checkpoint_crash_resume_matches_uninterrupted_baseline(monkeypatch, tmp
     monkeypatch.setattr(ci, "build_providers", lambda _: [provider_a_resume, provider_b_resume])
 
     resumed = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["checkpoint_a", "checkpoint_b"],
         depth="l2",
@@ -1862,7 +1863,7 @@ def test_checkpoint_crash_resume_matches_uninterrupted_baseline(monkeypatch, tmp
     monkeypatch.setattr(ci, "build_providers", lambda _: [baseline_a, baseline_b])
 
     baseline = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["checkpoint_a", "checkpoint_b"],
         depth="l2",
@@ -1884,7 +1885,7 @@ def test_checkpoint_stats_report_hit_miss_and_provider_skip(monkeypatch, tmp_pat
     monkeypatch.setattr(ci, "build_providers", lambda _: [provider_run1])
 
     first = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["checkpoint_stats"],
         depth="l2",
@@ -1908,7 +1909,7 @@ def test_checkpoint_stats_report_hit_miss_and_provider_skip(monkeypatch, tmp_pat
     monkeypatch.setattr(ci, "build_providers", lambda _: [provider_run2])
 
     second = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["checkpoint_stats"],
         depth="l2",
@@ -1932,7 +1933,7 @@ def test_checkpoint_stats_marks_cache_short_circuit(monkeypatch, tmp_path):
     monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
 
     ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["checkpoint_cache"],
         depth="l2",
@@ -1942,7 +1943,7 @@ def test_checkpoint_stats_marks_cache_short_circuit(monkeypatch, tmp_path):
     )
 
     cached = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["10.1000/xyz1"],
         sources=["checkpoint_cache"],
         depth="l2",
@@ -2020,7 +2021,7 @@ def test_openalex_mid_pagination_resume_from_checkpoint(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="openalex simulated page crash"):
         ci.ingest_from_internet(
-            theory_name="Technology Acceptance Model",
+            theory_name="My Fake Theory",
             l1_papers=["openalex:WSEED"],
             sources=["openalex"],
             depth="l2",
@@ -2030,7 +2031,7 @@ def test_openalex_mid_pagination_resume_from_checkpoint(monkeypatch, tmp_path):
         )
 
     request_payload = ci._request_payload(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["openalex:WSEED"],
         key_constructs=None,
         sources=["openalex"],
@@ -2046,7 +2047,7 @@ def test_openalex_mid_pagination_resume_from_checkpoint(monkeypatch, tmp_path):
 
     crash_on_second_page["enabled"] = False
     resumed = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["openalex:WSEED"],
         sources=["openalex"],
         depth="l2",
@@ -2056,7 +2057,7 @@ def test_openalex_mid_pagination_resume_from_checkpoint(monkeypatch, tmp_path):
     )
 
     baseline = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["openalex:WSEED"],
         sources=["openalex"],
         depth="l2",
@@ -2137,7 +2138,7 @@ def test_semantic_mid_pagination_resume_from_checkpoint(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="semantic simulated page crash"):
         ci.ingest_from_internet(
-            theory_name="Technology Acceptance Model",
+            theory_name="My Fake Theory",
             l1_papers=["semantic_scholar:seed1"],
             sources=["semantic_scholar"],
             depth="l2",
@@ -2147,7 +2148,7 @@ def test_semantic_mid_pagination_resume_from_checkpoint(monkeypatch, tmp_path):
         )
 
     request_payload = ci._request_payload(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["semantic_scholar:seed1"],
         key_constructs=None,
         sources=["semantic_scholar"],
@@ -2166,7 +2167,7 @@ def test_semantic_mid_pagination_resume_from_checkpoint(monkeypatch, tmp_path):
 
     crash_on_second_page["enabled"] = False
     resumed = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["semantic_scholar:seed1"],
         sources=["semantic_scholar"],
         depth="l2",
@@ -2176,7 +2177,7 @@ def test_semantic_mid_pagination_resume_from_checkpoint(monkeypatch, tmp_path):
     )
 
     baseline = ci.ingest_from_internet(
-        theory_name="Technology Acceptance Model",
+        theory_name="My Fake Theory",
         l1_papers=["semantic_scholar:seed1"],
         sources=["semantic_scholar"],
         depth="l2",
@@ -2188,3 +2189,155 @@ def test_semantic_mid_pagination_resume_from_checkpoint(monkeypatch, tmp_path):
     assert resumed.citation_data == baseline.citation_data
     assert resumed.papers_data == baseline.papers_data
     assert resumed.metadata["checkpoint_stats"]["hit"] is True
+
+
+class _ResumeCaptureProvider(ci.CitationProvider):
+    name = "resume_capture"
+    capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=True)
+
+    def __init__(self):
+        self.seen_resume_states = []
+
+    def fetch_seed_metadata(self, l1_papers):
+        return {
+            l1: ci.IngestionPaper(
+                paper_id=l1,
+                title="Seed",
+                source_ids={self.name: "SEED-1"},
+            )
+            for l1 in l1_papers
+        }
+
+    def fetch_citers_for_l1(
+        self,
+        l1_provider_id,
+        max_results=None,
+        resume_state=None,
+        progress_callback=None,
+    ):
+        self.seen_resume_states.append(resume_state)
+        return (
+            {
+                "resume_capture:C1": ci.IngestionPaper(
+                    paper_id="resume_capture:C1",
+                    title="Citer",
+                    year=2022,
+                    citations=1,
+                )
+            },
+            1,
+            "complete",
+        )
+
+    def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
+        return {}, {}
+
+    def fetch_l3_references(self, l2_paper_ids, max_l3=None):
+        return {}, {}
+
+
+def test_stale_pagination_state_is_ignored(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+    provider = _ResumeCaptureProvider()
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    request_payload = ci._request_payload(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        key_constructs=None,
+        sources=["resume_capture"],
+        depth="l2",
+        max_l2=200,
+        max_l3=None,
+        exhaustive=True,
+    )
+    key = ci._cache_key(request_payload)
+    stale_ts = time.time() - ci._PAGINATION_STATE_MAX_AGE_SECONDS - 10
+    ci._write_checkpoint_state(
+        checkpoint_root=checkpoint_dir,
+        key=key,
+        completed_providers=set(),
+        all_edges={},
+        all_papers={"doi:10.1000/xyz1": ci.IngestionPaper(paper_id="doi:10.1000/xyz1")},
+        provider_stats={},
+        combined_completeness={},
+        provider_pagination_state={
+            "resume_capture": {
+                "doi:10.1000/xyz1": {
+                    "status": "in_progress",
+                    "offset": 42,
+                    "updated_at": stale_ts,
+                    "papers": {},
+                }
+            }
+        },
+    )
+
+    result = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["resume_capture"],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    assert provider.seen_resume_states == [None]
+    stats = result.metadata["checkpoint_stats"]
+    assert stats["stale_state_ignored_count"] == 1
+    assert stats["stale_state_ignored_seeds"] == ["resume_capture:doi:10.1000/xyz1"]
+
+
+def test_fresh_pagination_state_is_reused(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+    provider = _ResumeCaptureProvider()
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    request_payload = ci._request_payload(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        key_constructs=None,
+        sources=["resume_capture"],
+        depth="l2",
+        max_l2=200,
+        max_l3=None,
+        exhaustive=True,
+    )
+    key = ci._cache_key(request_payload)
+    fresh_ts = time.time()
+    ci._write_checkpoint_state(
+        checkpoint_root=checkpoint_dir,
+        key=key,
+        completed_providers=set(),
+        all_edges={},
+        all_papers={"doi:10.1000/xyz1": ci.IngestionPaper(paper_id="doi:10.1000/xyz1")},
+        provider_stats={},
+        combined_completeness={},
+        provider_pagination_state={
+            "resume_capture": {
+                "doi:10.1000/xyz1": {
+                    "status": "in_progress",
+                    "offset": 7,
+                    "updated_at": fresh_ts,
+                    "papers": {},
+                }
+            }
+        },
+    )
+
+    result = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["resume_capture"],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    assert provider.seen_resume_states and provider.seen_resume_states[0] is not None
+    assert provider.seen_resume_states[0]["offset"] == 7
+    assert result.metadata["checkpoint_stats"]["stale_state_ignored_count"] == 0
