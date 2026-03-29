@@ -418,6 +418,12 @@ def _core_auth_headers(api_key: Optional[str]) -> Dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"}
 
 
+def _semantic_scholar_auth_headers(api_key: Optional[str]) -> Dict[str, str]:
+    if not api_key:
+        return {}
+    return {"Authorization": f"Bearer {api_key}"}
+
+
 def _doi_from_identifier(identifier: str) -> Optional[str]:
     if not identifier:
         return None
@@ -1012,6 +1018,12 @@ class SemanticScholarProvider(CitationProvider):
     name = "semantic_scholar"
     capabilities = ProviderCapabilities(True, True, True, supports_cited_by_traversal=True)
 
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key
+
+    def _headers(self) -> Dict[str, str]:
+        return _semantic_scholar_auth_headers(self.api_key)
+
     def fetch_seed_metadata(
         self,
         l1_papers: Sequence[str],
@@ -1026,6 +1038,7 @@ class SemanticScholarProvider(CitationProvider):
                     "https://api.semanticscholar.org/graph/v1/paper/DOI:"
                     f"{encoded}?fields=paperId,title,abstract,year,citationCount,externalIds",
                     provider=self.name,
+                    headers=self._headers(),
                 )
             elif paper_id.startswith("semantic_scholar:"):
                 token = paper_id.split(":", 1)[1]
@@ -1033,6 +1046,7 @@ class SemanticScholarProvider(CitationProvider):
                     "https://api.semanticscholar.org/graph/v1/paper/"
                     f"{token}?fields=paperId,title,abstract,year,citationCount,externalIds",
                     provider=self.name,
+                    headers=self._headers(),
                 )
 
             if not payload:
@@ -1065,7 +1079,7 @@ class SemanticScholarProvider(CitationProvider):
                 f"?fields=paperId,title,year,citationCount,externalIds,abstract"
                 f"&limit={batch_limit}&offset={offset}"
             )
-            payload = _safe_get(url, provider=self.name)
+            payload = _safe_get(url, provider=self.name, headers=self._headers())
             if not payload:
                 status = "failed" if not papers else "partial"
                 return papers, expected_count or 0, status
@@ -1107,7 +1121,7 @@ class SemanticScholarProvider(CitationProvider):
             "https://api.semanticscholar.org/graph/v1/paper/search"
             f"?query={query}&limit={limit}&fields=paperId,title,year,citationCount,references.paperId,references.externalIds"
         )
-        payload = _safe_get(url, provider=self.name)
+        payload = _safe_get(url, provider=self.name, headers=self._headers())
         if not payload:
             return edges, papers
 
@@ -1150,7 +1164,7 @@ class SemanticScholarProvider(CitationProvider):
                 "https://api.semanticscholar.org/graph/v1/paper/"
                 f"{token}?fields=references.paperId,references.externalIds"
             )
-            payload = _safe_get(url, provider=self.name)
+            payload = _safe_get(url, provider=self.name, headers=self._headers())
             if not payload:
                 continue
 
@@ -1397,6 +1411,8 @@ def build_providers(sources: Sequence[str]) -> List[CitationProvider]:
             continue
         if key == "core":
             providers.append(provider_cls(api_key=os.getenv("CORE_API_KEY")))
+        elif key == "semantic_scholar":
+            providers.append(provider_cls(api_key=os.getenv("SEMANTIC_SCHOLAR_API_KEY")))
         else:
             providers.append(provider_cls())
     return providers

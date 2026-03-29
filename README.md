@@ -108,6 +108,7 @@ If `labels_data` is omitted, the CLI extracts features and skips training/predic
 - Online mode is opt-in via `--online`; without it, the CLI still expects local `citation_data` and `papers_data` JSON files.
 - Supported v1 providers are `openalex`, `semantic_scholar`, `crossref`, and `core`.
 - Default online sources are `openalex,semantic_scholar,crossref,core` when `--sources` is not provided.
+- Semantic Scholar runs without authentication by default, but setting `SEMANTIC_SCHOLAR_API_KEY` can improve rate limits and live-ingestion reliability.
 - CORE runs unauthenticated by default, but using `CORE_API_KEY` increases rate limits and improves access.
 - Results from multiple providers are normalized and deduplicated before building the citation ecosystem.
 - `--depth l2` retrieves direct citers of the L1 papers; `--depth l2l3` also retrieves references from L2 papers to populate L3.

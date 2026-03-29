@@ -111,6 +111,32 @@ def test_core_auth_headers_uses_bearer_key():
     assert ci._core_auth_headers("abc123") == {"Authorization": "Bearer abc123"}
 
 
+def test_semantic_scholar_auth_headers_is_empty_without_key():
+    assert ci._semantic_scholar_auth_headers(None) == {}
+
+
+def test_semantic_scholar_auth_headers_uses_bearer_key():
+    assert ci._semantic_scholar_auth_headers("abc123") == {"Authorization": "Bearer abc123"}
+
+
+def test_build_providers_semantic_scholar_reads_env_key(monkeypatch):
+    monkeypatch.setenv("SEMANTIC_SCHOLAR_API_KEY", "secret-key")
+    providers = ci.build_providers(["semantic_scholar"])
+
+    assert len(providers) == 1
+    assert providers[0].name == "semantic_scholar"
+    assert getattr(providers[0], "api_key", None) == "secret-key"
+
+
+def test_build_providers_semantic_scholar_without_env_key(monkeypatch):
+    monkeypatch.delenv("SEMANTIC_SCHOLAR_API_KEY", raising=False)
+    providers = ci.build_providers(["semantic_scholar"])
+
+    assert len(providers) == 1
+    assert providers[0].name == "semantic_scholar"
+    assert getattr(providers[0], "api_key", "missing") is None
+
+
 def test_should_keep_openalex_item_requires_linked_l1():
     assert ci._should_keep_openalex_item({}, ["doi:10.1000/l1"], "Theory") is True
     assert ci._should_keep_openalex_item({"title": "Theory in title"}, [], "Theory") is False
@@ -745,7 +771,13 @@ def test_semantic_citers_caps_limit_before_api_boundary(monkeypatch):
     provider = ci.SemanticScholarProvider()
     request_pairs = []
 
-    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES):
+    def fake_safe_get(
+        url,
+        timeout=20,
+        provider=None,
+        max_retries=ci._SAFE_GET_MAX_RETRIES,
+        headers=None,
+    ):
         parsed = urllib.parse.urlparse(url)
         params = urllib.parse.parse_qs(parsed.query)
         offset = int(params["offset"][0])
@@ -787,13 +819,136 @@ def test_semantic_citers_caps_limit_before_api_boundary(monkeypatch):
     assert status == "partial"
 
 
+def test_semantic_seed_metadata_passes_auth_headers_when_configured(monkeypatch):
+    provider = ci.SemanticScholarProvider(api_key="secret-key")
+    captured_headers = []
+
+    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES, headers=None):
+        captured_headers.append(headers)
+        return {
+            "paperId": "abc123",
+            "title": "Seed Paper",
+            "abstract": "A seeded abstract.",
+            "year": 2020,
+            "citationCount": 10,
+            "externalIds": {"DOI": "10.1000/xyz1"},
+        }
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    papers = provider.fetch_seed_metadata(["doi:10.1000/xyz1"])
+
+    assert papers["doi:10.1000/xyz1"].title == "Seed Paper"
+    assert captured_headers == [{"Authorization": "Bearer secret-key"}]
+
+
+def test_semantic_citers_pass_auth_headers_when_configured(monkeypatch):
+    provider = ci.SemanticScholarProvider(api_key="secret-key")
+    captured_headers = []
+
+    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES, headers=None):
+        captured_headers.append(headers)
+        return {
+            "total": 1,
+            "data": [
+                {
+                    "citingPaper": {
+                        "paperId": "paper-1",
+                        "title": "Paper 1",
+                        "year": 2020,
+                        "citationCount": 1,
+                        "externalIds": {},
+                        "abstract": "",
+                    }
+                }
+            ],
+        }
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    papers, expected_count, status = provider.fetch_citers_for_l1("semantic_scholar:seed")
+
+    assert len(papers) == 1
+    assert expected_count == 1
+    assert status == "complete"
+    assert captured_headers == [{"Authorization": "Bearer secret-key"}]
+
+
+def test_semantic_l2_search_passes_auth_headers_when_configured(monkeypatch):
+    provider = ci.SemanticScholarProvider(api_key="secret-key")
+    captured_headers = []
+
+    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES, headers=None):
+        captured_headers.append(headers)
+        return {
+            "data": [
+                {
+                    "paperId": "paper-1",
+                    "title": "Paper 1",
+                    "year": 2020,
+                    "citationCount": 1,
+                    "references": [{"paperId": "xyz1", "externalIds": {"DOI": "10.1000/l1"}}],
+                    "externalIds": {},
+                    "abstract": "",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    edges, papers = provider.fetch_l2_and_metadata(
+        ["doi:10.1000/l1"],
+        theory_name="Theory",
+        key_constructs=["usefulness"],
+        max_l2=10,
+    )
+
+    assert edges == {"semantic_scholar:paper-1": {"doi:10.1000/l1"}}
+    assert "semantic_scholar:paper-1" in papers
+    assert captured_headers == [{"Authorization": "Bearer secret-key"}]
+
+
+def test_semantic_l3_requests_pass_auth_headers_when_configured(monkeypatch):
+    provider = ci.SemanticScholarProvider(api_key="secret-key")
+    captured_headers = []
+
+    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES, headers=None):
+        captured_headers.append(headers)
+        return {
+            "references": [
+                {
+                    "paperId": "abc123",
+                    "externalIds": {"DOI": "10.1000/l3a"},
+                }
+            ]
+        }
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    edges, papers = provider.fetch_l3_references(["semantic_scholar:seed"], max_l3=10)
+
+    assert edges["semantic_scholar:seed"] == {"doi:10.1000/l3a"}
+    assert papers["doi:10.1000/l3a"].source_ids == {"semantic_scholar": "abc123"}
+    assert captured_headers == [{"Authorization": "Bearer secret-key"}]
+
+
 def test_semantic_citers_stop_without_requesting_at_offset_9999(monkeypatch):
     """Semantic Scholar pagination should stop cleanly once the next request would cross the API ceiling."""
     provider = ci.SemanticScholarProvider()
     request_count = [0]
     request_offsets = []
 
-    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES):
+    def fake_safe_get(
+        url,
+        timeout=20,
+        provider=None,
+        max_retries=ci._SAFE_GET_MAX_RETRIES,
+        headers=None,
+    ):
         request_count[0] += 1
         parsed = urllib.parse.urlparse(url)
         params = urllib.parse.parse_qs(parsed.query)
@@ -836,7 +991,13 @@ def test_semantic_l3_requests_minimal_fields_and_uses_doi_ids(monkeypatch):
     provider = ci.SemanticScholarProvider()
     requested_urls = []
 
-    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES):
+    def fake_safe_get(
+        url,
+        timeout=20,
+        provider=None,
+        max_retries=ci._SAFE_GET_MAX_RETRIES,
+        headers=None,
+    ):
         requested_urls.append(url)
         return {
             "references": [
@@ -869,7 +1030,13 @@ def test_semantic_l3_requests_minimal_fields_and_uses_doi_ids(monkeypatch):
 def test_semantic_l3_default_budget_fetches_all_available_refs(monkeypatch):
     provider = ci.SemanticScholarProvider()
 
-    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES):
+    def fake_safe_get(
+        url,
+        timeout=20,
+        provider=None,
+        max_retries=ci._SAFE_GET_MAX_RETRIES,
+        headers=None,
+    ):
         return {
             "references": [
                 {"paperId": "r1", "externalIds": {}},
