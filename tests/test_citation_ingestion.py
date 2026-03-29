@@ -439,6 +439,215 @@ def test_ingest_completeness_in_metadata(monkeypatch, tmp_path):
     assert l1_entry["paged"]["expected"] == 3
 
 
+def test_ingest_sample_mode_marks_completeness_partial(monkeypatch, tmp_path):
+    """Non-exhaustive mode should report partial completeness when capped."""
+    provider = _PagedCitedByProvider()
+
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    result = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["paged"],
+        depth="l2",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        exhaustive=False,
+        max_l2=2,
+    )
+
+    l1_entry = next(iter(result.metadata["completeness"].values()))
+    assert l1_entry["paged"]["status"] == "partial"
+    assert l1_entry["paged"]["fetched"] == 2
+    assert l1_entry["paged"]["expected"] == 3
+    assert l1_entry["paged"]["fetched"] < l1_entry["paged"]["expected"]
+
+
+class _EarlyStopCitedByProvider(ci.CitationProvider):
+    """Fake provider that stops early and reports partial fetch status."""
+
+    name = "earlystop"
+    capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=True)
+
+    def fetch_seed_metadata(self, l1_papers):
+        return {
+            l1: ci.IngestionPaper(
+                paper_id=l1,
+                title="Foundational",
+                citations=50,
+                year=2000,
+                doi="10.1000/xyz1",
+                source_ids={"earlystop": "EARLY001"},
+            )
+            for l1 in l1_papers
+        }
+
+    def fetch_citers_for_l1(self, l1_provider_id, max_results=None):
+        # Simulate a provider run that fetched some pages and then failed.
+        return (
+            {
+                "earlystop:C001": ci.IngestionPaper(
+                    paper_id="earlystop:C001", title="Citer One", year=2021, citations=4
+                ),
+                "earlystop:C002": ci.IngestionPaper(
+                    paper_id="earlystop:C002", title="Citer Two", year=2022, citations=2
+                ),
+            },
+            5,
+            "partial",
+        )
+
+    def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
+        return {}, {}
+
+    def fetch_l3_references(self, l2_paper_ids, max_l3=None):
+        return {}, {}
+
+
+def test_ingest_completeness_partial_when_provider_stops_early(monkeypatch, tmp_path):
+    """Provider-level partial status should propagate into metadata completeness."""
+    provider = _EarlyStopCitedByProvider()
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    result = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["earlystop"],
+        depth="l2",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        exhaustive=True,
+    )
+
+    assert len(result.citation_data) == 2
+    l1_entry = next(iter(result.metadata["completeness"].values()))
+    assert l1_entry["earlystop"]["status"] == "partial"
+    assert l1_entry["earlystop"]["fetched"] == 2
+    assert l1_entry["earlystop"]["expected"] == 5
+    assert l1_entry["earlystop"]["fetched"] < l1_entry["earlystop"]["expected"]
+
+
+class _L3BudgetProvider(ci.CitationProvider):
+    """Fake provider that returns fixed L2 nodes and budget-aware L3 references."""
+
+    name = "l3budget"
+    capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=True)
+
+    def __init__(self):
+        self.max_l3_calls = []
+
+    def fetch_seed_metadata(self, l1_papers):
+        return {
+            l1: ci.IngestionPaper(
+                paper_id=l1,
+                title="Foundational",
+                citations=80,
+                year=2001,
+                doi="10.1000/xyz1",
+                source_ids={"l3budget": "L3SEED001"},
+            )
+            for l1 in l1_papers
+        }
+
+    def fetch_citers_for_l1(self, l1_provider_id, max_results=None):
+        papers = {
+            "l3budget:L201": ci.IngestionPaper(
+                paper_id="l3budget:L201", title="L2 One", year=2020, citations=5
+            ),
+            "l3budget:L202": ci.IngestionPaper(
+                paper_id="l3budget:L202", title="L2 Two", year=2021, citations=6
+            ),
+        }
+        if max_results is not None:
+            papers = dict(list(papers.items())[:max_results])
+        status = "complete" if max_results is None or len(papers) == 2 else "partial"
+        return papers, 2, status
+
+    def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
+        return {}, {}
+
+    def fetch_l3_references(self, l2_paper_ids, max_l3=None):
+        self.max_l3_calls.append(max_l3)
+        candidates = [
+            ("l3budget:L201", "l3budget:R301"),
+            ("l3budget:L201", "l3budget:R302"),
+            ("l3budget:L202", "l3budget:R303"),
+            ("l3budget:L202", "l3budget:R304"),
+        ]
+        budget = len(candidates) if max_l3 is None else max(0, max_l3)
+        edges = {}
+        papers = {}
+
+        for parent_id, ref_id in candidates[:budget]:
+            if parent_id not in l2_paper_ids:
+                continue
+            edges.setdefault(parent_id, set()).add(ref_id)
+            papers.setdefault(
+                ref_id,
+                ci.IngestionPaper(
+                    paper_id=ref_id,
+                    title=f"Reference {ref_id}",
+                    year=2015,
+                    citations=1,
+                ),
+            )
+
+        return edges, papers
+
+
+def test_ingest_l3_without_budget_fetches_all_available_refs(monkeypatch, tmp_path):
+    """When max_l3 is unset, provider should contribute all available L3 edges."""
+    provider = _L3BudgetProvider()
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    result = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["l3budget"],
+        depth="l2l3",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        exhaustive=True,
+    )
+
+    assert provider.max_l3_calls == [None]
+    assert result.metadata["provider_stats"]["l3budget"]["l3_edges"] == 4
+    l3_cited = {
+        cited_id
+        for cited_set in result.citation_data.values()
+        for cited_id in cited_set
+        if cited_id.startswith("l3budget:R")
+    }
+    assert len(l3_cited) == 4
+
+
+def test_ingest_l3_budget_caps_reference_edges(monkeypatch, tmp_path):
+    """Explicit max_l3 should cap provider-contributed L3 reference edges."""
+    provider = _L3BudgetProvider()
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    result = ci.ingest_from_internet(
+        theory_name="Technology Acceptance Model",
+        l1_papers=["10.1000/xyz1"],
+        sources=["l3budget"],
+        depth="l2l3",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        exhaustive=True,
+        max_l3=2,
+    )
+
+    assert provider.max_l3_calls == [2]
+    assert result.metadata["provider_stats"]["l3budget"]["l3_edges"] == 2
+    l3_cited = {
+        cited_id
+        for cited_set in result.citation_data.values()
+        for cited_id in cited_set
+        if cited_id.startswith("l3budget:R")
+    }
+    assert len(l3_cited) == 2
+
+
 # ---------------------------------------------------------------------------
 # _safe_get: retry on transient errors, stop on permanent errors
 # ---------------------------------------------------------------------------

@@ -21,10 +21,8 @@ key_constructs:
   - psychological need satisfaction
   - psychological need frustration
 cache_dir: .cache/adit_ingestion
-refresh_cache: true
+refresh_cache: false
 only_ingest: true
-max_l2: 100
-max_l3: 250
 save_ingested_citation_data: outputs/sdt_citation_data.json
 save_ingested_papers_data: outputs/sdt_papers_data.json
 output_features: outputs/sdt_features.csv

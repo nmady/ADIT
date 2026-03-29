@@ -1,0 +1,65 @@
+name: Live Ingestion Canary
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  live-canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run live canary (non-blocking)
+        env:
+          ADIT_RUN_LIVE_CANARY: "1"
+          ADIT_CANARY_THEORY_NAME: ${{ vars.ADIT_CANARY_THEORY_NAME }}
+          ADIT_CANARY_L1_PAPERS: ${{ vars.ADIT_CANARY_L1_PAPERS }}
+          ADIT_CANARY_SOURCES: ${{ vars.ADIT_CANARY_SOURCES }}
+          ADIT_CANARY_DEPTH: ${{ vars.ADIT_CANARY_DEPTH }}
+          CORE_API_KEY: ${{ secrets.CORE_API_KEY }}
+        run: |
+          set +e
+
+          THEORY_NAME="${ADIT_CANARY_THEORY_NAME:-Technology Acceptance Model}"
+          L1_PAPERS="${ADIT_CANARY_L1_PAPERS:-10.2307/249008}"
+          SOURCES="${ADIT_CANARY_SOURCES:-openalex,semantic_scholar}"
+          DEPTH="${ADIT_CANARY_DEPTH:-l2}"
+
+          echo "Running live canary with:"
+          echo "  theory=${THEORY_NAME}"
+          echo "  l1_papers=${L1_PAPERS}"
+          echo "  sources=${SOURCES}"
+          echo "  depth=${DEPTH}"
+
+          ADIT_CANARY_THEORY_NAME="${THEORY_NAME}" \
+          ADIT_CANARY_L1_PAPERS="${L1_PAPERS}" \
+          ADIT_CANARY_SOURCES="${SOURCES}" \
+          ADIT_CANARY_DEPTH="${DEPTH}" \
+          python -m pytest tests/test_live_ingestion_canary.py -q
+          EXIT_CODE=$?
+
+          if [ "$EXIT_CODE" -ne 0 ]; then
+            echo "::warning title=Live canary failed::Live ingestion canary failed (exit code ${EXIT_CODE}). This workflow is intentionally non-blocking."
+          else
+            echo "Live ingestion canary passed."
+          fi
+
+          exit 0

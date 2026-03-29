@@ -119,6 +119,11 @@ If `labels_data` is omitted, the CLI extracts features and skips training/predic
 - `--only-ingest` runs ingestion and exits before feature extraction/training.
 - `--save-ingested-citation-data` and `--save-ingested-papers-data` let you persist normalized outputs for offline replay.
 - Tests do not rely on live provider calls; the internet ingestion path is covered with mocked fixtures.
+- Optional live canary: set `ADIT_RUN_LIVE_CANARY=1` and run `pytest tests/test_live_ingestion_canary.py`.
+- Canary env knobs: `ADIT_CANARY_L1_PAPERS`, `ADIT_CANARY_SOURCES`, `ADIT_CANARY_DEPTH`, `ADIT_CANARY_CACHE_DIR`.
+- Canary assertions focus on completeness invariants (for example: never report `complete` when `fetched < expected`).
+- GitHub Actions includes `.github/workflows/live-canary.yml` for nightly/manual live checks; failures are reported as warnings and do not fail CI.
+- Optional repository Variables for workflow tuning: `ADIT_CANARY_THEORY_NAME`, `ADIT_CANARY_L1_PAPERS`, `ADIT_CANARY_SOURCES`, `ADIT_CANARY_DEPTH`.
 
 ### `citation_data.json` Format
 
