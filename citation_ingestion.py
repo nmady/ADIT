@@ -2096,6 +2096,7 @@ def ingest_from_internet(
     verbose: bool = False,
     checkpoint_dir: Optional[Path] = None,
     reset_checkpoints: bool = False,
+    checkpoint_staleness_seconds: Optional[int] = None,
 ) -> IngestionResult:
     """Ingest citation data from internet providers.
 
@@ -2105,7 +2106,13 @@ def ingest_from_internet(
             retrieval is capped at *max_l2* results per L1/provider.
         verbose: When ``True``, print live progress messages to stderr
             (per-seed status, retry countdowns).
+        checkpoint_staleness_seconds: Optional staleness window in seconds for
+            checkpoint resume state. When unset, defaults to
+            ``_PAGINATION_STATE_MAX_AGE_SECONDS``.
     """
+    if checkpoint_staleness_seconds is not None and checkpoint_staleness_seconds <= 0:
+        raise ValueError("checkpoint_staleness_seconds must be a positive integer")
+
     set_verbose(verbose)
     source_list = (
         ["openalex", "semantic_scholar", "crossref", "core"] if not sources else list(sources)
@@ -2184,6 +2191,11 @@ def ingest_from_internet(
     provider_l3_state: Dict[str, Dict[str, Any]] = {}
 
     checkpoint_root = checkpoint_dir or (cache_root / "checkpoints")
+    effective_staleness_seconds = (
+        checkpoint_staleness_seconds
+        if checkpoint_staleness_seconds is not None
+        else _PAGINATION_STATE_MAX_AGE_SECONDS
+    )
     checkpoint_state = _load_checkpoint_state(checkpoint_root, key, reset_checkpoints)
     if checkpoint_state:
         checkpoint_stats["hit"] = True
@@ -2264,7 +2276,10 @@ def ingest_from_internet(
         provider_state = provider_pagination_state.setdefault(provider.name, {})
         stale_removed = False
         for seed_id, seed_state in list(provider_state.items()):
-            if _is_pagination_state_stale(seed_state):
+            if _is_pagination_state_stale(
+                seed_state,
+                max_age_seconds=effective_staleness_seconds,
+            ):
                 provider_state.pop(seed_id, None)
                 stale_removed = True
                 stale_seeds = checkpoint_stats.get("stale_state_ignored_seeds")
@@ -2281,7 +2296,10 @@ def ingest_from_internet(
             _persist_checkpoint_snapshot()
 
         provider_l3_run_state = provider_l3_state.get(provider.name)
-        if _is_pagination_state_stale(provider_l3_run_state or {}):
+        if _is_pagination_state_stale(
+            provider_l3_run_state or {},
+            max_age_seconds=effective_staleness_seconds,
+        ):
             provider_l3_state.pop(provider.name, None)
             l3_stale_providers = checkpoint_stats.get("l3_stale_state_ignored_providers")
             if isinstance(l3_stale_providers, list):

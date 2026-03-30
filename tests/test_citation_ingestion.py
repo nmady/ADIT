@@ -1095,6 +1095,80 @@ def test_semantic_l3_default_budget_fetches_all_available_refs(monkeypatch):
     assert len(papers) == 3
 
 
+def test_openalex_l3_malformed_resume_state_fails_open(monkeypatch):
+    provider = ci.OpenAlexProvider()
+
+    def fake_safe_get(url, timeout=20, provider=None, max_retries=ci._SAFE_GET_MAX_RETRIES):
+        if url.endswith("W100?select=referenced_works"):
+            return {"referenced_works": ["https://openalex.org/W200"]}
+        if url.endswith("W200?select=id,doi,title,publication_year"):
+            return {
+                "id": "https://openalex.org/W200",
+                "doi": "https://doi.org/10.1000/l3a",
+                "title": "Hydrated L3",
+                "publication_year": 2018,
+            }
+        return None
+
+    malformed_resume_state = {
+        "next_l2_index": "bad-index",
+        "budget_remaining": "bad-budget",
+        "edges": ["not-a-dict"],
+        "papers": "not-a-dict",
+    }
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    edges, papers = provider.fetch_l3_references(
+        ["openalex:W100"],
+        max_l3=2,
+        resume_state=malformed_resume_state,
+    )
+
+    assert edges == {"openalex:W100": {"openalex:W200"}}
+    assert papers["openalex:W200"].title == "Hydrated L3"
+
+
+def test_semantic_l3_malformed_resume_state_fails_open(monkeypatch):
+    provider = ci.SemanticScholarProvider()
+
+    def fake_safe_get(
+        url,
+        timeout=20,
+        provider=None,
+        max_retries=ci._SAFE_GET_MAX_RETRIES,
+        headers=None,
+    ):
+        return {
+            "references": [
+                {
+                    "paperId": "abc123",
+                    "externalIds": {"DOI": "10.1000/l3a"},
+                }
+            ]
+        }
+
+    malformed_resume_state = {
+        "next_l2_index": "bad-index",
+        "budget_remaining": "bad-budget",
+        "edges": ["not-a-dict"],
+        "papers": "not-a-dict",
+    }
+
+    monkeypatch.setattr(ci, "_safe_get", fake_safe_get)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    edges, papers = provider.fetch_l3_references(
+        ["semantic_scholar:seed"],
+        max_l3=2,
+        resume_state=malformed_resume_state,
+    )
+
+    assert edges == {"semantic_scholar:seed": {"doi:10.1000/l3a"}}
+    assert papers["doi:10.1000/l3a"].source_ids == {"semantic_scholar": "abc123"}
+
+
 def test_openalex_l3_requests_minimal_edges_then_identity_hydration(monkeypatch):
     provider = ci.OpenAlexProvider()
     requested_urls = []
@@ -2908,6 +2982,61 @@ def test_fresh_pagination_state_is_reused(monkeypatch, tmp_path):
     assert result.metadata["checkpoint_stats"]["stale_state_ignored_count"] == 0
 
 
+def test_checkpoint_staleness_override_keeps_recent_state(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+    provider = _ResumeCaptureProvider()
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    request_payload = ci._request_payload(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        key_constructs=None,
+        sources=["resume_capture"],
+        depth="l2",
+        max_l2=200,
+        max_l3=None,
+        exhaustive=True,
+    )
+    key = ci._cache_key(request_payload)
+    # This timestamp is stale under the default 6h policy, but fresh under 24h override.
+    updated_ts = time.time() - ci._PAGINATION_STATE_MAX_AGE_SECONDS - 10
+    ci._write_checkpoint_state(
+        checkpoint_root=checkpoint_dir,
+        key=key,
+        completed_providers=set(),
+        all_edges={},
+        all_papers={"doi:10.1000/xyz1": ci.IngestionPaper(paper_id="doi:10.1000/xyz1")},
+        provider_stats={},
+        combined_completeness={},
+        provider_pagination_state={
+            "resume_capture": {
+                "doi:10.1000/xyz1": {
+                    "status": "in_progress",
+                    "offset": 42,
+                    "updated_at": updated_ts,
+                    "papers": {},
+                }
+            }
+        },
+    )
+
+    result = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["resume_capture"],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_staleness_seconds=24 * 60 * 60,
+        refresh=True,
+    )
+
+    assert provider.seen_resume_states and provider.seen_resume_states[0] is not None
+    assert provider.seen_resume_states[0]["offset"] == 42
+    assert result.metadata["checkpoint_stats"]["stale_state_ignored_count"] == 0
+
+
 class _L3ResumeCaptureProvider(ci.CitationProvider):
     name = "resume_l3_capture"
     capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=False)
@@ -2993,3 +3122,283 @@ def test_stale_l3_resume_state_is_ignored(monkeypatch, tmp_path):
     stats = result.metadata["checkpoint_stats"]
     assert stats["l3_stale_state_ignored_count"] == 1
     assert stats["l3_stale_state_ignored_providers"] == ["resume_l3_capture"]
+
+
+class _L2CrashMatrixProvider(ci.CitationProvider):
+    capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=False)
+
+    def __init__(self, name: str, edge_id: str, crash: bool = False, fail_on_call: bool = False):
+        self.name = name
+        self.edge_id = edge_id
+        self.crash = crash
+        self.fail_on_call = fail_on_call
+
+    def fetch_seed_metadata(self, l1_papers):
+        if self.fail_on_call:
+            raise AssertionError(f"{self.name} should have been skipped via checkpoint")
+        return {
+            l1_papers[0]: ci.IngestionPaper(
+                paper_id=l1_papers[0],
+                title=f"Seed from {self.name}",
+                source_ids={self.name: f"seed-{self.name}"},
+            )
+        }
+
+    def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
+        if self.fail_on_call:
+            raise AssertionError(f"{self.name} should have been skipped via checkpoint")
+        if self.crash:
+            raise RuntimeError(f"simulated l2 crash in {self.name}")
+        return (
+            {self.edge_id: {l1_papers[0]}},
+            {
+                self.edge_id: ci.IngestionPaper(
+                    paper_id=self.edge_id,
+                    title=f"{self.name} L2",
+                    year=2022,
+                    citations=1,
+                )
+            },
+        )
+
+    def fetch_l3_references(self, l2_paper_ids, max_l3=None):
+        return {}, {}
+
+
+def test_checkpoint_resume_multi_provider_l2_crash_matches_baseline(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+
+    first_openalex = _L2CrashMatrixProvider("openalex", "openalex:L2A")
+    first_semantic = _L2CrashMatrixProvider("semantic_scholar", "semantic_scholar:L2A", crash=True)
+    first_core = _L2CrashMatrixProvider("core", "core:L2A")
+    monkeypatch.setattr(ci, "build_providers", lambda _: [first_openalex, first_semantic, first_core])
+
+    with pytest.raises(RuntimeError, match="simulated l2 crash"):
+        ci.ingest_from_internet(
+            theory_name="My Fake Theory",
+            l1_papers=["10.1000/xyz1"],
+            sources=["openalex", "semantic_scholar", "core"],
+            depth="l2",
+            cache_dir=cache_dir,
+            checkpoint_dir=checkpoint_dir,
+            refresh=True,
+        )
+
+    resumed_openalex = _L2CrashMatrixProvider("openalex", "openalex:L2A", fail_on_call=True)
+    resumed_semantic = _L2CrashMatrixProvider("semantic_scholar", "semantic_scholar:L2A")
+    resumed_core = _L2CrashMatrixProvider("core", "core:L2A")
+    monkeypatch.setattr(
+        ci,
+        "build_providers",
+        lambda _: [resumed_openalex, resumed_semantic, resumed_core],
+    )
+
+    resumed = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["openalex", "semantic_scholar", "core"],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    baseline_openalex = _L2CrashMatrixProvider("openalex", "openalex:L2A")
+    baseline_semantic = _L2CrashMatrixProvider("semantic_scholar", "semantic_scholar:L2A")
+    baseline_core = _L2CrashMatrixProvider("core", "core:L2A")
+    monkeypatch.setattr(
+        ci,
+        "build_providers",
+        lambda _: [baseline_openalex, baseline_semantic, baseline_core],
+    )
+
+    baseline = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["openalex", "semantic_scholar", "core"],
+        depth="l2",
+        cache_dir=Path(tmp_path) / "baseline-cache",
+        checkpoint_dir=Path(tmp_path) / "baseline-checkpoints",
+        refresh=True,
+    )
+
+    assert resumed.citation_data == baseline.citation_data
+    assert resumed.papers_data == baseline.papers_data
+
+
+class _L3CrashMatrixProvider(ci.CitationProvider):
+    capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=False)
+
+    def __init__(
+        self,
+        name: str,
+        l2_prefix: str,
+        l3_refs: dict[str, list[str]],
+        crash_at_l3_index=None,
+    ):
+        self.name = name
+        self.l2_prefix = l2_prefix
+        self.l3_refs = l3_refs
+        self.crash_at_l3_index = crash_at_l3_index
+
+    def fetch_seed_metadata(self, l1_papers):
+        return {
+            l1_papers[0]: ci.IngestionPaper(
+                paper_id=l1_papers[0],
+                title=f"Seed from {self.name}",
+                source_ids={self.name: f"seed-{self.name}"},
+            )
+        }
+
+    def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
+        seed = l1_papers[0]
+        l2_a = f"{self.l2_prefix}:L2A"
+        l2_b = f"{self.l2_prefix}:L2B"
+        return (
+            {l2_a: {seed}, l2_b: {seed}},
+            {
+                l2_a: ci.IngestionPaper(paper_id=l2_a, title=f"{self.name} L2A", year=2020),
+                l2_b: ci.IngestionPaper(paper_id=l2_b, title=f"{self.name} L2B", year=2021),
+            },
+        )
+
+    def fetch_l3_references(
+        self,
+        l2_paper_ids,
+        max_l3=None,
+        resume_state=None,
+        progress_callback=None,
+    ):
+        edges = ci._deserialize_edges((resume_state or {}).get("edges"))
+        papers = ci._deserialize_papers((resume_state or {}).get("papers"))
+
+        start_index_raw = (resume_state or {}).get("next_l2_index")
+        try:
+            start_index = int(start_index_raw) if start_index_raw is not None else 0
+        except (TypeError, ValueError):
+            start_index = 0
+
+        for idx in range(start_index, len(l2_paper_ids)):
+            if self.crash_at_l3_index is not None and idx == self.crash_at_l3_index:
+                raise RuntimeError(f"simulated l3 crash in {self.name}")
+
+            pid = l2_paper_ids[idx]
+            for ref_id in self.l3_refs.get(pid, []):
+                edges.setdefault(pid, set()).add(ref_id)
+                papers.setdefault(
+                    ref_id,
+                    ci.IngestionPaper(
+                        paper_id=ref_id,
+                        title=f"Ref {ref_id}",
+                        doi=ref_id.split(":", 1)[1] if ref_id.startswith("doi:") else None,
+                    ),
+                )
+
+            if progress_callback:
+                progress_callback(
+                    {
+                        "status": "in_progress",
+                        "next_l2_index": idx + 1,
+                        "budget_remaining": None,
+                        "edges": ci._serialize_edges(edges),
+                        "papers": ci._serialize_papers(papers),
+                        "updated_at": time.time(),
+                    }
+                )
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "status": "complete",
+                    "next_l2_index": len(l2_paper_ids),
+                    "budget_remaining": None,
+                    "edges": ci._serialize_edges(edges),
+                    "papers": ci._serialize_papers(papers),
+                    "updated_at": time.time(),
+                }
+            )
+
+        return edges, papers
+
+
+def test_checkpoint_resume_multi_provider_l3_crash_matches_baseline(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+
+    oa_l3_refs = {
+        "openalex:L2A": ["doi:10.1000/shared-l3", "doi:10.1000/oa-l3a"],
+        "openalex:L2B": ["doi:10.1000/oa-l3b"],
+    }
+    s2_l3_refs = {
+        "semantic_scholar:L2A": ["doi:10.1000/shared-l3", "doi:10.1000/s2-l3a"],
+        "semantic_scholar:L2B": ["doi:10.1000/s2-l3b"],
+    }
+    core_l3_refs = {
+        "core:L2A": ["doi:10.1000/shared-l3", "doi:10.1000/core-l3a"],
+        "core:L2B": ["doi:10.1000/core-l3b"],
+    }
+
+    first_openalex = _L3CrashMatrixProvider("openalex", "openalex", oa_l3_refs)
+    first_semantic = _L3CrashMatrixProvider(
+        "semantic_scholar",
+        "semantic_scholar",
+        s2_l3_refs,
+        crash_at_l3_index=1,
+    )
+    first_core = _L3CrashMatrixProvider("core", "core", core_l3_refs)
+    monkeypatch.setattr(ci, "build_providers", lambda _: [first_openalex, first_semantic, first_core])
+
+    with pytest.raises(RuntimeError, match="simulated l3 crash in semantic_scholar"):
+        ci.ingest_from_internet(
+            theory_name="My Fake Theory",
+            l1_papers=["10.1000/xyz1"],
+            sources=["openalex", "semantic_scholar", "core"],
+            depth="l2l3",
+            cache_dir=cache_dir,
+            checkpoint_dir=checkpoint_dir,
+            refresh=True,
+        )
+
+    resumed_openalex = _L3CrashMatrixProvider("openalex", "openalex", oa_l3_refs)
+    resumed_semantic = _L3CrashMatrixProvider("semantic_scholar", "semantic_scholar", s2_l3_refs)
+    resumed_core = _L3CrashMatrixProvider("core", "core", core_l3_refs)
+    monkeypatch.setattr(
+        ci,
+        "build_providers",
+        lambda _: [resumed_openalex, resumed_semantic, resumed_core],
+    )
+
+    resumed = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["openalex", "semantic_scholar", "core"],
+        depth="l2l3",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    baseline_openalex = _L3CrashMatrixProvider("openalex", "openalex", oa_l3_refs)
+    baseline_semantic = _L3CrashMatrixProvider("semantic_scholar", "semantic_scholar", s2_l3_refs)
+    baseline_core = _L3CrashMatrixProvider("core", "core", core_l3_refs)
+    monkeypatch.setattr(
+        ci,
+        "build_providers",
+        lambda _: [baseline_openalex, baseline_semantic, baseline_core],
+    )
+
+    baseline = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["openalex", "semantic_scholar", "core"],
+        depth="l2l3",
+        cache_dir=Path(tmp_path) / "baseline-cache",
+        checkpoint_dir=Path(tmp_path) / "baseline-checkpoints",
+        refresh=True,
+    )
+
+    assert resumed.citation_data == baseline.citation_data
+    assert resumed.papers_data == baseline.papers_data
+    assert resumed.metadata["provider_stats"] == baseline.metadata["provider_stats"]
+    assert "semantic_scholar" in resumed.metadata["checkpoint_stats"]["l3_resumed_providers"]

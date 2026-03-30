@@ -45,6 +45,13 @@ CHECKPOINT_DIR_OPTION = typer.Option(
         "Defaults to <cache-dir>/checkpoints."
     ),
 )
+CHECKPOINT_STALENESS_OPTION = typer.Option(
+    None,
+    help=(
+        "Optional checkpoint staleness window in seconds. "
+        "Stale resume state older than this window is ignored."
+    ),
+)
 REFRESH_CACHE_OPTION = typer.Option(
     False,
     help="Ignore ingestion cache and force fresh network retrieval in online mode.",
@@ -179,6 +186,7 @@ def _resolve_cli_inputs(
     key_constructs: Optional[str],
     cache_dir: Optional[Path],
     checkpoint_dir: Optional[Path],
+    checkpoint_staleness_seconds: Optional[int],
     refresh_cache: bool,
     reset_checkpoints: bool,
     max_l2: int,
@@ -195,6 +203,14 @@ def _resolve_cli_inputs(
     l1_cfg = cfg.get("l1_papers")
     l1_cfg_str = ",".join(l1_cfg) if isinstance(l1_cfg, list) else None
     resolved_l1_file = l1_file or (Path(cfg["l1_file"]) if cfg.get("l1_file") else None)
+
+    resolved_checkpoint_staleness = (
+        int(cfg["checkpoint_staleness_seconds"])
+        if cfg.get("checkpoint_staleness_seconds") is not None
+        else checkpoint_staleness_seconds
+    )
+    if resolved_checkpoint_staleness is not None and resolved_checkpoint_staleness <= 0:
+        raise typer.BadParameter("checkpoint_staleness_seconds must be a positive integer.")
 
     return {
         "theory_name": theory_name or cfg.get("theory_name"),
@@ -217,6 +233,7 @@ def _resolve_cli_inputs(
         "cache_dir": cache_dir or (Path(cfg["cache_dir"]) if cfg.get("cache_dir") else None),
         "checkpoint_dir": checkpoint_dir
         or (Path(cfg["checkpoint_dir"]) if cfg.get("checkpoint_dir") else None),
+        "checkpoint_staleness_seconds": resolved_checkpoint_staleness,
         "refresh_cache": bool(refresh_cache or cfg.get("refresh_cache", False)),
         "reset_checkpoints": bool(reset_checkpoints or cfg.get("reset_checkpoints", False)),
         "max_l2": int(cfg.get("max_l2", max_l2)),
@@ -274,6 +291,7 @@ def _load_pipeline_inputs(params: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[
             depth=params["depth"],
             cache_dir=params["cache_dir"],
             checkpoint_dir=params.get("checkpoint_dir"),
+            checkpoint_staleness_seconds=params.get("checkpoint_staleness_seconds"),
             refresh=params["refresh_cache"],
             reset_checkpoints=params.get("reset_checkpoints", False),
             max_l2=params["max_l2"],
@@ -329,6 +347,7 @@ def run(
     key_constructs: Optional[str] = KEY_CONSTRUCTS_OPTION,
     cache_dir: Optional[Path] = CACHE_DIR_OPTION,
     checkpoint_dir: Optional[Path] = CHECKPOINT_DIR_OPTION,
+    checkpoint_staleness_seconds: Optional[int] = CHECKPOINT_STALENESS_OPTION,
     refresh_cache: bool = REFRESH_CACHE_OPTION,
     reset_checkpoints: bool = RESET_CHECKPOINTS_OPTION,
     max_l2: int = MAX_L2_OPTION,
@@ -358,6 +377,7 @@ def run(
         key_constructs,
         cache_dir,
         checkpoint_dir,
+        checkpoint_staleness_seconds,
         refresh_cache,
         reset_checkpoints,
         max_l2,

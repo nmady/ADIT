@@ -528,6 +528,8 @@ def test_cli_online_checkpoint_options_are_passed_to_ingestion(monkeypatch):
             "l2",
             "--checkpoint-dir",
             "custom-checkpoints",
+            "--checkpoint-staleness-seconds",
+            "1800",
             "--reset-checkpoints",
         ],
         color=False,
@@ -535,6 +537,7 @@ def test_cli_online_checkpoint_options_are_passed_to_ingestion(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert captured_kwargs["checkpoint_dir"] == Path("custom-checkpoints")
+    assert captured_kwargs["checkpoint_staleness_seconds"] == 1800
     assert captured_kwargs["reset_checkpoints"] is True
 
 
@@ -552,6 +555,7 @@ def test_cli_online_checkpoint_config_values_are_resolved(tmp_path, monkeypatch)
             "l1_papers": ["TAM1", "TAM2"],
             "depth": "l2",
             "checkpoint_dir": "cfg-checkpoints",
+            "checkpoint_staleness_seconds": 900,
             "reset_checkpoints": True,
         },
     )
@@ -585,4 +589,28 @@ def test_cli_online_checkpoint_config_values_are_resolved(tmp_path, monkeypatch)
 
     assert result.exit_code == 0, result.output
     assert captured_kwargs["checkpoint_dir"] == Path("cfg-checkpoints")
+    assert captured_kwargs["checkpoint_staleness_seconds"] == 900
     assert captured_kwargs["reset_checkpoints"] is True
+
+
+def test_cli_online_checkpoint_staleness_must_be_positive(monkeypatch):
+    """checkpoint_staleness_seconds should reject non-positive values."""
+    monkeypatch.setattr(cli, "ADIT", FakeADIT)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "--online",
+            "--theory-name",
+            "Technology Acceptance Model",
+            "--l1-papers",
+            "TAM1,TAM2",
+            "--checkpoint-staleness-seconds",
+            "0",
+        ],
+        color=False,
+    )
+
+    assert result.exit_code != 0
+    clean_output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    assert "checkpoint_staleness_seconds must be a positive integer" in clean_output

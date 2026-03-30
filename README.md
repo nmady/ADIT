@@ -118,6 +118,7 @@ If `labels_data` is omitted, the CLI extracts features and skips training/predic
 - Crossref is used for metadata enrichment of accepted papers and seed DOIs, not for L2 graph discovery.
 - `--cache-dir` stores cached ingestion results so repeated runs can reuse prior retrieval work.
 - `--checkpoint-dir` stores provider-atomic progress snapshots for resumable ingestion (defaults to `<cache-dir>/checkpoints`).
+- `--checkpoint-staleness-seconds` optionally overrides the resume-state staleness window (default: 21600 seconds / 6 hours).
 - `--reset-checkpoints` clears the current request's checkpoint state before ingestion starts.
 - `--refresh-cache` forces a fresh internet retrieval instead of reusing cached results.
 - Checkpoint semantics (Phase 1): completion is persisted after each provider completes; resumed runs skip completed providers and continue remaining providers.
@@ -125,9 +126,11 @@ If `labels_data` is omitted, the CLI extracts features and skips training/predic
 - Phase 3.1 extends L3 resume to CORE, so interrupted L3 expansion can continue from saved provider progress for OpenAlex, Semantic Scholar, and CORE.
 - Crossref remains no-op for L3 by contract.
 - Per-seed pagination progress includes a staleness guard (6-hour window by default); stale progress is ignored and the seed is safely refetched.
+- Provider L3 resume progress uses the same staleness guard policy; stale L3 state is ignored and rebuilt safely.
 - `--only-ingest` runs ingestion and exits before feature extraction/training.
 - `--save-ingested-citation-data` and `--save-ingested-papers-data` let you persist normalized outputs for offline replay.
 - Tests do not rely on live provider calls; the internet ingestion path is covered with mocked fixtures.
+- Integration coverage includes crash-resume equivalence checks that verify resumed ingestion output matches uninterrupted baseline output before feeding results into ADIT feature extraction/training.
 - Optional live canary: set `ADIT_RUN_LIVE_CANARY=1` and run `pytest tests/test_live_ingestion_canary.py`.
 - Canary env knobs: `ADIT_CANARY_L1_PAPERS`, `ADIT_CANARY_SOURCES`, `ADIT_CANARY_DEPTH`, `ADIT_CANARY_CACHE_DIR`.
 - Canary assertions focus on completeness invariants (for example: never report `complete` when `fetched < expected`).
@@ -294,6 +297,7 @@ Ingestion metadata also includes `checkpoint_stats`:
 - `providers_skipped` and `skipped_provider_names` report providers skipped because checkpoint state already marked them complete.
 - `providers_executed` and `executed_provider_names` report providers actually executed in this run.
 - `stale_state_ignored_count` and `stale_state_ignored_seeds` report stale per-seed pagination checkpoints that were discarded before execution.
+- `l3_stale_state_ignored_count` and `l3_stale_state_ignored_providers` report stale provider-level L3 checkpoints that were discarded before execution.
 - `l3_resumed_providers` reports providers resumed from persisted L3 progress in the current run.
 - `l3_resumed_parent_count` reports how many L2 parent positions were skipped because L3 resume state was restored.
 
@@ -309,11 +313,12 @@ A compact reference for keys accepted in config files (and equivalent CLI flags)
 - **papers_data**: (path, optional) — Offline `papers_data.json` path. Required when `online: false`.
 - **labels_data**: (path, optional) — Labels file (JSON list aligned to features or dict by paper_id) used for training.
 - **online**: (bool, default: false) — When true, fetch citation and paper metadata from online providers instead of local JSON.
-- **sources**: (list|string, default: [openalex, semantic_scholar, crossref]) — Providers to query in online mode. Accepts YAML lists or comma-separated strings on CLI.
+- **sources**: (list|string, default: [openalex, semantic_scholar, crossref, core]) — Providers to query in online mode. Accepts YAML lists or comma-separated strings on CLI.
 - **depth**: (string, default: l2l3) — Ingestion expansion depth: `l2` or `l2l3`.
 - **key_constructs**: (list|string, optional) — Additional keywords to bias provider search relevance. Accepts YAML lists or comma-separated strings.
 - **cache_dir**: (path, default: .cache/adit_ingestion) — Directory to cache provider responses and merged ingestion payloads.
 - **checkpoint_dir**: (path, default: <cache_dir>/checkpoints) — Directory for resumable checkpoint state.
+- **checkpoint_staleness_seconds**: (int, default: 21600) — Optional staleness window in seconds for L2 and L3 resume-state reuse.
 - **reset_checkpoints**: (bool, default: false) — If true, clear checkpoint state for the current request before ingestion starts.
 - **refresh_cache**: (bool, default: false) — If true, ignore cached ingestion and force fresh retrieval.
 - **max_l2**: (int, default: 200) — Per-provider cap on L2 retrieval. Admitted L2 papers must explicitly cite an L1 seed.
