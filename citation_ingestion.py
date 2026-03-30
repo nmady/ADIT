@@ -2140,6 +2140,8 @@ def ingest_from_internet(
         "executed_provider_names": [],
         "stale_state_ignored_count": 0,
         "stale_state_ignored_seeds": [],
+        "l3_stale_state_ignored_count": 0,
+        "l3_stale_state_ignored_providers": [],
         "l3_resumed_providers": [],
         "l3_resumed_parent_count": 0,
     }
@@ -2162,6 +2164,8 @@ def ingest_from_internet(
                 "executed_provider_names": [],
                 "stale_state_ignored_count": 0,
                 "stale_state_ignored_seeds": [],
+                "l3_stale_state_ignored_count": 0,
+                "l3_stale_state_ignored_providers": [],
                 "l3_resumed_providers": [],
                 "l3_resumed_parent_count": 0,
             }
@@ -2274,6 +2278,18 @@ def ingest_from_internet(
                 )
 
         if stale_removed:
+            _persist_checkpoint_snapshot()
+
+        provider_l3_run_state = provider_l3_state.get(provider.name)
+        if _is_pagination_state_stale(provider_l3_run_state or {}):
+            provider_l3_state.pop(provider.name, None)
+            l3_stale_providers = checkpoint_stats.get("l3_stale_state_ignored_providers")
+            if isinstance(l3_stale_providers, list):
+                l3_stale_providers.append(provider.name)
+            checkpoint_stats["l3_stale_state_ignored_count"] = (
+                int(checkpoint_stats.get("l3_stale_state_ignored_count", 0)) + 1
+            )
+            _vprint(f"  [{provider.name}] Ignoring stale L3 checkpoint state")
             _persist_checkpoint_snapshot()
 
         provider_l3_run_state = provider_l3_state.setdefault(provider.name, {})

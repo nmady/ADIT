@@ -1258,6 +1258,47 @@ def test_core_l3_budget_caps_reference_edges(monkeypatch):
     assert len(papers) == 2
 
 
+def test_core_l3_malformed_resume_state_fails_open(monkeypatch):
+    provider = ci.CoreProvider()
+
+    def fake_lookup_work(pid):
+        if pid == "core:l2a":
+            return {
+                "references": [
+                    {"id": "a1", "doi": "10.1000/core-a1", "title": "Core A1"},
+                ]
+            }
+        if pid == "core:l2b":
+            return {
+                "references": [
+                    {"id": "b1", "doi": "10.1000/core-b1", "title": "Core B1"},
+                ]
+            }
+        return None
+
+    malformed_resume_state = {
+        "next_l2_index": "not-an-int",
+        "budget_remaining": "not-an-int",
+        "edges": ["not-a-dict"],
+        "papers": "not-a-dict",
+    }
+
+    monkeypatch.setattr(provider, "_lookup_work", fake_lookup_work)
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    edges, papers = provider.fetch_l3_references(
+        ["core:l2a", "core:l2b"],
+        max_l3=2,
+        resume_state=malformed_resume_state,
+    )
+
+    assert edges == {
+        "core:l2a": {"doi:10.1000/core-a1"},
+        "core:l2b": {"doi:10.1000/core-b1"},
+    }
+    assert len(papers) == 2
+
+
 def test_crossref_l3_contract_returns_empty_graph():
     provider = ci.CrossrefProvider()
     edges, papers = provider.fetch_l3_references(["doi:10.1000/l2"], max_l3=10)
@@ -2590,6 +2631,131 @@ def test_core_l3_resume_from_checkpoint(monkeypatch, tmp_path):
     assert "core" in resumed.metadata["checkpoint_stats"]["l3_resumed_providers"]
 
 
+def test_core_l3_budget_resume_continues_remaining_budget(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+    crash_on_l3_second_parent = {"enabled": True}
+
+    class _CoreBudgetResumeProvider(ci.CoreProvider):
+        name = "core"
+
+        def __init__(self):
+            super().__init__(api_key=None)
+
+        def fetch_seed_metadata(self, l1_papers):
+            return {
+                l1: ci.IngestionPaper(
+                    paper_id=l1,
+                    title="Seed",
+                    source_ids={"core": "seed-core-id"},
+                )
+                for l1 in l1_papers
+            }
+
+        def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
+            seed = ci.normalize_identifier(l1_papers[0])
+            edges = {
+                "core:l2a": {seed},
+                "core:l2b": {seed},
+            }
+            papers = {
+                "core:l2a": ci.IngestionPaper(
+                    paper_id="core:l2a",
+                    title="L2 A",
+                    year=2020,
+                    source_ids={"core": "l2a"},
+                ),
+                "core:l2b": ci.IngestionPaper(
+                    paper_id="core:l2b",
+                    title="L2 B",
+                    year=2021,
+                    source_ids={"core": "l2b"},
+                ),
+            }
+            return edges, papers
+
+        def _lookup_work(self, paper_id):
+            if paper_id == "core:l2a":
+                return {
+                    "references": [
+                        {"doi": "10.1000/corea1", "id": "a1", "title": "Core A1"},
+                        {"doi": "10.1000/corea2", "id": "a2", "title": "Core A2"},
+                    ]
+                }
+            if paper_id == "core:l2b":
+                if crash_on_l3_second_parent["enabled"]:
+                    raise RuntimeError("core l3 budget simulated crash")
+                return {
+                    "references": [
+                        {"doi": "10.1000/coreb1", "id": "b1", "title": "Core B1"},
+                        {"doi": "10.1000/coreb2", "id": "b2", "title": "Core B2"},
+                    ]
+                }
+            return None
+
+    provider = _CoreBudgetResumeProvider()
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="core l3 budget simulated crash"):
+        ci.ingest_from_internet(
+            theory_name="My Fake Theory",
+            l1_papers=["doi:10.1000/seed"],
+            sources=["core"],
+            depth="l2l3",
+            max_l3=3,
+            cache_dir=cache_dir,
+            checkpoint_dir=checkpoint_dir,
+            refresh=True,
+        )
+
+    request_payload = ci._request_payload(
+        theory_name="My Fake Theory",
+        l1_papers=["doi:10.1000/seed"],
+        key_constructs=None,
+        sources=["core"],
+        depth="l2l3",
+        max_l2=200,
+        max_l3=3,
+        exhaustive=True,
+    )
+    key = ci._cache_key(request_payload)
+    state = ci._load_checkpoint_state(checkpoint_dir, key, reset_checkpoints=False)
+    assert state is not None
+    assert state["provider_l3_state"]["core"]["next_l2_index"] == 1
+    assert state["provider_l3_state"]["core"]["budget_remaining"] == 1
+
+    crash_on_l3_second_parent["enabled"] = False
+    resumed = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["doi:10.1000/seed"],
+        sources=["core"],
+        depth="l2l3",
+        max_l3=3,
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    baseline_provider = _CoreBudgetResumeProvider()
+    monkeypatch.setattr(ci, "build_providers", lambda _: [baseline_provider])
+    baseline = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["doi:10.1000/seed"],
+        sources=["core"],
+        depth="l2l3",
+        max_l3=3,
+        cache_dir=Path(tmp_path) / "baseline-cache",
+        checkpoint_dir=Path(tmp_path) / "baseline-checkpoints",
+        refresh=True,
+    )
+
+    assert resumed.citation_data == baseline.citation_data
+    assert resumed.papers_data == baseline.papers_data
+    assert resumed.metadata["provider_stats"]["core"]["l3_edges"] == 3
+    assert "core" in resumed.metadata["checkpoint_stats"]["l3_resumed_providers"]
+
+
 class _ResumeCaptureProvider(ci.CitationProvider):
     name = "resume_capture"
     capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=True)
@@ -2740,3 +2906,90 @@ def test_fresh_pagination_state_is_reused(monkeypatch, tmp_path):
     assert provider.seen_resume_states and provider.seen_resume_states[0] is not None
     assert provider.seen_resume_states[0]["offset"] == 7
     assert result.metadata["checkpoint_stats"]["stale_state_ignored_count"] == 0
+
+
+class _L3ResumeCaptureProvider(ci.CitationProvider):
+    name = "resume_l3_capture"
+    capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=False)
+
+    def __init__(self):
+        self.seen_l3_resume_states = []
+
+    def fetch_seed_metadata(self, l1_papers):
+        return {}
+
+    def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
+        seed = ci.normalize_identifier(l1_papers[0])
+        return (
+            {"resume_l3_capture:l2": {seed}},
+            {
+                "resume_l3_capture:l2": ci.IngestionPaper(
+                    paper_id="resume_l3_capture:l2",
+                    title="L2",
+                    year=2022,
+                )
+            },
+        )
+
+    def fetch_l3_references(
+        self,
+        l2_paper_ids,
+        max_l3=None,
+        resume_state=None,
+        progress_callback=None,
+    ):
+        self.seen_l3_resume_states.append(dict(resume_state or {}))
+        return {}, {}
+
+
+def test_stale_l3_resume_state_is_ignored(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+    provider = _L3ResumeCaptureProvider()
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    request_payload = ci._request_payload(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        key_constructs=None,
+        sources=["resume_l3_capture"],
+        depth="l2l3",
+        max_l2=200,
+        max_l3=None,
+        exhaustive=True,
+    )
+    key = ci._cache_key(request_payload)
+    stale_ts = time.time() - ci._PAGINATION_STATE_MAX_AGE_SECONDS - 10
+    ci._write_checkpoint_state(
+        checkpoint_root=checkpoint_dir,
+        key=key,
+        completed_providers=set(),
+        all_edges={},
+        all_papers={"doi:10.1000/xyz1": ci.IngestionPaper(paper_id="doi:10.1000/xyz1")},
+        provider_stats={},
+        combined_completeness={},
+        provider_l3_state={
+            "resume_l3_capture": {
+                "next_l2_index": 3,
+                "budget_remaining": 7,
+                "updated_at": stale_ts,
+                "edges": {},
+                "papers": {},
+            }
+        },
+    )
+
+    result = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["resume_l3_capture"],
+        depth="l2l3",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    assert provider.seen_l3_resume_states == [{}]
+    stats = result.metadata["checkpoint_stats"]
+    assert stats["l3_stale_state_ignored_count"] == 1
+    assert stats["l3_stale_state_ignored_providers"] == ["resume_l3_capture"]
