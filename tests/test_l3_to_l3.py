@@ -1,6 +1,7 @@
 """Tests for L3-to-L3 edge ingestion expansion and Crossref first-pass L3 discovery."""
 
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import citation_ingestion as ci
@@ -518,3 +519,383 @@ class TestAcceptanceSecondPassNoNewNodes:
 
         assert retained == {"doi:10.1000/a": {"doi:10.1000/b"}}
         assert "doi:10.1000/unknown" not in retained.get("doi:10.1000/a", set())
+
+
+# ── Crash-resume equivalence tests for L3→L3 second pass ────────────
+
+
+class _L3ToL3CrashProvider(ci.CitationProvider):
+    """Fake provider with full first-pass + second-pass support and crash injection."""
+
+    capabilities = ci.ProviderCapabilities(
+        True,
+        True,
+        True,
+        supports_cited_by_traversal=False,
+        supports_l3_outgoing=True,
+    )
+
+    def __init__(
+        self,
+        name: str,
+        l2_prefix: str,
+        l3_refs: dict,
+        l3_outgoing_refs: dict,
+        crash_at_l3_index=None,
+        crash_at_l3_outgoing_index=None,
+    ):
+        self.name = name
+        self.l2_prefix = l2_prefix
+        self.l3_refs = l3_refs
+        self.l3_outgoing_refs = l3_outgoing_refs
+        self.crash_at_l3_index = crash_at_l3_index
+        self.crash_at_l3_outgoing_index = crash_at_l3_outgoing_index
+
+    def fetch_seed_metadata(self, l1_papers):
+        return {
+            l1_papers[0]: ci.IngestionPaper(
+                paper_id=l1_papers[0],
+                title=f"Seed from {self.name}",
+                source_ids={self.name: f"seed-{self.name}"},
+            )
+        }
+
+    def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
+        seed = l1_papers[0]
+        l2_a = f"{self.l2_prefix}:L2A"
+        l2_b = f"{self.l2_prefix}:L2B"
+        return (
+            {l2_a: {seed}, l2_b: {seed}},
+            {
+                l2_a: ci.IngestionPaper(paper_id=l2_a, title=f"{self.name} L2A", year=2020),
+                l2_b: ci.IngestionPaper(paper_id=l2_b, title=f"{self.name} L2B", year=2021),
+            },
+        )
+
+    def fetch_l3_references(
+        self, l2_paper_ids, max_l3=None, resume_state=None, progress_callback=None
+    ):
+        edges = ci._deserialize_edges((resume_state or {}).get("edges"))
+        papers = ci._deserialize_papers((resume_state or {}).get("papers"))
+
+        start_index_raw = (resume_state or {}).get("next_l2_index")
+        try:
+            start_index = int(start_index_raw) if start_index_raw is not None else 0
+        except (TypeError, ValueError):
+            start_index = 0
+
+        for idx in range(start_index, len(l2_paper_ids)):
+            if self.crash_at_l3_index is not None and idx == self.crash_at_l3_index:
+                raise RuntimeError(f"simulated l3 crash in {self.name}")
+
+            pid = l2_paper_ids[idx]
+            for ref_id in self.l3_refs.get(pid, []):
+                edges.setdefault(pid, set()).add(ref_id)
+                papers.setdefault(
+                    ref_id,
+                    ci.IngestionPaper(
+                        paper_id=ref_id,
+                        title=f"Ref {ref_id}",
+                        doi=ref_id.split(":", 1)[1] if ref_id.startswith("doi:") else None,
+                    ),
+                )
+
+            if progress_callback:
+                progress_callback(
+                    {
+                        "status": "in_progress",
+                        "next_l2_index": idx + 1,
+                        "budget_remaining": None,
+                        "edges": ci._serialize_edges(edges),
+                        "papers": ci._serialize_papers(papers),
+                        "updated_at": time.time(),
+                    }
+                )
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "status": "complete",
+                    "next_l2_index": len(l2_paper_ids),
+                    "budget_remaining": None,
+                    "edges": ci._serialize_edges(edges),
+                    "papers": ci._serialize_papers(papers),
+                    "updated_at": time.time(),
+                }
+            )
+
+        return edges, papers
+
+    def fetch_l3_outgoing_references(
+        self, l3_paper_ids, max_edges=None, resume_state=None, progress_callback=None
+    ):
+        edges = ci._deserialize_edges((resume_state or {}).get("edges"))
+        papers = ci._deserialize_papers((resume_state or {}).get("papers"))
+
+        start_index_raw = (resume_state or {}).get("next_l3_parent_index")
+        try:
+            start_index = int(start_index_raw) if start_index_raw is not None else 0
+        except (TypeError, ValueError):
+            start_index = 0
+
+        for idx in range(start_index, len(l3_paper_ids)):
+            if self.crash_at_l3_outgoing_index is not None and idx == self.crash_at_l3_outgoing_index:
+                raise RuntimeError(f"simulated l3-to-l3 crash in {self.name}")
+
+            pid = l3_paper_ids[idx]
+            for target in self.l3_outgoing_refs.get(pid, []):
+                edges.setdefault(pid, set()).add(target)
+                papers.setdefault(
+                    target,
+                    ci.IngestionPaper(paper_id=target, title=f"Outgoing {target}"),
+                )
+
+            if progress_callback:
+                progress_callback(
+                    {
+                        "status": "in_progress",
+                        "next_l3_parent_index": idx + 1,
+                        "edges": ci._serialize_edges(edges),
+                        "papers": ci._serialize_papers(papers),
+                        "updated_at": time.time(),
+                    }
+                )
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "status": "complete",
+                    "next_l3_parent_index": len(l3_paper_ids),
+                    "edges": ci._serialize_edges(edges),
+                    "papers": ci._serialize_papers(papers),
+                    "updated_at": time.time(),
+                }
+            )
+
+        return edges, papers
+
+
+def _make_l3_to_l3_refs():
+    """Shared L3 and L3→L3 reference fixtures for crash-resume tests."""
+    oa_l3_refs = {
+        "openalex:L2A": ["doi:10.1000/shared-l3", "doi:10.1000/oa-l3a"],
+        "openalex:L2B": ["doi:10.1000/oa-l3b"],
+    }
+    s2_l3_refs = {
+        "semantic_scholar:L2A": ["doi:10.1000/shared-l3", "doi:10.1000/s2-l3a"],
+        "semantic_scholar:L2B": ["doi:10.1000/s2-l3b"],
+    }
+    # L3→L3 outgoing references: only references between existing L3 members
+    # should survive the second-pass filter.
+    oa_outgoing = {
+        "doi:10.1000/shared-l3": ["doi:10.1000/oa-l3a"],
+        "doi:10.1000/oa-l3a": ["doi:10.1000/oa-l3b", "doi:10.1000/external-l4"],
+    }
+    s2_outgoing = {
+        "doi:10.1000/s2-l3a": ["doi:10.1000/shared-l3"],
+        "doi:10.1000/s2-l3b": ["doi:10.1000/s2-l3a", "doi:10.1000/another-l4"],
+    }
+    return oa_l3_refs, s2_l3_refs, oa_outgoing, s2_outgoing
+
+
+def test_l3_to_l3_crash_resume_matches_baseline(monkeypatch, tmp_path):
+    """Crash mid-second-pass in semantic_scholar, resume, verify equivalence with baseline."""
+    oa_l3_refs, s2_l3_refs, oa_outgoing, s2_outgoing = _make_l3_to_l3_refs()
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+
+    # ─── Phase 1: crash run ────────────────────────────────────────────
+    first_oa = _L3ToL3CrashProvider("openalex", "openalex", oa_l3_refs, oa_outgoing)
+    first_s2 = _L3ToL3CrashProvider(
+        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+        crash_at_l3_outgoing_index=1,
+    )
+    monkeypatch.setattr(ci, "build_providers", lambda _: [first_oa, first_s2])
+
+    with pytest.raises(RuntimeError, match="simulated l3-to-l3 crash in semantic_scholar"):
+        ci.ingest_from_internet(
+            theory_name="L3 Crash Theory",
+            l1_papers=["10.1000/xyz1"],
+            sources=["openalex", "semantic_scholar"],
+            depth="l2l3",
+            cache_dir=cache_dir,
+            checkpoint_dir=checkpoint_dir,
+            refresh=True,
+        )
+
+    # ─── Phase 2: resume run ──────────────────────────────────────────
+    resumed_oa = _L3ToL3CrashProvider("openalex", "openalex", oa_l3_refs, oa_outgoing)
+    resumed_s2 = _L3ToL3CrashProvider(
+        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+    )
+    monkeypatch.setattr(ci, "build_providers", lambda _: [resumed_oa, resumed_s2])
+
+    resumed = ci.ingest_from_internet(
+        theory_name="L3 Crash Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["openalex", "semantic_scholar"],
+        depth="l2l3",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    # ─── Phase 3: baseline run (no crashes, clean state) ──────────────
+    baseline_oa = _L3ToL3CrashProvider("openalex", "openalex", oa_l3_refs, oa_outgoing)
+    baseline_s2 = _L3ToL3CrashProvider(
+        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+    )
+    monkeypatch.setattr(ci, "build_providers", lambda _: [baseline_oa, baseline_s2])
+
+    baseline = ci.ingest_from_internet(
+        theory_name="L3 Crash Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["openalex", "semantic_scholar"],
+        depth="l2l3",
+        cache_dir=Path(tmp_path) / "baseline-cache",
+        checkpoint_dir=Path(tmp_path) / "baseline-checkpoints",
+        refresh=True,
+    )
+
+    # ─── Assertions ───────────────────────────────────────────────────
+    assert resumed.citation_data == baseline.citation_data
+    assert resumed.papers_data == baseline.papers_data
+    assert resumed.metadata["provider_stats"] == baseline.metadata["provider_stats"]
+    assert "semantic_scholar" in resumed.metadata["checkpoint_stats"]["l3_to_l3_resumed_providers"]
+
+
+def test_l3_to_l3_crash_at_first_provider_resume(monkeypatch, tmp_path):
+    """Crash openalex (first provider) mid-second-pass, verify resume equivalence."""
+    oa_l3_refs, s2_l3_refs, oa_outgoing, s2_outgoing = _make_l3_to_l3_refs()
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+
+    # ─── Crash run: openalex crashes mid-second-pass ──────────────────
+    first_oa = _L3ToL3CrashProvider(
+        "openalex", "openalex", oa_l3_refs, oa_outgoing,
+        crash_at_l3_outgoing_index=1,
+    )
+    first_s2 = _L3ToL3CrashProvider(
+        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+    )
+    monkeypatch.setattr(ci, "build_providers", lambda _: [first_oa, first_s2])
+
+    with pytest.raises(RuntimeError, match="simulated l3-to-l3 crash in openalex"):
+        ci.ingest_from_internet(
+            theory_name="L3 Crash Theory",
+            l1_papers=["10.1000/xyz1"],
+            sources=["openalex", "semantic_scholar"],
+            depth="l2l3",
+            cache_dir=cache_dir,
+            checkpoint_dir=checkpoint_dir,
+            refresh=True,
+        )
+
+    # ─── Resume run ──────────────────────────────────────────────────
+    resumed_oa = _L3ToL3CrashProvider("openalex", "openalex", oa_l3_refs, oa_outgoing)
+    resumed_s2 = _L3ToL3CrashProvider(
+        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+    )
+    monkeypatch.setattr(ci, "build_providers", lambda _: [resumed_oa, resumed_s2])
+
+    resumed = ci.ingest_from_internet(
+        theory_name="L3 Crash Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["openalex", "semantic_scholar"],
+        depth="l2l3",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    # ─── Baseline run ────────────────────────────────────────────────
+    baseline_oa = _L3ToL3CrashProvider("openalex", "openalex", oa_l3_refs, oa_outgoing)
+    baseline_s2 = _L3ToL3CrashProvider(
+        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+    )
+    monkeypatch.setattr(ci, "build_providers", lambda _: [baseline_oa, baseline_s2])
+
+    baseline = ci.ingest_from_internet(
+        theory_name="L3 Crash Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["openalex", "semantic_scholar"],
+        depth="l2l3",
+        cache_dir=Path(tmp_path) / "baseline-cache",
+        checkpoint_dir=Path(tmp_path) / "baseline-checkpoints",
+        refresh=True,
+    )
+
+    assert resumed.citation_data == baseline.citation_data
+    assert resumed.papers_data == baseline.papers_data
+    assert "openalex" in resumed.metadata["checkpoint_stats"]["l3_to_l3_resumed_providers"]
+
+
+def test_l3_to_l3_no_l4_nodes_after_crash_resume(monkeypatch, tmp_path):
+    """After crash-resume, papers_data must not contain any IDs absent from baseline."""
+    oa_l3_refs, s2_l3_refs, oa_outgoing, s2_outgoing = _make_l3_to_l3_refs()
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+
+    # ─── Crash run ────────────────────────────────────────────────────
+    first_oa = _L3ToL3CrashProvider("openalex", "openalex", oa_l3_refs, oa_outgoing)
+    first_s2 = _L3ToL3CrashProvider(
+        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+        crash_at_l3_outgoing_index=0,
+    )
+    monkeypatch.setattr(ci, "build_providers", lambda _: [first_oa, first_s2])
+
+    with pytest.raises(RuntimeError, match="simulated l3-to-l3 crash in semantic_scholar"):
+        ci.ingest_from_internet(
+            theory_name="L3 Crash Theory",
+            l1_papers=["10.1000/xyz1"],
+            sources=["openalex", "semantic_scholar"],
+            depth="l2l3",
+            cache_dir=cache_dir,
+            checkpoint_dir=checkpoint_dir,
+            refresh=True,
+        )
+
+    # ─── Resume run ──────────────────────────────────────────────────
+    resumed_oa = _L3ToL3CrashProvider("openalex", "openalex", oa_l3_refs, oa_outgoing)
+    resumed_s2 = _L3ToL3CrashProvider(
+        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+    )
+    monkeypatch.setattr(ci, "build_providers", lambda _: [resumed_oa, resumed_s2])
+
+    resumed = ci.ingest_from_internet(
+        theory_name="L3 Crash Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["openalex", "semantic_scholar"],
+        depth="l2l3",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    # ─── Baseline run ────────────────────────────────────────────────
+    baseline_oa = _L3ToL3CrashProvider("openalex", "openalex", oa_l3_refs, oa_outgoing)
+    baseline_s2 = _L3ToL3CrashProvider(
+        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+    )
+    monkeypatch.setattr(ci, "build_providers", lambda _: [baseline_oa, baseline_s2])
+
+    baseline = ci.ingest_from_internet(
+        theory_name="L3 Crash Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["openalex", "semantic_scholar"],
+        depth="l2l3",
+        cache_dir=Path(tmp_path) / "baseline-cache",
+        checkpoint_dir=Path(tmp_path) / "baseline-checkpoints",
+        refresh=True,
+    )
+
+    # No L4 nodes should appear — resumed papers_data keys ⊆ baseline keys
+    assert set(resumed.papers_data.keys()) == set(baseline.papers_data.keys())
+    # External L4 references should not be in citation_data targets
+    all_targets = set()
+    for targets in resumed.citation_data.values():
+        all_targets.update(targets)
+    baseline_targets = set()
+    for targets in baseline.citation_data.values():
+        baseline_targets.update(targets)
+    assert all_targets == baseline_targets

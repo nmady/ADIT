@@ -8,7 +8,7 @@ ADIT uses machine learning to identify papers that subscribe to a specific theor
 
 ## Key Components
 
-- **Theory Ecosystem Construction**: Builds multi-level citation networks (L1: originating papers, L2: citing papers, L3: cited papers).
+- **Theory Ecosystem Construction**: Builds multi-level citation networks (L1: originating papers, L2: citing papers, L3: cited papers) with L3→L3 inter-reference edges.
 - **Feature Extraction**: Uses text embeddings, citation metrics, and structural features.
 - **Machine Learning Classification**: Predicts which papers contribute to the theory using modern ML models.
 
@@ -112,10 +112,10 @@ If `labels_data` is omitted, the CLI extracts features and skips training/predic
 - Semantic Scholar runs without authentication by default, but setting `SEMANTIC_SCHOLAR_API_KEY` can improve rate limits and live-ingestion reliability.
 - CORE runs unauthenticated by default, but using `CORE_API_KEY` increases rate limits and improves access.
 - Results from multiple providers are normalized and deduplicated before building the citation ecosystem.
-- `--depth l2` retrieves direct citers of the L1 papers; `--depth l2l3` also retrieves references from L2 papers to populate L3.
+- `--depth l2` retrieves direct citers of the L1 papers; `--depth l2l3` also retrieves references from L2 papers to populate L3, then runs a second pass scanning L3 outgoing references to discover L3→L3 edges (no L4 nodes are materialized).
 - L2 contract: every admitted L2 paper must cite at least one L1 seed paper.
 - Title or theory-name matches alone are not sufficient for L2 inclusion.
-- Crossref is used for metadata enrichment of accepted papers and seed DOIs, not for L2 graph discovery.
+- Crossref is used for metadata enrichment of accepted papers and seed DOIs, not for L2 graph discovery. In L3 mode, Crossref performs DOI-gated reference expansion (first pass) and DOI-gated outgoing-edge discovery (second pass).
 - `--cache-dir` stores cached ingestion results so repeated runs can reuse prior retrieval work.
 - `--checkpoint-dir` stores provider-atomic progress snapshots for resumable ingestion (defaults to `<cache-dir>/checkpoints`).
 - `--checkpoint-staleness-seconds` optionally overrides the resume-state staleness window (default: 21600 seconds / 6 hours).
@@ -123,8 +123,8 @@ If `labels_data` is omitted, the CLI extracts features and skips training/predic
 - `--refresh-cache` forces a fresh internet retrieval instead of reusing cached results.
 - Checkpoint semantics (Phase 1): completion is persisted after each provider completes; resumed runs skip completed providers and continue remaining providers.
 - Phase 2 adds L2 mid-pagination resume for OpenAlex (cursor) and Semantic Scholar (offset), so interrupted cited-by traversal can continue from saved per-seed progress.
-- Phase 3.1 extends L3 resume to CORE, so interrupted L3 expansion can continue from saved provider progress for OpenAlex, Semantic Scholar, and CORE.
-- Crossref remains no-op for L3 by contract.
+- Phase 3.1 extends L3 resume to CORE, so interrupted L3 expansion can continue from saved provider progress for OpenAlex, Semantic Scholar, CORE, and Crossref.
+- After the first pass completes, a second pass scans L3 outgoing references across all providers that support it (OpenAlex, Semantic Scholar, Crossref, CORE). Only edges whose target is already an L3 member are retained; no L4 nodes are created.
 - Per-seed pagination progress includes a staleness guard (6-hour window by default); stale progress is ignored and the seed is safely refetched.
 - Provider L3 resume progress uses the same staleness guard policy; stale L3 state is ignored and rebuilt safely.
 - `--only-ingest` runs ingestion and exits before feature extraction/training.
@@ -300,6 +300,9 @@ Ingestion metadata also includes `checkpoint_stats`:
 - `l3_stale_state_ignored_count` and `l3_stale_state_ignored_providers` report stale provider-level L3 checkpoints that were discarded before execution.
 - `l3_resumed_providers` reports providers resumed from persisted L3 progress in the current run.
 - `l3_resumed_parent_count` reports how many L2 parent positions were skipped because L3 resume state was restored.
+- `l3_to_l3_edges_added` reports the total number of L3→L3 edges retained after second-pass filtering.
+- `l3_to_l3_parent_scanned_count` reports how many L3 parents were scanned for outgoing references.
+- `l3_to_l3_resumed_providers` reports providers whose second-pass L3→L3 traversal was resumed from checkpoint.
 
 ## Config reference
 
@@ -322,7 +325,7 @@ A compact reference for keys accepted in config files (and equivalent CLI flags)
 - **reset_checkpoints**: (bool, default: false) — If true, clear checkpoint state for the current request before ingestion starts.
 - **refresh_cache**: (bool, default: false) — If true, ignore cached ingestion and force fresh retrieval.
 - **max_l2**: (int, default: 200) — Per-provider cap on L2 retrieval. Admitted L2 papers must explicitly cite an L1 seed.
-- **max_l3**: (int or null, default: null/unlimited) — Optional per-provider cap on L3 reference edges retrieved when expanding L2 → L3. Omit or set to null for exhaustive L3 retrieval.
+- **max_l3**: (int or null, default: null/unlimited) — Optional per-provider cap on L3 reference edges retrieved when expanding L2 → L3, and also applied to second-pass L3→L3 edge retrieval. Omit or set to null for exhaustive retrieval.
 - **save_ingested_citation_data**: (path, optional) — Persist normalized `citation_data.json` produced by online ingestion.
 - **save_ingested_papers_data**: (path, optional) — Persist normalized `papers_data.json` produced by online ingestion.
 - **output_features**: (path, optional) — CSV path to write extracted features.
@@ -331,7 +334,7 @@ A compact reference for keys accepted in config files (and equivalent CLI flags)
 Notes:
 - Many config keys accept either YAML lists (recommended for examples) or comma-separated CLI strings — the CLI normalizes both formats.
 - `max_l2`/`max_l3` are applied per-provider; the final L2/L3 coverage is the union of provider outputs after deduplication.
-- Crossref contributes metadata enrichment for accepted papers, but does not add L2 graph nodes or edges.
+- Crossref contributes metadata enrichment for accepted papers, but does not add L2 graph nodes or edges. In L3 mode, Crossref performs DOI-gated reference expansion and outgoing-edge discovery.
 - Use `year: null` in `papers_data.json` to indicate unknown publication year; ADIT emits `pub_year` as `NaN` and imputes numeric features at training time.
 
 ## Adaptation Notes
@@ -346,6 +349,7 @@ Current internet-ingestion support includes:
 - OpenAlex
 - Semantic Scholar
 - Crossref
+- CORE
 
 Planned future adapters may include:
 - Dimensions
