@@ -26,6 +26,7 @@ class ProviderCapabilities:
     supports_reference_expansion: bool
     supports_citation_counts: bool
     supports_cited_by_traversal: bool = False
+    supports_l3_outgoing: bool = False
 
 
 @dataclass
@@ -100,6 +101,22 @@ class CitationProvider:
             ``"complete"``, ``"partial"``, ``"failed"``, or ``"skipped"``.
         """
         raise NotImplementedError
+
+    def fetch_l3_outgoing_references(
+        self,
+        l3_paper_ids: Sequence[str],
+        max_edges: Optional[int] = None,
+        resume_state: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
+        """Return outgoing references from L3 papers for L3-to-L3 edge discovery.
+
+        Default no-op for providers that do not declare
+        ``supports_l3_outgoing``.  Edges and paper stubs returned here will
+        be filtered by the orchestrator to retain only targets already present
+        in the L3 membership set.
+        """
+        return {}, {}
 
 
 _CACHE_SCHEMA_VERSION = 5
@@ -654,6 +671,8 @@ def _write_checkpoint_state(
     combined_completeness: Dict[str, Dict[str, object]],
     provider_pagination_state: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
     provider_l3_state: Optional[Dict[str, Dict[str, Any]]] = None,
+    l3_to_l3_state: Optional[Dict[str, Dict[str, Any]]] = None,
+    ingestion_phase: str = "l2_to_l3",
 ) -> None:
     """Persist the current ingestion snapshot used for crash-safe resume."""
     checkpoint_path = _checkpoint_file(checkpoint_root, key)
@@ -669,6 +688,8 @@ def _write_checkpoint_state(
             provider_pagination_state or {}
         ),
         "provider_l3_state": _serialize_provider_l3_state(provider_l3_state or {}),
+        "l3_to_l3_state": _serialize_provider_l3_state(l3_to_l3_state or {}),
+        "ingestion_phase": ingestion_phase,
     }
     _write_json_atomic(checkpoint_path, payload)
 
@@ -1196,7 +1217,9 @@ def _build_metadata(
 
 class OpenAlexProvider(CitationProvider):
     name = "openalex"
-    capabilities = ProviderCapabilities(True, True, True, supports_cited_by_traversal=True)
+    capabilities = ProviderCapabilities(
+        True, True, True, supports_cited_by_traversal=True, supports_l3_outgoing=True
+    )
 
     def _collect_l3_reference_edges(
         self,
@@ -1492,10 +1515,91 @@ class OpenAlexProvider(CitationProvider):
 
         return edges, papers
 
+    def fetch_l3_outgoing_references(
+        self,
+        l3_paper_ids: Sequence[str],
+        max_edges: Optional[int] = None,
+        resume_state: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
+        """Fetch outgoing references from L3 papers for L3-to-L3 edge discovery."""
+        edges = _deserialize_edges((resume_state or {}).get("edges"))
+        papers = _deserialize_papers((resume_state or {}).get("papers"))
+
+        start_index_raw = (resume_state or {}).get("next_l3_parent_index")
+        try:
+            start_index = int(start_index_raw) if start_index_raw is not None else 0
+        except (TypeError, ValueError):
+            start_index = 0
+
+        if max_edges is None:
+            budget = None
+        elif (resume_state or {}).get("budget_remaining") is not None:
+            try:
+                budget = max(0, int((resume_state or {}).get("budget_remaining")))
+            except (TypeError, ValueError):
+                budget = max(0, max_edges)
+        else:
+            budget = max(0, max_edges)
+
+        for idx in range(start_index, len(l3_paper_ids)):
+            pid = l3_paper_ids[idx]
+            if budget is not None and budget <= 0:
+                break
+            if not pid.startswith("openalex:"):
+                continue
+
+            openalex_token = pid.split(":", 1)[1]
+            url = f"https://api.openalex.org/works/{openalex_token}?select=referenced_works"
+            payload = _safe_get(url, provider=self.name)
+            if not payload:
+                continue
+
+            refs = payload.get("referenced_works", []) or []
+            for ref in refs:
+                if budget is not None and budget <= 0:
+                    break
+                ref_id = normalize_identifier(ref, source=self.name)
+                if not ref_id:
+                    continue
+                edges.setdefault(pid, set()).add(ref_id)
+                papers.setdefault(ref_id, _openalex_reference_stub(ref_id, ref))
+                if budget is not None:
+                    budget -= 1
+
+            if progress_callback:
+                progress_callback(
+                    {
+                        "status": "in_progress",
+                        "next_l3_parent_index": idx + 1,
+                        "budget_remaining": budget,
+                        "edges": _serialize_edges(edges),
+                        "papers": _serialize_papers(papers),
+                        "updated_at": time.time(),
+                    }
+                )
+            time.sleep(0.03)
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "status": "complete",
+                    "next_l3_parent_index": len(l3_paper_ids),
+                    "budget_remaining": budget,
+                    "edges": _serialize_edges(edges),
+                    "papers": _serialize_papers(papers),
+                    "updated_at": time.time(),
+                }
+            )
+
+        return edges, papers
+
 
 class SemanticScholarProvider(CitationProvider):
     name = "semantic_scholar"
-    capabilities = ProviderCapabilities(True, True, True, supports_cited_by_traversal=True)
+    capabilities = ProviderCapabilities(
+        True, True, True, supports_cited_by_traversal=True, supports_l3_outgoing=True
+    )
 
     def __init__(self, api_key: Optional[str] = None):
         """Initialize provider with optional API key for higher rate limits."""
@@ -1754,10 +1858,92 @@ class SemanticScholarProvider(CitationProvider):
 
         return edges, papers
 
+    def fetch_l3_outgoing_references(
+        self,
+        l3_paper_ids: Sequence[str],
+        max_edges: Optional[int] = None,
+        resume_state: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
+        """Fetch outgoing references from L3 papers for L3-to-L3 edge discovery."""
+        edges = _deserialize_edges((resume_state or {}).get("edges"))
+        papers = _deserialize_papers((resume_state or {}).get("papers"))
+
+        start_index_raw = (resume_state or {}).get("next_l3_parent_index")
+        try:
+            start_index = int(start_index_raw) if start_index_raw is not None else 0
+        except (TypeError, ValueError):
+            start_index = 0
+
+        if max_edges is None:
+            budget = None
+        elif (resume_state or {}).get("budget_remaining") is not None:
+            try:
+                budget = max(0, int((resume_state or {}).get("budget_remaining")))
+            except (TypeError, ValueError):
+                budget = max(0, max_edges)
+        else:
+            budget = max(0, max_edges)
+
+        for idx in range(start_index, len(l3_paper_ids)):
+            pid = l3_paper_ids[idx]
+            if budget is not None and budget <= 0:
+                break
+            if not pid.startswith("semantic_scholar:"):
+                continue
+
+            token = pid.split(":", 1)[1]
+            url = (
+                "https://api.semanticscholar.org/graph/v1/paper/"
+                f"{token}?fields=references.paperId,references.externalIds"
+            )
+            payload = _safe_get(url, provider=self.name, headers=self._headers())
+            if not payload:
+                continue
+
+            for ref in payload.get("references", []) or []:
+                if budget is not None and budget <= 0:
+                    break
+                paper = _paper_from_semantic_reference(ref)
+                if not paper:
+                    continue
+                ref_id = paper.paper_id
+                edges.setdefault(pid, set()).add(ref_id)
+                papers.setdefault(ref_id, paper)
+                if budget is not None:
+                    budget -= 1
+
+            if progress_callback:
+                progress_callback(
+                    {
+                        "status": "in_progress",
+                        "next_l3_parent_index": idx + 1,
+                        "budget_remaining": budget,
+                        "edges": _serialize_edges(edges),
+                        "papers": _serialize_papers(papers),
+                        "updated_at": time.time(),
+                    }
+                )
+            time.sleep(0.05)
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "status": "complete",
+                    "next_l3_parent_index": len(l3_paper_ids),
+                    "budget_remaining": budget,
+                    "edges": _serialize_edges(edges),
+                    "papers": _serialize_papers(papers),
+                    "updated_at": time.time(),
+                }
+            )
+
+        return edges, papers
+
 
 class CrossrefProvider(CitationProvider):
     name = "crossref"
-    capabilities = ProviderCapabilities(True, False, False)
+    capabilities = ProviderCapabilities(True, True, False, supports_l3_outgoing=True)
 
     def fetch_seed_metadata(
         self,
@@ -1810,14 +1996,212 @@ class CrossrefProvider(CitationProvider):
         self,
         l2_paper_ids: Sequence[str],
         max_l3: Optional[int] = None,
+        resume_state: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
-        """Crossref does not provide graph-safe reference expansion in this pipeline."""
-        return {}, {}
+        """Expand L2 papers to L3 references via Crossref DOI-based lookups.
+
+        Only references that themselves carry a DOI are admitted as new L3
+        nodes (DOI-gated).  References without DOIs are silently dropped.
+        """
+        edges = _deserialize_edges((resume_state or {}).get("edges"))
+        papers = _deserialize_papers((resume_state or {}).get("papers"))
+
+        start_index_raw = (resume_state or {}).get("next_l2_index")
+        try:
+            start_index = int(start_index_raw) if start_index_raw is not None else 0
+        except (TypeError, ValueError):
+            start_index = 0
+
+        if max_l3 is None:
+            budget = None
+        elif (resume_state or {}).get("budget_remaining") is not None:
+            try:
+                budget = max(0, int((resume_state or {}).get("budget_remaining")))
+            except (TypeError, ValueError):
+                budget = max(0, max_l3)
+        else:
+            budget = max(0, max_l3)
+
+        for idx in range(start_index, len(l2_paper_ids)):
+            pid = l2_paper_ids[idx]
+            if budget is not None and budget <= 0:
+                break
+
+            doi = _doi_from_identifier(pid)
+            if not doi:
+                continue
+
+            payload = _safe_get(
+                f"https://api.crossref.org/works/{urllib.parse.quote(doi, safe='')}",
+                provider=self.name,
+            )
+            item = (payload or {}).get("message")
+            if not item:
+                continue
+
+            for ref in item.get("reference", []) or []:
+                if budget is not None and budget <= 0:
+                    break
+                ref_doi = ref.get("DOI")
+                if not ref_doi:
+                    continue
+                ref_id = normalize_identifier(ref_doi)
+                if not ref_id:
+                    continue
+                edges.setdefault(pid, set()).add(ref_id)
+                papers.setdefault(
+                    ref_id,
+                    IngestionPaper(
+                        paper_id=ref_id,
+                        title=ref.get("article-title") or "",
+                        year=(
+                            int(ref["year"])
+                            if ref.get("year") and str(ref["year"]).isdigit()
+                            else None
+                        ),
+                        doi=ref_doi.lower(),
+                        source_ids={self.name: ref_doi.lower()},
+                    ),
+                )
+                if budget is not None:
+                    budget -= 1
+
+            if progress_callback:
+                progress_callback(
+                    {
+                        "status": "in_progress",
+                        "next_l2_index": idx + 1,
+                        "budget_remaining": budget,
+                        "edges": _serialize_edges(edges),
+                        "papers": _serialize_papers(papers),
+                        "updated_at": time.time(),
+                    }
+                )
+            time.sleep(0.03)
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "status": "complete",
+                    "next_l2_index": len(l2_paper_ids),
+                    "budget_remaining": budget,
+                    "edges": _serialize_edges(edges),
+                    "papers": _serialize_papers(papers),
+                    "updated_at": time.time(),
+                }
+            )
+
+        return edges, papers
+
+    def fetch_l3_outgoing_references(
+        self,
+        l3_paper_ids: Sequence[str],
+        max_edges: Optional[int] = None,
+        resume_state: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
+        """Fetch outgoing references from L3 papers for L3-to-L3 edge discovery.
+
+        Reuses the Crossref /works/{doi} API; only L3 parents with DOIs are
+        queried.
+        """
+        edges = _deserialize_edges((resume_state or {}).get("edges"))
+        papers = _deserialize_papers((resume_state or {}).get("papers"))
+
+        start_index_raw = (resume_state or {}).get("next_l3_parent_index")
+        try:
+            start_index = int(start_index_raw) if start_index_raw is not None else 0
+        except (TypeError, ValueError):
+            start_index = 0
+
+        if max_edges is None:
+            budget = None
+        elif (resume_state or {}).get("budget_remaining") is not None:
+            try:
+                budget = max(0, int((resume_state or {}).get("budget_remaining")))
+            except (TypeError, ValueError):
+                budget = max(0, max_edges)
+        else:
+            budget = max(0, max_edges)
+
+        for idx in range(start_index, len(l3_paper_ids)):
+            pid = l3_paper_ids[idx]
+            if budget is not None and budget <= 0:
+                break
+
+            doi = _doi_from_identifier(pid)
+            if not doi:
+                continue
+
+            payload = _safe_get(
+                f"https://api.crossref.org/works/{urllib.parse.quote(doi, safe='')}",
+                provider=self.name,
+            )
+            item = (payload or {}).get("message")
+            if not item:
+                continue
+
+            for ref in item.get("reference", []) or []:
+                if budget is not None and budget <= 0:
+                    break
+                ref_doi = ref.get("DOI")
+                if not ref_doi:
+                    continue
+                ref_id = normalize_identifier(ref_doi)
+                if not ref_id:
+                    continue
+                edges.setdefault(pid, set()).add(ref_id)
+                papers.setdefault(
+                    ref_id,
+                    IngestionPaper(
+                        paper_id=ref_id,
+                        title=ref.get("article-title") or "",
+                        year=(
+                            int(ref["year"])
+                            if ref.get("year") and str(ref["year"]).isdigit()
+                            else None
+                        ),
+                        doi=ref_doi.lower(),
+                        source_ids={self.name: ref_doi.lower()},
+                    ),
+                )
+                if budget is not None:
+                    budget -= 1
+
+            if progress_callback:
+                progress_callback(
+                    {
+                        "status": "in_progress",
+                        "next_l3_parent_index": idx + 1,
+                        "budget_remaining": budget,
+                        "edges": _serialize_edges(edges),
+                        "papers": _serialize_papers(papers),
+                        "updated_at": time.time(),
+                    }
+                )
+            time.sleep(0.03)
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "status": "complete",
+                    "next_l3_parent_index": len(l3_paper_ids),
+                    "budget_remaining": budget,
+                    "edges": _serialize_edges(edges),
+                    "papers": _serialize_papers(papers),
+                    "updated_at": time.time(),
+                }
+            )
+
+        return edges, papers
 
 
 class CoreProvider(CitationProvider):
     name = "core"
-    capabilities = ProviderCapabilities(True, True, True, supports_cited_by_traversal=False)
+    capabilities = ProviderCapabilities(
+        True, True, True, supports_cited_by_traversal=False, supports_l3_outgoing=True
+    )
 
     def __init__(self, api_key: Optional[str] = None):
         """Initialize provider with optional CORE API key."""
@@ -2017,6 +2401,82 @@ class CoreProvider(CitationProvider):
 
         return edges, papers
 
+    def fetch_l3_outgoing_references(
+        self,
+        l3_paper_ids: Sequence[str],
+        max_edges: Optional[int] = None,
+        resume_state: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]:
+        """Fetch outgoing references from L3 papers for L3-to-L3 edge discovery."""
+        edges = _deserialize_edges((resume_state or {}).get("edges"))
+        papers = _deserialize_papers((resume_state or {}).get("papers"))
+
+        start_index_raw = (resume_state or {}).get("next_l3_parent_index")
+        try:
+            start_index = int(start_index_raw) if start_index_raw is not None else 0
+        except (TypeError, ValueError):
+            start_index = 0
+
+        if max_edges is None:
+            budget = None
+        elif (resume_state or {}).get("budget_remaining") is not None:
+            try:
+                budget = max(0, int((resume_state or {}).get("budget_remaining")))
+            except (TypeError, ValueError):
+                budget = max(0, max_edges)
+        else:
+            budget = max(0, max_edges)
+
+        for idx in range(start_index, len(l3_paper_ids)):
+            pid = l3_paper_ids[idx]
+            if budget is not None and budget <= 0:
+                break
+
+            payload = self._lookup_work(pid)
+            if not payload:
+                continue
+
+            for ref in payload.get("references") or []:
+                if budget is not None and budget <= 0:
+                    break
+
+                paper = self._reference_to_paper(ref)
+                if not paper:
+                    continue
+
+                edges.setdefault(pid, set()).add(paper.paper_id)
+                papers.setdefault(paper.paper_id, paper)
+                if budget is not None:
+                    budget -= 1
+
+            if progress_callback:
+                progress_callback(
+                    {
+                        "status": "in_progress",
+                        "next_l3_parent_index": idx + 1,
+                        "budget_remaining": budget,
+                        "edges": _serialize_edges(edges),
+                        "papers": _serialize_papers(papers),
+                        "updated_at": time.time(),
+                    }
+                )
+            time.sleep(0.03)
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "status": "complete",
+                    "next_l3_parent_index": len(l3_paper_ids),
+                    "budget_remaining": budget,
+                    "edges": _serialize_edges(edges),
+                    "papers": _serialize_papers(papers),
+                    "updated_at": time.time(),
+                }
+            )
+
+        return edges, papers
+
 
 _PROVIDER_REGISTRY = {
     "openalex": OpenAlexProvider,
@@ -2151,6 +2611,9 @@ def ingest_from_internet(
         "l3_stale_state_ignored_providers": [],
         "l3_resumed_providers": [],
         "l3_resumed_parent_count": 0,
+        "l3_to_l3_edges_added": 0,
+        "l3_to_l3_parent_scanned_count": 0,
+        "l3_to_l3_resumed_providers": [],
     }
 
     cached = _load_cached_result(cache_root, key, refresh)
@@ -2175,6 +2638,9 @@ def ingest_from_internet(
                 "l3_stale_state_ignored_providers": [],
                 "l3_resumed_providers": [],
                 "l3_resumed_parent_count": 0,
+                "l3_to_l3_edges_added": 0,
+                "l3_to_l3_parent_scanned_count": 0,
+                "l3_to_l3_resumed_providers": [],
             }
         )
         metadata["checkpoint_stats"] = merged_stats
@@ -2189,6 +2655,8 @@ def ingest_from_internet(
     completed_providers: Set[str] = set()
     provider_pagination_state: Dict[str, Dict[str, Dict[str, Any]]] = {}
     provider_l3_state: Dict[str, Dict[str, Any]] = {}
+    l3_to_l3_state: Dict[str, Dict[str, Any]] = {}
+    ingestion_phase: str = "l2_to_l3"
 
     checkpoint_root = checkpoint_dir or (cache_root / "checkpoints")
     effective_staleness_seconds = (
@@ -2222,6 +2690,10 @@ def ingest_from_internet(
         provider_l3_state = _deserialize_provider_l3_state(
             checkpoint_state.get("provider_l3_state")
         )
+        l3_to_l3_state = _deserialize_provider_l3_state(checkpoint_state.get("l3_to_l3_state"))
+        raw_phase = checkpoint_state.get("ingestion_phase")
+        if isinstance(raw_phase, str) and raw_phase in ("l2_to_l3", "l3_to_l3"):
+            ingestion_phase = raw_phase
 
         _vprint(f"[ADIT] Loaded checkpoint: {len(completed_providers)} completed provider(s)")
 
@@ -2236,6 +2708,8 @@ def ingest_from_internet(
             combined_completeness,
             provider_pagination_state,
             provider_l3_state,
+            l3_to_l3_state,
+            ingestion_phase,
         )
 
     for provider in providers:
@@ -2259,10 +2733,44 @@ def ingest_from_internet(
             targets = _crossref_enrichment_targets(list(all_edges.keys()), all_papers)
             crossref_papers = provider.fetch_seed_metadata(targets) if targets else {}
             _merge_provider_outputs(all_edges, all_papers, {}, crossref_papers)
+
+            crossref_l3_edges_added = 0
+            if depth.lower() in {"l2l3", "l3", "2"}:
+                # First-pass Crossref L3: DOI-gated reference expansion from L2 papers.
+                crossref_l3_run_state = provider_l3_state.get(provider.name)
+                if _is_pagination_state_stale(
+                    crossref_l3_run_state or {},
+                    max_age_seconds=effective_staleness_seconds,
+                ):
+                    provider_l3_state.pop(provider.name, None)
+                    l3_stale_providers = checkpoint_stats.get("l3_stale_state_ignored_providers")
+                    if isinstance(l3_stale_providers, list):
+                        l3_stale_providers.append(provider.name)
+                    checkpoint_stats["l3_stale_state_ignored_count"] = (
+                        int(checkpoint_stats.get("l3_stale_state_ignored_count", 0)) + 1
+                    )
+                    _persist_checkpoint_snapshot()
+
+                crossref_l3_run_state = provider_l3_state.setdefault(provider.name, {})
+
+                def _crossref_l3_progress(state: Dict[str, Any]) -> None:
+                    crossref_l3_run_state.clear()
+                    crossref_l3_run_state.update(dict(state))
+                    _persist_checkpoint_snapshot()
+
+                l3_edges, l3_papers = provider.fetch_l3_references(
+                    l2_paper_ids=list(all_edges.keys()),
+                    max_l3=max_l3,
+                    resume_state=crossref_l3_run_state,
+                    progress_callback=_crossref_l3_progress,
+                )
+                _merge_provider_outputs(all_edges, all_papers, l3_edges, l3_papers)
+                crossref_l3_edges_added = sum(len(cited) for cited in l3_edges.values())
+
             provider_stats[provider.name] = {
                 "l2_nodes": 0,
                 "l2_edges": 0,
-                "l3_edges": 0,
+                "l3_edges": crossref_l3_edges_added,
                 "papers": 0,
                 "metadata_enriched": len(crossref_papers),
                 "completeness": {},
@@ -2353,6 +2861,97 @@ def ingest_from_internet(
         provider_pagination_state.pop(provider.name, None)
         provider_l3_state.pop(provider.name, None)
         _persist_checkpoint_snapshot()
+
+    # ── Second pass: L3→L3 edge discovery ──────────────────────────────
+    # After the first pass completes (L2→L3), build the L3 membership set
+    # and query each provider's outgoing references for L3 parents.  Only
+    # edges whose target is already in the membership set are retained.
+    if depth.lower() in {"l2l3", "l3", "2"}:
+        ingestion_phase = "l3_to_l3"
+        _persist_checkpoint_snapshot()
+
+        # Build L3 membership: all paper IDs that are NOT L1 seeds and NOT
+        # L2 citers.  L2 citers are keys in all_edges that cite an L1 seed.
+        l1_set = set(l1_norm)
+        l2_set: Set[str] = set()
+        for citing, cited in all_edges.items():
+            if cited & l1_set:
+                l2_set.add(citing)
+        l3_member_set = set(all_papers.keys()) - l1_set - l2_set
+
+        l3_parent_ids = sorted(l3_member_set)
+        _vprint(f"\n[ADIT] Second pass (L3\u2192L3): {len(l3_parent_ids)} L3 parents to scan")
+
+        l3_to_l3_completed: Set[str] = set()
+        raw_l3_to_l3_completed = l3_to_l3_state.get("__completed_providers")
+        if isinstance(raw_l3_to_l3_completed, dict):
+            # stored as {"names": [...]}
+            names = raw_l3_to_l3_completed.get("names")
+            if isinstance(names, list):
+                l3_to_l3_completed = {n for n in names if isinstance(n, str)}
+
+        total_l3_to_l3_edges = 0
+
+        for provider in providers:
+            if not provider.capabilities.supports_l3_outgoing:
+                continue
+            if provider.name in l3_to_l3_completed:
+                _vprint(f"  [{provider.name}] Skipping L3\u2192L3 (checkpoint complete)")
+                continue
+
+            _vprint(f"  [{provider.name}] Scanning L3 outgoing references...")
+
+            run_state = l3_to_l3_state.get(provider.name)
+            if _is_pagination_state_stale(
+                run_state or {},
+                max_age_seconds=effective_staleness_seconds,
+            ):
+                l3_to_l3_state.pop(provider.name, None)
+                _persist_checkpoint_snapshot()
+
+            run_state = l3_to_l3_state.setdefault(provider.name, {})
+
+            # Track resumed providers
+            resumed_idx = run_state.get("next_l3_parent_index")
+            if isinstance(resumed_idx, int) and resumed_idx > 0:
+                resumed = checkpoint_stats.get("l3_to_l3_resumed_providers")
+                if isinstance(resumed, list) and provider.name not in resumed:
+                    resumed.append(provider.name)
+
+            def _l3_to_l3_progress(state: Dict[str, Any], _rs: Dict[str, Any] = run_state) -> None:
+                _rs.clear()
+                _rs.update(dict(state))
+                _persist_checkpoint_snapshot()
+
+            raw_edges, raw_papers = provider.fetch_l3_outgoing_references(
+                l3_paper_ids=l3_parent_ids,
+                max_edges=max_l3,
+                resume_state=run_state,
+                progress_callback=_l3_to_l3_progress,
+            )
+
+            # Filter: retain only edges where target is already in L3 set
+            retained_edges: Dict[str, Set[str]] = {}
+            for parent, targets in raw_edges.items():
+                kept = targets & l3_member_set
+                if kept:
+                    retained_edges[parent] = kept
+
+            retained_count = sum(len(v) for v in retained_edges.values())
+            total_l3_to_l3_edges += retained_count
+            _vprint(f"  [{provider.name}] \u2192 {retained_count} L3\u2192L3 edges retained")
+
+            # Merge retained edges (but NOT new papers — no L4 materialization)
+            for parent, targets in retained_edges.items():
+                all_edges.setdefault(parent, set()).update(targets)
+
+            l3_to_l3_completed.add(provider.name)
+            l3_to_l3_state["__completed_providers"] = {"names": sorted(l3_to_l3_completed)}
+            l3_to_l3_state.pop(provider.name, None)
+            _persist_checkpoint_snapshot()
+
+        checkpoint_stats["l3_to_l3_edges_added"] = total_l3_to_l3_edges
+        checkpoint_stats["l3_to_l3_parent_scanned_count"] = len(l3_parent_ids)
 
     citation_data, papers_data, alias_map = _dedupe_and_materialize(all_edges, all_papers)
 

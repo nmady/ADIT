@@ -3172,7 +3172,9 @@ def test_checkpoint_resume_multi_provider_l2_crash_matches_baseline(monkeypatch,
     first_openalex = _L2CrashMatrixProvider("openalex", "openalex:L2A")
     first_semantic = _L2CrashMatrixProvider("semantic_scholar", "semantic_scholar:L2A", crash=True)
     first_core = _L2CrashMatrixProvider("core", "core:L2A")
-    monkeypatch.setattr(ci, "build_providers", lambda _: [first_openalex, first_semantic, first_core])
+    monkeypatch.setattr(
+        ci, "build_providers", lambda _: [first_openalex, first_semantic, first_core]
+    )
 
     with pytest.raises(RuntimeError, match="simulated l2 crash"):
         ci.ingest_from_internet(
@@ -3347,7 +3349,9 @@ def test_checkpoint_resume_multi_provider_l3_crash_matches_baseline(monkeypatch,
         crash_at_l3_index=1,
     )
     first_core = _L3CrashMatrixProvider("core", "core", core_l3_refs)
-    monkeypatch.setattr(ci, "build_providers", lambda _: [first_openalex, first_semantic, first_core])
+    monkeypatch.setattr(
+        ci, "build_providers", lambda _: [first_openalex, first_semantic, first_core]
+    )
 
     with pytest.raises(RuntimeError, match="simulated l3 crash in semantic_scholar"):
         ci.ingest_from_internet(
