@@ -98,7 +98,13 @@ VERBOSE_OPTION = typer.Option(
     False,
     "--verbose",
     "-v",
-    help="Print live progress messages to stderr (retry countdowns, per-seed status).",
+    help="Print detailed diagnostics to stderr (retry countdowns, per-seed internals).",
+)
+QUIET_OPTION = typer.Option(
+    False,
+    "--quiet",
+    "-q",
+    help="Suppress ingestion progress output on stderr.",
 )
 
 
@@ -199,6 +205,7 @@ def _resolve_cli_inputs(
     only_ingest: bool,
     exhaustive: bool,
     verbose: bool,
+    quiet: bool,
 ) -> Dict[str, Any]:
     l1_cfg = cfg.get("l1_papers")
     l1_cfg_str = ",".join(l1_cfg) if isinstance(l1_cfg, list) else None
@@ -251,6 +258,7 @@ def _resolve_cli_inputs(
         "only_ingest": bool(only_ingest or cfg.get("only_ingest", False)),
         "exhaustive": bool(exhaustive if exhaustive is not None else cfg.get("exhaustive", True)),
         "verbose": bool(verbose or cfg.get("verbose", False)),
+        "quiet": bool(quiet or cfg.get("quiet", False)),
     }
 
 
@@ -298,6 +306,7 @@ def _load_pipeline_inputs(params: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[
             max_l3=params["max_l3"],
             exhaustive=params.get("exhaustive", True),
             verbose=params.get("verbose", False),
+            quiet=params.get("quiet", False),
         )
         typer.echo(
             "Online ingestion complete: "
@@ -359,6 +368,7 @@ def run(
     only_ingest: bool = ONLY_INGEST_OPTION,
     exhaustive: bool = EXHAUSTIVE_OPTION,
     verbose: bool = VERBOSE_OPTION,
+    quiet: bool = QUIET_OPTION,
 ) -> None:
     """Run ADIT using CLI values and/or a config file."""
     cfg = _load_config(config)
@@ -390,6 +400,7 @@ def run(
         only_ingest,
         exhaustive,
         verbose,
+        quiet,
     )
 
     if not params["theory_name"]:

@@ -136,6 +136,7 @@ _PAGINATION_STATE_MAX_AGE_SECONDS = 6 * 60 * 60
 # ---------------------------------------------------------------------------
 
 _VERBOSE: bool = False
+_QUIET: bool = False
 _VERBOSE_CLEAR_WIDTH = 80  # column width used when clearing a transient line
 
 
@@ -145,9 +146,43 @@ def set_verbose(flag: bool) -> None:
     _VERBOSE = bool(flag)
 
 
+def set_quiet(flag: bool) -> None:
+    """Enable or disable standard ingestion progress messages."""
+    global _QUIET
+    _QUIET = bool(flag)
+
+
+def _stderr_supports_color() -> bool:
+    if _QUIET:
+        return False
+    if os.getenv("NO_COLOR"):
+        return False
+    return bool(getattr(sys.stderr, "isatty", lambda: False)())
+
+
+def _progress(msg: str) -> None:
+    """Print always-on milestone progress lines to stderr unless quiet mode is enabled."""
+    if _QUIET:
+        return
+    sys.stderr.write(msg + "\n")
+    sys.stderr.flush()
+
+
+def _progress_done(msg: str) -> None:
+    """Print completed milestone progress lines with a checkmark marker."""
+    if _QUIET:
+        return
+    if _stderr_supports_color():
+        prefix = "\033[32m✓\033[0m "
+    else:
+        prefix = "✓ "
+    sys.stderr.write(prefix + msg + "\n")
+    sys.stderr.flush()
+
+
 def _vprint(msg: str) -> None:
     """Print a permanent progress line to stderr when verbose mode is on."""
-    if not _VERBOSE:
+    if _QUIET or not _VERBOSE:
         return
     sys.stderr.write(msg + "\n")
     sys.stderr.flush()
@@ -199,7 +234,7 @@ def _countdown_sleep(seconds: float, label: str) -> None:
     on completion.  Falls back to a plain ``time.sleep`` when verbose mode is
     off or the delay is very short.
     """
-    if not _VERBOSE or seconds < 1.0:
+    if _QUIET or not _VERBOSE or seconds < 1.0:
         time.sleep(seconds)
         return
 
@@ -1037,11 +1072,15 @@ def _fetch_provider_graph(
     max_results: Optional[int] = None if exhaustive else max_l2
 
     if provider.capabilities.supports_cited_by_traversal:
-        for l1_id in l1_norm:
+        total_seeds = len(l1_norm)
+        for seed_index, l1_id in enumerate(l1_norm, start=1):
             seed = l1_papers_resolved.get(l1_id)
             raw_provider_id = seed.source_ids.get(provider.name) if seed else None
             if not raw_provider_id:
-                _vprint(f"  [{provider.name}] Skipping {l1_id} — no provider ID resolved")
+                _progress(
+                    f"  [{provider.name}] Seed {seed_index}/{total_seeds}: "
+                    f"skipped {l1_id} (no provider ID resolved)"
+                )
                 completeness[l1_id] = {
                     provider.name: {
                         "status": "skipped",
@@ -1053,17 +1092,54 @@ def _fetch_provider_graph(
                 continue
 
             l1_native_id = normalize_identifier(raw_provider_id, source=provider.name)
-            _vprint(f"  [{provider.name}] Fetching citers for seed: {l1_id}")
+            _progress(
+                f"  [{provider.name}] Seed {seed_index}/{total_seeds}: "
+                f"fetching citers for {l1_id}"
+            )
 
             resume_state = None
             if provider_seed_state and isinstance(provider_seed_state.get(l1_id), dict):
                 resume_state = provider_seed_state[l1_id]
 
             progress_fn = None
-            if seed_progress_callback is not None:
+            last_progress_fetched: Optional[int] = None
+            if seed_progress_callback is not None or not _QUIET:
 
-                def _on_progress(state: Dict[str, Any], seed: str = l1_id) -> None:
-                    seed_progress_callback(seed, state)
+                def _on_progress(
+                    state: Dict[str, Any],
+                    seed: str = l1_id,
+                    seed_pos: int = seed_index,
+                    seed_total: int = total_seeds,
+                    provider_name: str = provider.name,
+                ) -> None:
+                    nonlocal last_progress_fetched
+
+                    if seed_progress_callback is not None:
+                        seed_progress_callback(seed, state)
+
+                    if _QUIET:
+                        return
+
+                    status = str(state.get("status") or "")
+                    if status != "in_progress":
+                        return
+
+                    fetched_raw = state.get("fetched_count")
+                    expected_raw = state.get("expected_count")
+                    if not isinstance(fetched_raw, int):
+                        return
+                    if fetched_raw == last_progress_fetched:
+                        return
+
+                    expected_display = "?"
+                    if isinstance(expected_raw, int) and expected_raw > 0:
+                        expected_display = str(expected_raw)
+
+                    _progress(
+                        f"  [{provider_name}] Seed {seed_pos}/{seed_total}: "
+                        f"citers {fetched_raw}/{expected_display}"
+                    )
+                    last_progress_fetched = fetched_raw
 
                 progress_fn = _on_progress
 
@@ -1078,9 +1154,9 @@ def _fetch_provider_graph(
                 l1_native_id,
                 **call_kwargs,
             )
-            _vprint(
-                f"  [{provider.name}] \u2192 {len(papers_for_l1)}"
-                f"/{expected_count or '?'} papers ({status})"
+            _progress_done(
+                f"  [{provider.name}] Seed {seed_index}/{total_seeds}: "
+                f"fetched {len(papers_for_l1)}/{expected_count or '?'} papers ({status})"
             )
             completeness.setdefault(l1_id, {})[provider.name] = {
                 "status": status,
@@ -1104,11 +1180,14 @@ def _fetch_provider_graph(
         l2_edges.update(search_edges)
         l2_papers.update(search_papers)
 
+    _progress(f"  [{provider.name}] L2 candidates materialized: {len(l2_edges)}")
+
     all_edges = dict(l2_edges)
     all_papers = dict(l2_papers)
     added_l3_edges = 0
 
     if depth.lower() in {"l2l3", "l3", "2"}:
+        _progress(f"  [{provider.name}] L3 hydration: {len(l2_edges)} L2 parents")
         l3_call_kwargs: Dict[str, Any] = {
             "l2_paper_ids": list(l2_edges.keys()),
             "max_l3": max_l3,
@@ -1122,6 +1201,7 @@ def _fetch_provider_graph(
         l3_edges, l3_papers = provider.fetch_l3_references(**l3_call_kwargs)
         _merge_provider_outputs(all_edges, all_papers, l3_edges, l3_papers)
         added_l3_edges = sum(len(cited) for cited in l3_edges.values())
+        _progress_done(f"  [{provider.name}] L3 hydration complete: {added_l3_edges} edges")
 
     stats: Dict[str, object] = {
         "l2_nodes": len(l2_edges),
@@ -2554,6 +2634,7 @@ def ingest_from_internet(
     max_l3: Optional[int] = None,
     exhaustive: bool = True,
     verbose: bool = False,
+    quiet: bool = False,
     checkpoint_dir: Optional[Path] = None,
     reset_checkpoints: bool = False,
     checkpoint_staleness_seconds: Optional[int] = None,
@@ -2566,6 +2647,7 @@ def ingest_from_internet(
             retrieval is capped at *max_l2* results per L1/provider.
         verbose: When ``True``, print live progress messages to stderr
             (per-seed status, retry countdowns).
+        quiet: When ``True``, suppress standard and verbose progress messages.
         checkpoint_staleness_seconds: Optional staleness window in seconds for
             checkpoint resume state. When unset, defaults to
             ``_PAGINATION_STATE_MAX_AGE_SECONDS``.
@@ -2574,14 +2656,15 @@ def ingest_from_internet(
         raise ValueError("checkpoint_staleness_seconds must be a positive integer")
 
     set_verbose(verbose)
+    set_quiet(quiet)
     source_list = (
         ["openalex", "semantic_scholar", "crossref", "core"] if not sources else list(sources)
     )
     _reset_ingest_stats(source_list)
     providers = build_providers(source_list)
-    _vprint(
-        f"[ADIT] Starting ingestion: theory='{theory_name}', "
-        f"seeds={len(l1_papers)}, providers={source_list}"
+    _progress(
+        f"[ADIT] Ingesting theory '{theory_name}': "
+        f"{len(l1_papers)} seed(s), {len(providers)} provider(s)"
     )
 
     cache_root = cache_dir or Path(".cache") / "adit_ingestion"
@@ -2618,6 +2701,11 @@ def ingest_from_internet(
 
     cached = _load_cached_result(cache_root, key, refresh)
     if cached:
+        _progress_done(
+            "[ADIT] Loaded cached ingestion result: "
+            f"{cached.metadata.get('paper_count', 0)} papers, "
+            f"{cached.metadata.get('edge_count', 0)} edges"
+        )
         metadata = dict(cached.metadata or {})
         existing_checkpoint_stats = metadata.get("checkpoint_stats")
         if not isinstance(existing_checkpoint_stats, dict):
@@ -2695,7 +2783,9 @@ def ingest_from_internet(
         if isinstance(raw_phase, str) and raw_phase in ("l2_to_l3", "l3_to_l3"):
             ingestion_phase = raw_phase
 
-        _vprint(f"[ADIT] Loaded checkpoint: {len(completed_providers)} completed provider(s)")
+        _progress(
+            f"[ADIT] Resuming from checkpoint: {len(completed_providers)} completed provider(s)"
+        )
 
     def _persist_checkpoint_snapshot() -> None:
         _write_checkpoint_state(
@@ -2712,9 +2802,13 @@ def ingest_from_internet(
             ingestion_phase,
         )
 
-    for provider in providers:
+    provider_total = len(providers)
+    for provider_index, provider in enumerate(providers, start=1):
         if provider.name in completed_providers:
-            _vprint(f"\n[ADIT] Skipping provider (checkpoint complete): {provider.name}")
+            _progress_done(
+                f"[ADIT] Provider {provider_index}/{provider_total}: "
+                f"{provider.name} skipped (checkpoint complete)"
+            )
             skipped_names = checkpoint_stats["skipped_provider_names"]
             if isinstance(skipped_names, list):
                 skipped_names.append(provider.name)
@@ -2726,7 +2820,7 @@ def ingest_from_internet(
             executed_names.append(provider.name)
         checkpoint_stats["providers_executed"] = int(checkpoint_stats["providers_executed"]) + 1
 
-        _vprint(f"\n[ADIT] Querying provider: {provider.name}")
+        _progress(f"[ADIT] Provider {provider_index}/{provider_total}: {provider.name}")
         _merge_seed_metadata(all_papers, provider.fetch_seed_metadata(l1_norm))
 
         if provider.name == "crossref":
@@ -2775,6 +2869,10 @@ def ingest_from_internet(
                 "metadata_enriched": len(crossref_papers),
                 "completeness": {},
             }
+            _progress_done(
+                f"[ADIT] Provider {provider_index}/{provider_total}: {provider.name} completed "
+                f"(enriched={len(crossref_papers)}, l3_edges={crossref_l3_edges_added})"
+            )
             completed_providers.add(provider.name)
             provider_pagination_state.pop(provider.name, None)
             provider_l3_state.pop(provider.name, None)
@@ -2854,6 +2952,11 @@ def ingest_from_internet(
         )
         _merge_provider_outputs(all_edges, all_papers, provider_edges, provider_papers)
         provider_stats[provider.name] = stats
+        _progress_done(
+            f"[ADIT] Provider {provider_index}/{provider_total}: {provider.name} completed "
+            f"(papers={stats.get('papers', 0)}, "
+            f"l2_edges={stats.get('l2_edges', 0)}, l3_edges={stats.get('l3_edges', 0)})"
+        )
         for l1_id, l1_completeness in stats.get("completeness", {}).items():
             combined_completeness.setdefault(l1_id, {}).update(l1_completeness)
 
@@ -2880,7 +2983,7 @@ def ingest_from_internet(
         l3_member_set = set(all_papers.keys()) - l1_set - l2_set
 
         l3_parent_ids = sorted(l3_member_set)
-        _vprint(f"\n[ADIT] Second pass (L3\u2192L3): {len(l3_parent_ids)} L3 parents to scan")
+        _progress(f"[ADIT] L3->L3 pass: {len(l3_parent_ids)} parent(s) to scan")
 
         l3_to_l3_completed: Set[str] = set()
         raw_l3_to_l3_completed = l3_to_l3_state.get("__completed_providers")
@@ -2892,14 +2995,22 @@ def ingest_from_internet(
 
         total_l3_to_l3_edges = 0
 
-        for provider in providers:
+        l3_providers = [p for p in providers if p.capabilities.supports_l3_outgoing]
+        l3_provider_total = len(l3_providers)
+        for l3_provider_index, provider in enumerate(l3_providers, start=1):
             if not provider.capabilities.supports_l3_outgoing:
                 continue
             if provider.name in l3_to_l3_completed:
-                _vprint(f"  [{provider.name}] Skipping L3\u2192L3 (checkpoint complete)")
+                _progress_done(
+                    f"  [{provider.name}] L3->L3 provider {l3_provider_index}/{l3_provider_total}: "
+                    "skipped (checkpoint complete)"
+                )
                 continue
 
-            _vprint(f"  [{provider.name}] Scanning L3 outgoing references...")
+            _progress(
+                f"  [{provider.name}] L3->L3 provider {l3_provider_index}/{l3_provider_total}: "
+                "scanning outgoing references"
+            )
 
             run_state = l3_to_l3_state.get(provider.name)
             if _is_pagination_state_stale(
@@ -2939,7 +3050,10 @@ def ingest_from_internet(
 
             retained_count = sum(len(v) for v in retained_edges.values())
             total_l3_to_l3_edges += retained_count
-            _vprint(f"  [{provider.name}] \u2192 {retained_count} L3\u2192L3 edges retained")
+            _progress_done(
+                f"  [{provider.name}] L3->L3 provider {l3_provider_index}/{l3_provider_total}: "
+                f"retained {retained_count} edges"
+            )
 
             # Merge retained edges (but NOT new papers — no L4 materialization)
             for parent, targets in retained_edges.items():
@@ -2953,6 +3067,7 @@ def ingest_from_internet(
         checkpoint_stats["l3_to_l3_edges_added"] = total_l3_to_l3_edges
         checkpoint_stats["l3_to_l3_parent_scanned_count"] = len(l3_parent_ids)
 
+    _progress("[ADIT] Deduplicating and materializing graph")
     citation_data, papers_data, alias_map = _dedupe_and_materialize(all_edges, all_papers)
 
     metadata = _build_metadata(
@@ -2973,6 +3088,9 @@ def ingest_from_internet(
         "metadata": metadata,
     }
     _write_cache(cache_root, key, result_payload)
-    _vprint(f"\n[ADIT] Done: {metadata['paper_count']} papers, {metadata['edge_count']} edges")
+    _progress_done(f"[ADIT] Cached ingestion result: key={key}")
+    _progress_done(
+        f"[ADIT] Ingestion complete: {metadata['paper_count']} papers, {metadata['edge_count']} edges"
+    )
 
     return IngestionResult(citation_data=citation_data, papers_data=papers_data, metadata=metadata)

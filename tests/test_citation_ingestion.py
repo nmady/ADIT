@@ -532,6 +532,55 @@ class _EarlyStopCitedByProvider(ci.CitationProvider):
         return {}, {}
 
 
+class _ProgressCitedByProvider(ci.CitationProvider):
+    """Fake provider that emits in-progress callback updates with expected citer counts."""
+
+    name = "progress"
+    capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=True)
+
+    def fetch_seed_metadata(self, l1_papers):
+        return {
+            l1: ci.IngestionPaper(
+                paper_id=l1,
+                title="Foundational",
+                citations=42,
+                year=2005,
+                doi="10.1000/xyz1",
+                source_ids={"progress": "PROGRESS001"},
+            )
+            for l1 in l1_papers
+        }
+
+    def fetch_citers_for_l1(
+        self,
+        l1_provider_id,
+        max_results=None,
+        resume_state=None,
+        progress_callback=None,
+    ):
+        papers = {
+            "progress:C001": ci.IngestionPaper(
+                paper_id="progress:C001", title="Citer One", year=2020, citations=2
+            ),
+            "progress:C002": ci.IngestionPaper(
+                paper_id="progress:C002", title="Citer Two", year=2021, citations=3
+            ),
+            "progress:C003": ci.IngestionPaper(
+                paper_id="progress:C003", title="Citer Three", year=2022, citations=4
+            ),
+        }
+        if progress_callback is not None:
+            progress_callback({"status": "in_progress", "fetched_count": 1, "expected_count": 3})
+            progress_callback({"status": "in_progress", "fetched_count": 2, "expected_count": 3})
+        return papers, 3, "complete"
+
+    def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
+        return {}, {}
+
+    def fetch_l3_references(self, l2_paper_ids, max_l3=None):
+        return {}, {}
+
+
 def test_ingest_completeness_partial_when_provider_stops_early(monkeypatch, tmp_path):
     """Provider-level partial status should propagate into metadata completeness."""
     provider = _EarlyStopCitedByProvider()
@@ -553,6 +602,26 @@ def test_ingest_completeness_partial_when_provider_stops_early(monkeypatch, tmp_
     assert l1_entry["earlystop"]["fetched"] == 2
     assert l1_entry["earlystop"]["expected"] == 5
     assert l1_entry["earlystop"]["fetched"] < l1_entry["earlystop"]["expected"]
+
+
+def test_ingest_progress_reports_citer_fraction_from_callback(monkeypatch, tmp_path, capsys):
+    """In-progress traversal should emit citer fetched/expected updates when provided."""
+    provider = _ProgressCitedByProvider()
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["progress"],
+        depth="l2",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        exhaustive=True,
+    )
+    captured = capsys.readouterr()
+
+    assert "Seed 1/1: citers 1/3" in captured.err
+    assert "Seed 1/1: citers 2/3" in captured.err
 
 
 class _L3BudgetProvider(ci.CitationProvider):
@@ -1553,8 +1622,55 @@ def test_dedupe_and_materialize_merges_l3_nodes_by_doi_and_preserves_sources():
 # ---------------------------------------------------------------------------
 
 
+def test_default_progress_messages_are_emitted(monkeypatch, tmp_path, capsys):
+    """Standard ingestion milestones should print to stderr by default."""
+    provider = _FakeProvider()
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["fake"],
+        depth="l2l3",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        max_l2=10,
+        max_l3=10,
+    )
+    captured = capsys.readouterr()
+
+    assert "[ADIT] Ingesting theory" in captured.err
+    assert "Provider 1/1" in captured.err
+    assert "L2 candidates materialized" in captured.err
+    assert "Ingestion complete" in captured.err
+
+
+def test_quiet_mode_suppresses_progress_and_verbose_output(monkeypatch, tmp_path, capsys):
+    """Quiet mode should suppress both default progress and verbose diagnostics."""
+    provider = _FakeProvider()
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["fake"],
+        depth="l2l3",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        max_l2=10,
+        max_l3=10,
+        verbose=True,
+        quiet=True,
+    )
+    captured = capsys.readouterr()
+    ci.set_quiet(False)
+
+    assert captured.err == ""
+
+
 def test_verbose_off_produces_no_output(monkeypatch, capsys):
     """_vprint and _countdown_sleep should produce no output when verbose is off."""
+    ci.set_quiet(False)
     ci.set_verbose(False)
     monkeypatch.setattr(ci.time, "sleep", lambda _: None)
     ci._vprint("should not appear")
@@ -1565,6 +1681,7 @@ def test_verbose_off_produces_no_output(monkeypatch, capsys):
 
 def test_verbose_countdown_writes_ticks_to_stderr(monkeypatch, capsys):
     """_countdown_sleep should write countdown ticks to stderr and clear the line."""
+    ci.set_quiet(False)
     ci.set_verbose(True)
     monkeypatch.setattr(ci.time, "sleep", lambda _: None)
     ci._countdown_sleep(2.0, "test-provider attempt 1/3")
@@ -1592,6 +1709,7 @@ def test_verbose_safe_get_prints_retry_message(monkeypatch, capsys):
     monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(ci.time, "sleep", lambda _: None)
     ci._reset_ingest_stats(["test"])
+    ci.set_quiet(False)
     ci.set_verbose(True)
 
     result = ci._safe_get("https://example.com/test", provider="test", max_retries=3)
@@ -1611,6 +1729,7 @@ def test_verbose_safe_get_prints_permanent_failure(monkeypatch, capsys):
 
     monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
     ci._reset_ingest_stats(["test"])
+    ci.set_quiet(False)
     ci.set_verbose(True)
 
     result = ci._safe_get("https://example.com/not-found", provider="test")

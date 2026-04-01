@@ -531,6 +531,7 @@ def test_cli_online_checkpoint_options_are_passed_to_ingestion(monkeypatch):
             "--checkpoint-staleness-seconds",
             "1800",
             "--reset-checkpoints",
+            "--quiet",
         ],
         color=False,
     )
@@ -539,6 +540,55 @@ def test_cli_online_checkpoint_options_are_passed_to_ingestion(monkeypatch):
     assert captured_kwargs["checkpoint_dir"] == Path("custom-checkpoints")
     assert captured_kwargs["checkpoint_staleness_seconds"] == 1800
     assert captured_kwargs["reset_checkpoints"] is True
+    assert captured_kwargs["quiet"] is True
+
+
+def test_cli_online_defaults_quiet_to_false(monkeypatch):
+    """Online mode should pass quiet=False unless requested."""
+    monkeypatch.setattr(cli, "ADIT", FakeADIT)
+    captured_kwargs = {}
+
+    def fake_ingest(**kwargs):
+        captured_kwargs.update(kwargs)
+        return SimpleNamespace(
+            citation_data={"PaperA": ["TAM1"]},
+            papers_data={
+                "PaperA": {
+                    "title": "A",
+                    "abstract": "a",
+                    "keywords": "k",
+                    "citations": 1,
+                    "year": 2010,
+                },
+                "TAM1": {
+                    "title": "TAM",
+                    "abstract": "foundation",
+                    "keywords": "tam",
+                    "citations": 100,
+                    "year": 1990,
+                },
+            },
+            metadata={"paper_count": 2, "edge_count": 1},
+        )
+
+    monkeypatch.setattr(cli, "ingest_from_internet", fake_ingest)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "--online",
+            "--theory-name",
+            "Technology Acceptance Model",
+            "--l1-papers",
+            "TAM1,TAM2",
+            "--depth",
+            "l2",
+        ],
+        color=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured_kwargs["quiet"] is False
 
 
 def test_cli_online_checkpoint_config_values_are_resolved(tmp_path, monkeypatch):

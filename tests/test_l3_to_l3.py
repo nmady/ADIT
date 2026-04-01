@@ -639,7 +639,10 @@ class _L3ToL3CrashProvider(ci.CitationProvider):
             start_index = 0
 
         for idx in range(start_index, len(l3_paper_ids)):
-            if self.crash_at_l3_outgoing_index is not None and idx == self.crash_at_l3_outgoing_index:
+            if (
+                self.crash_at_l3_outgoing_index is not None
+                and idx == self.crash_at_l3_outgoing_index
+            ):
                 raise RuntimeError(f"simulated l3-to-l3 crash in {self.name}")
 
             pid = l3_paper_ids[idx]
@@ -707,7 +710,10 @@ def test_l3_to_l3_crash_resume_matches_baseline(monkeypatch, tmp_path):
     # ─── Phase 1: crash run ────────────────────────────────────────────
     first_oa = _L3ToL3CrashProvider("openalex", "openalex", oa_l3_refs, oa_outgoing)
     first_s2 = _L3ToL3CrashProvider(
-        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+        "semantic_scholar",
+        "semantic_scholar",
+        s2_l3_refs,
+        s2_outgoing,
         crash_at_l3_outgoing_index=1,
     )
     monkeypatch.setattr(ci, "build_providers", lambda _: [first_oa, first_s2])
@@ -726,7 +732,10 @@ def test_l3_to_l3_crash_resume_matches_baseline(monkeypatch, tmp_path):
     # ─── Phase 2: resume run ──────────────────────────────────────────
     resumed_oa = _L3ToL3CrashProvider("openalex", "openalex", oa_l3_refs, oa_outgoing)
     resumed_s2 = _L3ToL3CrashProvider(
-        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+        "semantic_scholar",
+        "semantic_scholar",
+        s2_l3_refs,
+        s2_outgoing,
     )
     monkeypatch.setattr(ci, "build_providers", lambda _: [resumed_oa, resumed_s2])
 
@@ -743,7 +752,10 @@ def test_l3_to_l3_crash_resume_matches_baseline(monkeypatch, tmp_path):
     # ─── Phase 3: baseline run (no crashes, clean state) ──────────────
     baseline_oa = _L3ToL3CrashProvider("openalex", "openalex", oa_l3_refs, oa_outgoing)
     baseline_s2 = _L3ToL3CrashProvider(
-        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+        "semantic_scholar",
+        "semantic_scholar",
+        s2_l3_refs,
+        s2_outgoing,
     )
     monkeypatch.setattr(ci, "build_providers", lambda _: [baseline_oa, baseline_s2])
 
@@ -772,11 +784,17 @@ def test_l3_to_l3_crash_at_first_provider_resume(monkeypatch, tmp_path):
 
     # ─── Crash run: openalex crashes mid-second-pass ──────────────────
     first_oa = _L3ToL3CrashProvider(
-        "openalex", "openalex", oa_l3_refs, oa_outgoing,
+        "openalex",
+        "openalex",
+        oa_l3_refs,
+        oa_outgoing,
         crash_at_l3_outgoing_index=1,
     )
     first_s2 = _L3ToL3CrashProvider(
-        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+        "semantic_scholar",
+        "semantic_scholar",
+        s2_l3_refs,
+        s2_outgoing,
     )
     monkeypatch.setattr(ci, "build_providers", lambda _: [first_oa, first_s2])
 
@@ -794,7 +812,10 @@ def test_l3_to_l3_crash_at_first_provider_resume(monkeypatch, tmp_path):
     # ─── Resume run ──────────────────────────────────────────────────
     resumed_oa = _L3ToL3CrashProvider("openalex", "openalex", oa_l3_refs, oa_outgoing)
     resumed_s2 = _L3ToL3CrashProvider(
-        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+        "semantic_scholar",
+        "semantic_scholar",
+        s2_l3_refs,
+        s2_outgoing,
     )
     monkeypatch.setattr(ci, "build_providers", lambda _: [resumed_oa, resumed_s2])
 
@@ -811,7 +832,10 @@ def test_l3_to_l3_crash_at_first_provider_resume(monkeypatch, tmp_path):
     # ─── Baseline run ────────────────────────────────────────────────
     baseline_oa = _L3ToL3CrashProvider("openalex", "openalex", oa_l3_refs, oa_outgoing)
     baseline_s2 = _L3ToL3CrashProvider(
-        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+        "semantic_scholar",
+        "semantic_scholar",
+        s2_l3_refs,
+        s2_outgoing,
     )
     monkeypatch.setattr(ci, "build_providers", lambda _: [baseline_oa, baseline_s2])
 
@@ -839,7 +863,10 @@ def test_l3_to_l3_no_l4_nodes_after_crash_resume(monkeypatch, tmp_path):
     # ─── Crash run ────────────────────────────────────────────────────
     first_oa = _L3ToL3CrashProvider("openalex", "openalex", oa_l3_refs, oa_outgoing)
     first_s2 = _L3ToL3CrashProvider(
-        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+        "semantic_scholar",
+        "semantic_scholar",
+        s2_l3_refs,
+        s2_outgoing,
         crash_at_l3_outgoing_index=0,
     )
     monkeypatch.setattr(ci, "build_providers", lambda _: [first_oa, first_s2])
@@ -858,7 +885,10 @@ def test_l3_to_l3_no_l4_nodes_after_crash_resume(monkeypatch, tmp_path):
     # ─── Resume run ──────────────────────────────────────────────────
     resumed_oa = _L3ToL3CrashProvider("openalex", "openalex", oa_l3_refs, oa_outgoing)
     resumed_s2 = _L3ToL3CrashProvider(
-        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+        "semantic_scholar",
+        "semantic_scholar",
+        s2_l3_refs,
+        s2_outgoing,
     )
     monkeypatch.setattr(ci, "build_providers", lambda _: [resumed_oa, resumed_s2])
 
@@ -875,7 +905,10 @@ def test_l3_to_l3_no_l4_nodes_after_crash_resume(monkeypatch, tmp_path):
     # ─── Baseline run ────────────────────────────────────────────────
     baseline_oa = _L3ToL3CrashProvider("openalex", "openalex", oa_l3_refs, oa_outgoing)
     baseline_s2 = _L3ToL3CrashProvider(
-        "semantic_scholar", "semantic_scholar", s2_l3_refs, s2_outgoing,
+        "semantic_scholar",
+        "semantic_scholar",
+        s2_l3_refs,
+        s2_outgoing,
     )
     monkeypatch.setattr(ci, "build_providers", lambda _: [baseline_oa, baseline_s2])
 
