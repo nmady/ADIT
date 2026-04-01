@@ -1641,7 +1641,10 @@ def test_default_progress_messages_are_emitted(monkeypatch, tmp_path, capsys):
 
     assert "[ADIT] Ingesting theory" in captured.err
     assert "Provider 1/1" in captured.err
-    assert "L2 nodes collected (provider-local, pre-dedup)" in captured.err
+    assert (
+        "L2 nodes collected (provider-local, pre-dedup)" in captured.err
+        or "Total L2 nodes collected across all seeds (provider-local)" in captured.err
+    )
     assert "Ingestion complete" in captured.err
 
 
@@ -3551,3 +3554,35 @@ def test_checkpoint_resume_multi_provider_l3_crash_matches_baseline(monkeypatch,
     assert resumed.papers_data == baseline.papers_data
     assert resumed.metadata["provider_stats"] == baseline.metadata["provider_stats"]
     assert "semantic_scholar" in resumed.metadata["checkpoint_stats"]["l3_resumed_providers"]
+
+
+def test_ingest_rejects_nonpositive_max_workers(tmp_path):
+    with pytest.raises(ValueError, match="max_workers must be a positive integer"):
+        ci.ingest_from_internet(
+            theory_name="My Fake Theory",
+            l1_papers=["10.1000/xyz1"],
+            sources=["openalex"],
+            depth="l2",
+            cache_dir=Path(tmp_path),
+            refresh=True,
+            max_workers=0,
+        )
+
+
+def test_parallel_wave1_execution_path_runs(monkeypatch, tmp_path):
+    p_openalex = _L2CrashMatrixProvider("openalex", "openalex:L2A")
+    p_semantic = _L2CrashMatrixProvider("semantic_scholar", "semantic_scholar:L2A")
+    monkeypatch.setattr(ci, "build_providers", lambda _: [p_openalex, p_semantic])
+
+    result = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["openalex", "semantic_scholar"],
+        depth="l2",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        max_workers=2,
+    )
+
+    # Both providers should contribute at least one edge in parallel wave-1 mode.
+    assert result.metadata["edge_count"] >= 2

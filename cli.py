@@ -71,6 +71,15 @@ MAX_L3_OPTION = typer.Option(
         "By default, all available L3 references are retrieved."
     ),
 )
+MAX_WORKERS_OPTION = typer.Option(
+    None,
+    "--max-workers",
+    "-j",
+    help=(
+        "Optional provider-level parallel worker count for online ingestion. "
+        "When omitted, ingestion runs sequentially."
+    ),
+)
 SAVE_INGESTED_CITATION_OPTION = typer.Option(
     None,
     help="Optional output path to persist online-ingested citation_data JSON.",
@@ -197,6 +206,7 @@ def _resolve_cli_inputs(
     reset_checkpoints: bool,
     max_l2: int,
     max_l3: Optional[int],
+    max_workers: Optional[int],
     save_ingested_citation_data: Optional[Path],
     save_ingested_papers_data: Optional[Path],
     output_features: Optional[Path],
@@ -218,6 +228,12 @@ def _resolve_cli_inputs(
     )
     if resolved_checkpoint_staleness is not None and resolved_checkpoint_staleness <= 0:
         raise typer.BadParameter("checkpoint_staleness_seconds must be a positive integer.")
+
+    resolved_max_workers = (
+        int(cfg["max_workers"]) if cfg.get("max_workers") is not None else max_workers
+    )
+    if resolved_max_workers is not None and resolved_max_workers <= 0:
+        raise typer.BadParameter("max_workers must be a positive integer.")
 
     return {
         "theory_name": theory_name or cfg.get("theory_name"),
@@ -245,6 +261,7 @@ def _resolve_cli_inputs(
         "reset_checkpoints": bool(reset_checkpoints or cfg.get("reset_checkpoints", False)),
         "max_l2": int(cfg.get("max_l2", max_l2)),
         "max_l3": int(cfg["max_l3"]) if cfg.get("max_l3") is not None else max_l3,
+        "max_workers": resolved_max_workers,
         "save_ingested_citation_data": save_ingested_citation_data
         or (
             Path(cfg["save_ingested_citation_data"])
@@ -304,6 +321,7 @@ def _load_pipeline_inputs(params: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[
             reset_checkpoints=params.get("reset_checkpoints", False),
             max_l2=params["max_l2"],
             max_l3=params["max_l3"],
+            max_workers=params.get("max_workers"),
             exhaustive=params.get("exhaustive", True),
             verbose=params.get("verbose", False),
             quiet=params.get("quiet", False),
@@ -361,6 +379,7 @@ def run(
     reset_checkpoints: bool = RESET_CHECKPOINTS_OPTION,
     max_l2: int = MAX_L2_OPTION,
     max_l3: Optional[int] = MAX_L3_OPTION,
+    max_workers: Optional[int] = MAX_WORKERS_OPTION,
     save_ingested_citation_data: Optional[Path] = SAVE_INGESTED_CITATION_OPTION,
     save_ingested_papers_data: Optional[Path] = SAVE_INGESTED_PAPERS_OPTION,
     output_features: Optional[Path] = OUTPUT_FEATURES_OPTION,
@@ -392,6 +411,7 @@ def run(
         reset_checkpoints,
         max_l2,
         max_l3,
+        max_workers,
         save_ingested_citation_data,
         save_ingested_papers_data,
         output_features,
