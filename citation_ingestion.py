@@ -1180,23 +1180,74 @@ def _fetch_provider_graph(
         l2_edges.update(search_edges)
         l2_papers.update(search_papers)
 
-    _progress(f"  [{provider.name}] L2 candidates materialized: {len(l2_edges)}")
+    _progress(
+        f"  [{provider.name}] L2 nodes collected (provider-local, pre-dedup): {len(l2_edges)}"
+    )
 
     all_edges = dict(l2_edges)
     all_papers = dict(l2_papers)
     added_l3_edges = 0
 
     if depth.lower() in {"l2l3", "l3", "2"}:
-        _progress(f"  [{provider.name}] L3 hydration: {len(l2_edges)} L2 parents")
+        l2_parent_ids = list(l2_edges.keys())
+        total_l2_parents = len(l2_parent_ids)
+        _progress(
+            f"  [{provider.name}] L3 hydration started: {total_l2_parents} L2 parent(s)"
+        )
+        l3_progress_fn = l3_progress_callback
+        last_l3_parent_index: Optional[int] = None
+        if l3_progress_callback is not None or not _QUIET:
+
+            def _on_l3_progress(
+                state: Dict[str, Any],
+                provider_name: str = provider.name,
+            ) -> None:
+                nonlocal last_l3_parent_index
+
+                if l3_progress_callback is not None:
+                    l3_progress_callback(state)
+
+                if _QUIET:
+                    return
+
+                if str(state.get("status") or "") != "in_progress":
+                    return
+
+                parent_index_raw = state.get("next_l2_index")
+                if not isinstance(parent_index_raw, int):
+                    return
+                if total_l2_parents <= 0:
+                    return
+
+                parent_index = min(max(parent_index_raw, 1), total_l2_parents)
+                if parent_index == last_l3_parent_index:
+                    return
+
+                refs_display = "?"
+                parent_id = l2_parent_ids[parent_index - 1]
+                edges_raw = state.get("edges")
+                if isinstance(edges_raw, dict):
+                    parent_targets = edges_raw.get(parent_id)
+                    if isinstance(parent_targets, list):
+                        refs_display = str(len(parent_targets))
+
+                _progress(
+                    f"  [{provider_name}] L3 parent {parent_index}/{total_l2_parents}: "
+                    f"references {refs_display}"
+                )
+                last_l3_parent_index = parent_index
+
+            l3_progress_fn = _on_l3_progress
+
         l3_call_kwargs: Dict[str, Any] = {
-            "l2_paper_ids": list(l2_edges.keys()),
+            "l2_paper_ids": l2_parent_ids,
             "max_l3": max_l3,
         }
         l3_signature = inspect.signature(provider.fetch_l3_references)
         if "resume_state" in l3_signature.parameters:
             l3_call_kwargs["resume_state"] = provider_l3_state
-        if "progress_callback" in l3_signature.parameters and l3_progress_callback is not None:
-            l3_call_kwargs["progress_callback"] = l3_progress_callback
+        if "progress_callback" in l3_signature.parameters and l3_progress_fn is not None:
+            l3_call_kwargs["progress_callback"] = l3_progress_fn
 
         l3_edges, l3_papers = provider.fetch_l3_references(**l3_call_kwargs)
         _merge_provider_outputs(all_edges, all_papers, l3_edges, l3_papers)

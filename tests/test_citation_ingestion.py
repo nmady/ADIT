@@ -1641,7 +1641,7 @@ def test_default_progress_messages_are_emitted(monkeypatch, tmp_path, capsys):
 
     assert "[ADIT] Ingesting theory" in captured.err
     assert "Provider 1/1" in captured.err
-    assert "L2 candidates materialized" in captured.err
+    assert "L2 nodes collected (provider-local, pre-dedup)" in captured.err
     assert "Ingestion complete" in captured.err
 
 
