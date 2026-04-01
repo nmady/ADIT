@@ -138,6 +138,8 @@ _PAGINATION_STATE_MAX_AGE_SECONDS = 6 * 60 * 60
 _VERBOSE: bool = False
 _QUIET: bool = False
 _VERBOSE_CLEAR_WIDTH = 80  # column width used when clearing a transient line
+_TRANSIENT_PROGRESS_ACTIVE: bool = False
+_TRANSIENT_PROGRESS_LAST_LEN: int = 0
 
 
 def set_verbose(flag: bool) -> None:
@@ -152,6 +154,23 @@ def set_quiet(flag: bool) -> None:
     _QUIET = bool(flag)
 
 
+def _stderr_is_tty() -> bool:
+    return bool(getattr(sys.stderr, "isatty", lambda: False)())
+
+
+def _clear_transient_progress_line() -> None:
+    """Clear active in-place progress output so permanent lines stay readable."""
+    global _TRANSIENT_PROGRESS_ACTIVE, _TRANSIENT_PROGRESS_LAST_LEN
+    if not _TRANSIENT_PROGRESS_ACTIVE:
+        return
+    if _stderr_is_tty():
+        clear_width = max(_VERBOSE_CLEAR_WIDTH, _TRANSIENT_PROGRESS_LAST_LEN)
+        sys.stderr.write("\r" + " " * clear_width + "\r")
+        sys.stderr.flush()
+    _TRANSIENT_PROGRESS_ACTIVE = False
+    _TRANSIENT_PROGRESS_LAST_LEN = 0
+
+
 def _stderr_supports_color() -> bool:
     if _QUIET:
         return False
@@ -164,6 +183,7 @@ def _progress(msg: str) -> None:
     """Print always-on milestone progress lines to stderr unless quiet mode is enabled."""
     if _QUIET:
         return
+    _clear_transient_progress_line()
     sys.stderr.write(msg + "\n")
     sys.stderr.flush()
 
@@ -172,12 +192,32 @@ def _progress_done(msg: str) -> None:
     """Print completed milestone progress lines with a checkmark marker."""
     if _QUIET:
         return
+    _clear_transient_progress_line()
     if _stderr_supports_color():
         prefix = "\033[32m✓\033[0m "
     else:
         prefix = "✓ "
     sys.stderr.write(prefix + msg + "\n")
     sys.stderr.flush()
+
+
+def _progress_inline(msg: str) -> None:
+    """Print transient in-place progress updates for interactive terminals."""
+    global _TRANSIENT_PROGRESS_ACTIVE, _TRANSIENT_PROGRESS_LAST_LEN
+    if _QUIET:
+        return
+    if not _stderr_is_tty():
+        _progress(msg)
+        return
+
+    padded_msg = msg
+    if _TRANSIENT_PROGRESS_ACTIVE and _TRANSIENT_PROGRESS_LAST_LEN > len(msg):
+        padded_msg = msg + " " * (_TRANSIENT_PROGRESS_LAST_LEN - len(msg))
+
+    sys.stderr.write("\r" + padded_msg)
+    sys.stderr.flush()
+    _TRANSIENT_PROGRESS_ACTIVE = True
+    _TRANSIENT_PROGRESS_LAST_LEN = len(msg)
 
 
 def _vprint(msg: str) -> None:
@@ -1135,7 +1175,7 @@ def _fetch_provider_graph(
                     if isinstance(expected_raw, int) and expected_raw > 0:
                         expected_display = str(expected_raw)
 
-                    _progress(
+                    _progress_inline(
                         f"  [{provider_name}] Seed {seed_pos}/{seed_total}: "
                         f"citers {fetched_raw}/{expected_display}"
                     )
@@ -1191,9 +1231,7 @@ def _fetch_provider_graph(
     if depth.lower() in {"l2l3", "l3", "2"}:
         l2_parent_ids = list(l2_edges.keys())
         total_l2_parents = len(l2_parent_ids)
-        _progress(
-            f"  [{provider.name}] L3 hydration started: {total_l2_parents} L2 parent(s)"
-        )
+        _progress(f"  [{provider.name}] L3 hydration started: {total_l2_parents} L2 parent(s)")
         l3_progress_fn = l3_progress_callback
         last_l3_parent_index: Optional[int] = None
         if l3_progress_callback is not None or not _QUIET:
@@ -1231,7 +1269,7 @@ def _fetch_provider_graph(
                     if isinstance(parent_targets, list):
                         refs_display = str(len(parent_targets))
 
-                _progress(
+                _progress_inline(
                     f"  [{provider_name}] L3 parent {parent_index}/{total_l2_parents}: "
                     f"references {refs_display}"
                 )

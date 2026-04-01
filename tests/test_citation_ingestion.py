@@ -1668,6 +1668,32 @@ def test_quiet_mode_suppresses_progress_and_verbose_output(monkeypatch, tmp_path
     assert captured.err == ""
 
 
+def test_progress_inline_overwrites_when_tty(monkeypatch, capsys):
+    """Inline progress should use carriage-return updates on interactive stderr."""
+    ci.set_quiet(False)
+    monkeypatch.setattr(ci.sys.stderr, "isatty", lambda: True, raising=False)
+
+    ci._progress_inline("inline 1/3")
+    ci._progress_inline("inline 2/3")
+    ci._progress_done("inline complete")
+
+    captured = capsys.readouterr()
+    assert "\rinline 1/3" in captured.err
+    assert "\rinline 2/3" in captured.err
+    assert "inline complete" in captured.err
+
+
+def test_progress_inline_falls_back_to_newlines_when_not_tty(monkeypatch, capsys):
+    """Inline progress should degrade to durable newline output for non-TTY stderr."""
+    ci.set_quiet(False)
+    monkeypatch.setattr(ci.sys.stderr, "isatty", lambda: False, raising=False)
+
+    ci._progress_inline("inline fallback")
+
+    captured = capsys.readouterr()
+    assert "inline fallback\n" in captured.err
+
+
 def test_verbose_off_produces_no_output(monkeypatch, capsys):
     """_vprint and _countdown_sleep should produce no output when verbose is off."""
     ci.set_quiet(False)
