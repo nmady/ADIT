@@ -1,0 +1,15 @@
+theory_name: Automated Detection of Implicit Theory
+acronym: ADIT
+l1_papers:
+  - 10.1109/HICSS.2014.564 # Larsen et al. (2014) - Theory Identity: A Machine-Learning Approach
+online: true
+depth: l2l3
+key_constructs:
+  - theory identity
+  - implicit theory
+cache_dir: .cache/adit_ingestion
+refresh_cache: false
+only_ingest: true
+save_ingested_citation_data: outputs/adit_data.json
+save_ingested_papers_data: outputs/adit_papers_data.json
+output_features: outputs/adit_features.csv

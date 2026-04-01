@@ -1,5 +1,6 @@
 import io
 import logging
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -3586,3 +3587,76 @@ def test_parallel_wave1_execution_path_runs(monkeypatch, tmp_path):
 
     # Both providers should contribute at least one edge in parallel wave-1 mode.
     assert result.metadata["edge_count"] >= 2
+
+
+def test_parallel_l2_to_l3_execution_path_runs(monkeypatch, tmp_path):
+    tracker = {"active": 0, "overlap": False, "lock": threading.Lock()}
+
+    class _ParallelL3Provider(ci.CitationProvider):
+        capabilities = ci.ProviderCapabilities(
+            True,
+            True,
+            True,
+            supports_cited_by_traversal=True,
+            supports_l3_outgoing=False,
+        )
+
+        def __init__(self, name: str):
+            self.name = name
+
+        def fetch_seed_metadata(self, l1_papers):
+            return {
+                "doi:10.1000/xyz1": ci.IngestionPaper(
+                    paper_id="doi:10.1000/xyz1",
+                    source_ids={self.name: f"seed:{self.name}:L1"},
+                )
+            }
+
+        def fetch_citers_for_l1(self, l1_provider_id, max_results=None, resume_state=None, progress_callback=None):
+            parent_id = f"{self.name}:L2A"
+            return (
+                {
+                    parent_id: ci.IngestionPaper(
+                        paper_id=parent_id,
+                        source_ids={self.name: f"{self.name}:L2A"},
+                    )
+                },
+                1,
+                "complete",
+            )
+
+        def fetch_l3_references(self, l2_paper_ids, max_l3=None, resume_state=None, progress_callback=None):
+            with tracker["lock"]:
+                tracker["active"] += 1
+                if tracker["active"] >= 2:
+                    tracker["overlap"] = True
+
+            time.sleep(0.06)
+
+            with tracker["lock"]:
+                tracker["active"] -= 1
+
+            parent = l2_paper_ids[0]
+            ref_id = f"doi:10.1000/{self.name}-l3"
+            return (
+                {parent: {ref_id}},
+                {ref_id: ci.IngestionPaper(paper_id=ref_id, doi=ref_id.split(":", 1)[1])},
+            )
+
+    p1 = _ParallelL3Provider("parallel_l3_a")
+    p2 = _ParallelL3Provider("parallel_l3_b")
+    monkeypatch.setattr(ci, "build_providers", lambda _: [p1, p2])
+
+    result = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["parallel_l3_a", "parallel_l3_b"],
+        depth="l2l3",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        max_workers=2,
+    )
+
+    assert tracker["overlap"] is True
+    assert result.metadata["provider_stats"]["parallel_l3_a"]["l3_edges"] == 1
+    assert result.metadata["provider_stats"]["parallel_l3_b"]["l3_edges"] == 1

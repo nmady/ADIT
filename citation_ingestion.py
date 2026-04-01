@@ -1532,6 +1532,45 @@ def _run_provider_wave1_worker(
         raise ProviderIngestionError(provider.name, exc) from exc
 
 
+def _run_provider_l2_to_l3_worker(
+    provider: CitationProvider,
+    l2_parent_ids: Sequence[str],
+    max_l3: Optional[int],
+    provider_l3_state: Optional[Dict[str, Any]],
+    checkpoint_root: Path,
+    request_key: str,
+) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper], Dict[str, Any]]:
+    """Run L2->L3 expansion for one provider with provider-local checkpoint updates."""
+    try:
+        local_l3_state: Dict[str, Any] = dict(provider_l3_state or {})
+
+        def _l3_progress(state: Dict[str, Any]) -> None:
+            local_l3_state.clear()
+            local_l3_state.update(dict(state))
+            _write_provider_checkpoint_state(
+                checkpoint_root,
+                request_key,
+                provider.name,
+                provider_pagination_state={},
+                provider_l3_state=local_l3_state,
+            )
+
+        l3_call_kwargs: Dict[str, Any] = {
+            "l2_paper_ids": list(l2_parent_ids),
+            "max_l3": max_l3,
+        }
+        l3_signature = inspect.signature(provider.fetch_l3_references)
+        if "resume_state" in l3_signature.parameters:
+            l3_call_kwargs["resume_state"] = local_l3_state
+        if "progress_callback" in l3_signature.parameters:
+            l3_call_kwargs["progress_callback"] = _l3_progress
+
+        l3_edges, l3_papers = provider.fetch_l3_references(**l3_call_kwargs)
+        return l3_edges, l3_papers, local_l3_state
+    except Exception as exc:  # pragma: no cover - exercised by parallel failure tests
+        raise ProviderIngestionError(provider.name, exc) from exc
+
+
 def _merge_seed_metadata(
     all_papers: Dict[str, IngestionPaper],
     seed_papers: Dict[str, IngestionPaper],
@@ -3431,6 +3470,7 @@ def ingest_from_internet(
 
         l3_providers = [provider for provider in providers if provider.capabilities.supports_reference_expansion]
         l3_provider_total = len(l3_providers)
+        l3_jobs: List[Tuple[CitationProvider, int, List[str], Dict[str, Any]]] = []
         for l3_provider_index, provider in enumerate(l3_providers, start=1):
             if provider.name in l2_to_l3_completed:
                 _progress_done(
@@ -3485,22 +3525,15 @@ def ingest_from_internet(
                 _persist_checkpoint_snapshot()
                 continue
 
-            def _l3_progress(state: Dict[str, Any]) -> None:
-                provider_l3_run_state.clear()
-                provider_l3_run_state.update(dict(state))
-                _persist_checkpoint_snapshot()
+            l3_jobs.append((provider, l3_provider_index, provider_l2_parent_ids, provider_l3_run_state))
 
-            l3_call_kwargs: Dict[str, Any] = {
-                "l2_paper_ids": provider_l2_parent_ids,
-                "max_l3": max_l3,
-            }
-            l3_signature = inspect.signature(provider.fetch_l3_references)
-            if "resume_state" in l3_signature.parameters:
-                l3_call_kwargs["resume_state"] = provider_l3_run_state
-            if "progress_callback" in l3_signature.parameters:
-                l3_call_kwargs["progress_callback"] = _l3_progress
-
-            l3_edges, l3_papers = provider.fetch_l3_references(**l3_call_kwargs)
+        def _finalize_l2_to_l3_provider(
+            provider: CitationProvider,
+            l3_provider_index: int,
+            l3_edges: Dict[str, Set[str]],
+            l3_papers: Dict[str, IngestionPaper],
+            local_l3_state: Dict[str, Any],
+        ) -> None:
             _merge_provider_outputs(all_edges, all_papers, l3_edges, l3_papers)
 
             l3_edges_added = sum(len(cited) for cited in l3_edges.values())
@@ -3523,7 +3556,104 @@ def ingest_from_internet(
             l2_to_l3_completed.add(provider.name)
             provider_l3_state["__completed_providers"] = {"names": sorted(l2_to_l3_completed)}
             provider_l3_state.pop(provider.name, None)
+            _write_provider_checkpoint_state(
+                checkpoint_root,
+                key,
+                provider.name,
+                provider_pagination_state={},
+                provider_l3_state={},
+            )
             _persist_checkpoint_snapshot()
+
+        if max_workers is not None and max_workers > 1 and len(l3_jobs) > 1:
+            effective_workers = min(max_workers, len(l3_jobs))
+            merge_lock = threading.Lock()
+            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                futures = {}
+                for provider, l3_provider_index, provider_l2_parent_ids, provider_l3_run_state in l3_jobs:
+                    futures[
+                        executor.submit(
+                            _run_provider_l2_to_l3_worker,
+                            provider,
+                            provider_l2_parent_ids,
+                            max_l3,
+                            provider_l3_run_state,
+                            checkpoint_root,
+                            key,
+                        )
+                    ] = (provider, l3_provider_index)
+
+                for future in as_completed(futures):
+                    provider, l3_provider_index = futures[future]
+                    try:
+                        l3_edges, l3_papers, local_l3_state = future.result()
+                    except ProviderIngestionError as exc:
+                        provider_checkpoint = _load_provider_checkpoint_state(
+                            checkpoint_root,
+                            key,
+                            exc.provider_name,
+                            False,
+                        )
+                        if provider_checkpoint:
+                            checkpoint_l3_state = provider_checkpoint.get("provider_l3_state")
+                            if isinstance(checkpoint_l3_state, dict):
+                                provider_l3_state[exc.provider_name] = checkpoint_l3_state
+                                _persist_checkpoint_snapshot()
+
+                        provider_stats[exc.provider_name] = {
+                            "status": "failed",
+                            "error": str(exc.cause),
+                        }
+                        _progress(
+                            f"  [{exc.provider_name}] L2->L3 provider "
+                            f"{l3_provider_index}/{l3_provider_total}: "
+                            f"failed ({exc.cause}) — continuing"
+                        )
+                        continue
+
+                    with merge_lock:
+                        provider_l3_state[provider.name] = dict(local_l3_state)
+                        _finalize_l2_to_l3_provider(
+                            provider,
+                            l3_provider_index,
+                            l3_edges,
+                            l3_papers,
+                            local_l3_state,
+                        )
+        else:
+            for provider, l3_provider_index, provider_l2_parent_ids, provider_l3_run_state in l3_jobs:
+                try:
+                    l3_edges, l3_papers, local_l3_state = _run_provider_l2_to_l3_worker(
+                        provider,
+                        provider_l2_parent_ids,
+                        max_l3,
+                        provider_l3_run_state,
+                        checkpoint_root,
+                        key,
+                    )
+                except ProviderIngestionError as exc:
+                    provider_checkpoint = _load_provider_checkpoint_state(
+                        checkpoint_root,
+                        key,
+                        provider.name,
+                        False,
+                    )
+                    if provider_checkpoint:
+                        checkpoint_l3_state = provider_checkpoint.get("provider_l3_state")
+                        if isinstance(checkpoint_l3_state, dict):
+                            provider_l3_state[provider.name] = checkpoint_l3_state
+                            _persist_checkpoint_snapshot()
+
+                    # Preserve existing single-provider semantics: surface root cause.
+                    raise exc.cause from exc
+                provider_l3_state[provider.name] = dict(local_l3_state)
+                _finalize_l2_to_l3_provider(
+                    provider,
+                    l3_provider_index,
+                    l3_edges,
+                    l3_papers,
+                    local_l3_state,
+                )
 
     # ── Second pass: L3→L3 edge discovery ──────────────────────────────
     # After the first pass completes (L2→L3), build the L3 membership set
