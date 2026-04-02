@@ -3202,6 +3202,7 @@ def ingest_from_internet(
         )
 
     parallel_completed: Set[str] = set()
+    parallel_attempted: Set[str] = set()
     if max_workers is not None and max_workers > 1:
         parallel_candidates = [
             provider
@@ -3217,6 +3218,7 @@ def ingest_from_internet(
             with ThreadPoolExecutor(max_workers=effective_workers) as executor:
                 futures = {}
                 for provider in parallel_candidates:
+                    parallel_attempted.add(provider.name)
                     provider_index = provider_index_map.get(provider.name, 0)
                     executed_names = checkpoint_stats["executed_provider_names"]
                     if isinstance(executed_names, list):
@@ -3327,6 +3329,8 @@ def ingest_from_internet(
 
     provider_total = len(providers)
     for provider_index, provider in enumerate(providers, start=1):
+        if provider.name in parallel_attempted:
+            continue
         if provider.name in parallel_completed:
             continue
         if provider.name in completed_providers:

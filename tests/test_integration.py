@@ -274,6 +274,18 @@ def test_ingestion_checkpoint_resume_feeds_adit_pipeline(monkeypatch, tmp_path, 
     assert resumed.citation_data == baseline.citation_data
     assert resumed.papers_data == baseline.papers_data
 
+    # Checkpoint-file shape assertions.
+    # Sequential mode (no max_workers): only the main `.checkpoint.json` should be present;
+    # coordinator and per-provider files are written exclusively in parallel mode.
+    assert any(checkpoint_dir.glob("*.checkpoint.json")), (
+        "Expected a main checkpoint file after crash + resume"
+    )
+    assert not any(checkpoint_dir.glob("*.coordinator.checkpoint.json")), (
+        "Coordinator checkpoint should only be written in parallel mode"
+    )
+    provider_checkpoint_files = list(checkpoint_dir.glob("*.provider.checkpoint.json"))
+    assert provider_checkpoint_files, "Expected provider checkpoint files to be present"
+
     adit = ADIT(
         "Technology Acceptance Model",
         l1,
