@@ -134,6 +134,8 @@ _SAFE_GET_MAX_DELAY = 60.0
 _SAFE_GET_BACKOFF_FACTOR = 2.0
 _SAFE_GET_RETRY_AFTER_MAX_SECONDS = 300  # cap on server-specified Retry-After waits
 _PAGINATION_STATE_MAX_AGE_SECONDS = 6 * 60 * 60
+_FAILURE_SUMMARY_REQUEST_INTERVAL = 50
+_FAILURE_SUMMARY_SECONDS_INTERVAL = 15.0
 
 # ---------------------------------------------------------------------------
 # Verbose terminal output
@@ -141,6 +143,7 @@ _PAGINATION_STATE_MAX_AGE_SECONDS = 6 * 60 * 60
 
 _VERBOSE: bool = False
 _QUIET: bool = False
+_DEBUG_HTTP: bool = False
 _VERBOSE_CLEAR_WIDTH = 80  # column width used when clearing a transient line
 _TRANSIENT_PROGRESS_ACTIVE: bool = False
 _TRANSIENT_PROGRESS_LAST_LEN: int = 0
@@ -158,6 +161,12 @@ def set_quiet(flag: bool) -> None:
     """Enable or disable standard ingestion progress messages."""
     global _QUIET
     _QUIET = bool(flag)
+
+
+def set_debug_http(flag: bool) -> None:
+    """Enable or disable HTTP response-body diagnostics for failed requests."""
+    global _DEBUG_HTTP
+    _DEBUG_HTTP = bool(flag)
 
 
 def _stderr_is_tty() -> bool:
@@ -309,6 +318,9 @@ _INGEST_STATS = {
     "total_requests": 0,
     "total_failures": 0,
     "per_provider_failures": {},
+    "per_status_failures": {},
+    "last_summary_request_count": 0,
+    "last_summary_timestamp": 0.0,
 }
 
 
@@ -331,15 +343,55 @@ def _reset_ingest_stats(source_list: Sequence[str]) -> None:
     _INGEST_STATS["total_requests"] = 0
     _INGEST_STATS["total_failures"] = 0
     _INGEST_STATS["per_provider_failures"] = dict.fromkeys(source_list, 0)
+    _INGEST_STATS["per_status_failures"] = {}
+    _INGEST_STATS["last_summary_request_count"] = 0
+    _INGEST_STATS["last_summary_timestamp"] = time.time()
 
 
-def _record_request_failure(provider: Optional[str]) -> None:
+def _record_request_failure(provider: Optional[str], status_code: Optional[int] = None) -> None:
     """Increment global and per-provider failure counters."""
+    code_key = str(status_code) if status_code is not None else "unknown"
     with _STATS_LOCK:
         _INGEST_STATS["total_failures"] += 1
+        per_status = _INGEST_STATS["per_status_failures"]
+        per_status[code_key] = int(per_status.get(code_key, 0)) + 1
         if provider:
             failures = _INGEST_STATS["per_provider_failures"]
             failures[provider] = int(failures.get(provider, 0)) + 1
+
+
+def _emit_failure_summary_if_due(force: bool = False) -> None:
+    """Emit periodic aggregate failure counts to keep long runs readable."""
+    with _STATS_LOCK:
+        total_failures = int(_INGEST_STATS["total_failures"])
+        if total_failures <= 0:
+            return
+
+        total_requests = int(_INGEST_STATS["total_requests"])
+        now = time.time()
+        last_count = int(_INGEST_STATS["last_summary_request_count"])
+        last_ts = float(_INGEST_STATS["last_summary_timestamp"])
+        requests_delta = total_requests - last_count
+        time_delta = now - last_ts
+
+        if not force and requests_delta < _FAILURE_SUMMARY_REQUEST_INTERVAL:
+            if time_delta < _FAILURE_SUMMARY_SECONDS_INTERVAL:
+                return
+
+        _INGEST_STATS["last_summary_request_count"] = total_requests
+        _INGEST_STATS["last_summary_timestamp"] = now
+        per_status = dict(_INGEST_STATS["per_status_failures"])
+
+    status_tokens = [f"{code}={count}" for code, count in sorted(per_status.items())]
+    status_summary = ", ".join(status_tokens) if status_tokens else "none"
+    summary_msg = (
+        "[ADIT] HTTP failures so far: "
+        f"{total_failures}/{total_requests} request(s) failed ({status_summary})"
+    )
+    if force:
+        _progress(summary_msg)
+    else:
+        _progress_inline(summary_msg)
 
 
 def _compute_retry_sleep(last_error: Exception, delay: float) -> Tuple[float, str]:
@@ -388,15 +440,29 @@ def _safe_get(
             error_body = _http_error_body(exc)
             last_error_body = error_body
             if exc.code in _PERMANENT_FAILURE_HTTP_CODES:
-                _record_request_failure(provider)
-                logger.warning(
-                    "Permanent HTTP failure: provider=%s status=%s url=%s body=%s",
-                    provider,
-                    exc.code,
-                    url,
-                    error_body,
-                )
+                _record_request_failure(provider, status_code=exc.code)
+                log_body = error_body if _DEBUG_HTTP else "<suppressed; enable --debug-http>"
+                if exc.code == 404 and not _DEBUG_HTTP:
+                    logger.debug(
+                        "Permanent HTTP failure: provider=%s status=%s url=%s body=%s",
+                        provider,
+                        exc.code,
+                        url,
+                        log_body,
+                    )
+                else:
+                    logger.warning(
+                        "Permanent HTTP failure: provider=%s status=%s url=%s body=%s",
+                        provider,
+                        exc.code,
+                        url,
+                        log_body,
+                    )
                 _vprint(f"  [{provider or 'unknown'}] Permanent HTTP {exc.code} — skipping request")
+                if _DEBUG_HTTP and error_body:
+                    body_preview = re.sub(r"\s+", " ", error_body).strip()[:240]
+                    _vprint(f"    body: {body_preview}")
+                _emit_failure_summary_if_due()
                 return None
             last_error = exc
         except Exception as exc:
@@ -427,16 +493,21 @@ def _safe_get(
             )
             delay *= _SAFE_GET_BACKOFF_FACTOR
 
-    _record_request_failure(provider)
+    _record_request_failure(provider, status_code=getattr(last_error, "code", None))
+    log_body = last_error_body if _DEBUG_HTTP else "<suppressed; enable --debug-http>"
     logger.warning(
         "Request failed after %d attempts: provider=%s url=%s final_error=%s body=%s",
         max_retries,
         provider,
         url,
         last_error,
-        last_error_body,
+        log_body,
     )
     _vprint(f"  [{provider or 'unknown'}] All {max_retries} retries exhausted — skipping request")
+    if _DEBUG_HTTP and last_error_body:
+        body_preview = re.sub(r"\s+", " ", last_error_body).strip()[:240]
+        _vprint(f"    body: {body_preview}")
+    _emit_failure_summary_if_due()
     return None
 
 
@@ -785,7 +856,10 @@ def _load_coordinator_checkpoint_state(
 
     if not isinstance(payload, dict):
         return None
-    if payload.get("coordinator_checkpoint_schema_version") != _COORDINATOR_CHECKPOINT_SCHEMA_VERSION:
+    if (
+        payload.get("coordinator_checkpoint_schema_version")
+        != _COORDINATOR_CHECKPOINT_SCHEMA_VERSION
+    ):
         return None
     if payload.get("request_key") != key:
         return None
@@ -1679,6 +1753,7 @@ def _build_metadata(
             "total_requests": int(_INGEST_STATS["total_requests"]),
             "total_failures": int(_INGEST_STATS["total_failures"]),
             "per_provider_failures": dict(_INGEST_STATS["per_provider_failures"]),
+            "per_status_failures": dict(_INGEST_STATS["per_status_failures"]),
         },
         "completeness": completeness,
         "cache_key": cache_key,
@@ -3031,6 +3106,7 @@ def ingest_from_internet(
     exhaustive: bool = True,
     verbose: bool = False,
     quiet: bool = False,
+    debug_http: bool = False,
     max_workers: Optional[int] = None,
     checkpoint_dir: Optional[Path] = None,
     reset_checkpoints: bool = False,
@@ -3045,6 +3121,7 @@ def ingest_from_internet(
         verbose: When ``True``, print live progress messages to stderr
             (per-seed status, retry countdowns).
         quiet: When ``True``, suppress standard and verbose progress messages.
+        debug_http: When ``True``, include failed-response bodies in diagnostics.
         checkpoint_staleness_seconds: Optional staleness window in seconds for
             checkpoint resume state. When unset, defaults to
             ``_PAGINATION_STATE_MAX_AGE_SECONDS``.
@@ -3056,6 +3133,7 @@ def ingest_from_internet(
 
     set_verbose(verbose)
     set_quiet(quiet)
+    set_debug_http(debug_http)
     source_list = (
         ["openalex", "semantic_scholar", "crossref", "core"] if not sources else list(sources)
     )
@@ -3211,7 +3289,9 @@ def ingest_from_internet(
         ]
         if parallel_candidates:
             provider_total = len(providers)
-            provider_index_map = {provider.name: idx for idx, provider in enumerate(providers, start=1)}
+            provider_index_map = {
+                provider.name: idx for idx, provider in enumerate(providers, start=1)
+            }
             merge_lock = threading.Lock()
             effective_workers = min(max_workers, len(parallel_candidates))
 
@@ -3289,7 +3369,9 @@ def ingest_from_internet(
 
                     with merge_lock:
                         _merge_seed_metadata(all_papers, seed_metadata)
-                        _merge_provider_outputs(all_edges, all_papers, provider_edges, provider_papers)
+                        _merge_provider_outputs(
+                            all_edges, all_papers, provider_edges, provider_papers
+                        )
                         provider_stats[provider.name] = stats
                         for l1_id, l1_completeness in stats.get("completeness", {}).items():
                             combined_completeness.setdefault(l1_id, {}).update(l1_completeness)
@@ -3472,7 +3554,9 @@ def ingest_from_internet(
             if isinstance(names, list):
                 l2_to_l3_completed = {n for n in names if isinstance(n, str)}
 
-        l3_providers = [provider for provider in providers if provider.capabilities.supports_reference_expansion]
+        l3_providers = [
+            provider for provider in providers if provider.capabilities.supports_reference_expansion
+        ]
         l3_provider_total = len(l3_providers)
         l3_jobs: List[Tuple[CitationProvider, int, List[str], Dict[str, Any]]] = []
         for l3_provider_index, provider in enumerate(l3_providers, start=1):
@@ -3522,14 +3606,14 @@ def ingest_from_internet(
                     "skipped (no provider-linked deduped parents)"
                 )
                 l2_to_l3_completed.add(provider.name)
-                provider_l3_state["__completed_providers"] = {
-                    "names": sorted(l2_to_l3_completed)
-                }
+                provider_l3_state["__completed_providers"] = {"names": sorted(l2_to_l3_completed)}
                 provider_l3_state.pop(provider.name, None)
                 _persist_checkpoint_snapshot()
                 continue
 
-            l3_jobs.append((provider, l3_provider_index, provider_l2_parent_ids, provider_l3_run_state))
+            l3_jobs.append(
+                (provider, l3_provider_index, provider_l2_parent_ids, provider_l3_run_state)
+            )
 
         def _finalize_l2_to_l3_provider(
             provider: CitationProvider,
@@ -3574,7 +3658,12 @@ def ingest_from_internet(
             merge_lock = threading.Lock()
             with ThreadPoolExecutor(max_workers=effective_workers) as executor:
                 futures = {}
-                for provider, l3_provider_index, provider_l2_parent_ids, provider_l3_run_state in l3_jobs:
+                for (
+                    provider,
+                    l3_provider_index,
+                    provider_l2_parent_ids,
+                    provider_l3_run_state,
+                ) in l3_jobs:
                     futures[
                         executor.submit(
                             _run_provider_l2_to_l3_worker,
@@ -3625,7 +3714,12 @@ def ingest_from_internet(
                             local_l3_state,
                         )
         else:
-            for provider, l3_provider_index, provider_l2_parent_ids, provider_l3_run_state in l3_jobs:
+            for (
+                provider,
+                l3_provider_index,
+                provider_l2_parent_ids,
+                provider_l3_run_state,
+            ) in l3_jobs:
                 try:
                     l3_edges, l3_papers, local_l3_state = _run_provider_l2_to_l3_worker(
                         provider,
@@ -3782,6 +3876,7 @@ def ingest_from_internet(
         "metadata": metadata,
     }
     _write_cache(cache_root, key, result_payload)
+    _emit_failure_summary_if_due(force=True)
     _progress_done(f"[ADIT] Cached ingestion result: key={key}")
     _progress_done(
         f"[ADIT] Ingestion complete: {metadata['paper_count']} papers, {metadata['edge_count']} edges"

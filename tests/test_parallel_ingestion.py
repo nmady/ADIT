@@ -11,12 +11,8 @@ Six tests covering:
 
 import threading
 import time
-from pathlib import Path
-
-import pytest
 
 import citation_ingestion as ci
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared helper provider
@@ -50,7 +46,11 @@ class _SimpleL2Provider(ci.CitationProvider):
         l2_id = f"{self.name}:L2A"
         return (
             {l2_id: {seed}},
-            {l2_id: ci.IngestionPaper(paper_id=l2_id, title=f"{self.name} L2A", year=2022, citations=1)},
+            {
+                l2_id: ci.IngestionPaper(
+                    paper_id=l2_id, title=f"{self.name} L2A", year=2022, citations=1
+                )
+            },
         )
 
     def fetch_l3_references(self, l2_paper_ids, max_l3=None):
@@ -262,7 +262,9 @@ def test_max_workers_none_is_sequential(monkeypatch, tmp_path):
     """ThreadPoolExecutor must never be constructed when max_workers is None."""
 
     def _assert_not_called(*args, **kwargs):
-        raise AssertionError("ThreadPoolExecutor should not be constructed when max_workers is None")
+        raise AssertionError(
+            "ThreadPoolExecutor should not be constructed when max_workers is None"
+        )
 
     monkeypatch.setattr(ci, "ThreadPoolExecutor", _assert_not_called)
 

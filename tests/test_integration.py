@@ -6,8 +6,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from adit import ADIT
 import citation_ingestion as ci
+from adit import ADIT
 
 
 def test_adit_full_pipeline(mock_transformer, sample_citation_data, sample_papers_data):
@@ -277,12 +277,12 @@ def test_ingestion_checkpoint_resume_feeds_adit_pipeline(monkeypatch, tmp_path, 
     # Checkpoint-file shape assertions.
     # Sequential mode (no max_workers): only the main `.checkpoint.json` should be present;
     # coordinator and per-provider files are written exclusively in parallel mode.
-    assert any(checkpoint_dir.glob("*.checkpoint.json")), (
-        "Expected a main checkpoint file after crash + resume"
-    )
-    assert not any(checkpoint_dir.glob("*.coordinator.checkpoint.json")), (
-        "Coordinator checkpoint should only be written in parallel mode"
-    )
+    assert any(
+        checkpoint_dir.glob("*.checkpoint.json")
+    ), "Expected a main checkpoint file after crash + resume"
+    assert not any(
+        checkpoint_dir.glob("*.coordinator.checkpoint.json")
+    ), "Coordinator checkpoint should only be written in parallel mode"
     provider_checkpoint_files = list(checkpoint_dir.glob("*.provider.checkpoint.json"))
     assert provider_checkpoint_files, "Expected provider checkpoint files to be present"
 

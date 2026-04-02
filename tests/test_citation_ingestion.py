@@ -7,8 +7,9 @@ import urllib.parse
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import citation_ingestion as ci
 import pytest
+
+import citation_ingestion as ci
 
 
 class _FakeProvider(ci.CitationProvider):
@@ -290,6 +291,7 @@ def test_ingest_from_internet_metadata_includes_fetch_stats(monkeypatch, tmp_pat
     assert isinstance(stats["total_requests"], int)
     assert isinstance(stats["total_failures"], int)
     assert isinstance(stats["per_provider_failures"], dict)
+    assert isinstance(stats["per_status_failures"], dict)
     assert stats["per_provider_failures"]["fake"] == 0
 
 
@@ -843,8 +845,8 @@ def test_safe_get_exhausts_retries_and_returns_none(monkeypatch):
     assert ci._INGEST_STATS["total_failures"] == 1
 
 
-def test_safe_get_logs_http_error_body_on_permanent_failure(monkeypatch, caplog):
-    """_safe_get should include the server response body in permanent failure logs."""
+def test_safe_get_suppresses_http_error_body_without_debug_http(monkeypatch, caplog):
+    """_safe_get should suppress response bodies unless debug-http mode is enabled."""
 
     def fake_urlopen(req, timeout=None):
         raise urllib.error.HTTPError(
@@ -857,9 +859,37 @@ def test_safe_get_logs_http_error_body_on_permanent_failure(monkeypatch, caplog)
 
     monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
     ci._reset_ingest_stats(["test"])
+    ci.set_debug_http(False)
 
     with caplog.at_level(logging.WARNING):
         result = ci._safe_get("https://example.com/test", provider="test")
+
+    assert result is None
+    assert "offset + limit must be < 10000" not in caplog.text
+    assert "suppressed" in caplog.text
+
+
+def test_safe_get_logs_http_error_body_when_debug_http_enabled(monkeypatch, caplog):
+    """_safe_get should include response bodies when debug-http mode is enabled."""
+
+    def fake_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(
+            url="https://example.com/test",
+            code=400,
+            msg="bad request",
+            hdrs=None,
+            fp=io.BytesIO(b'{"error":"offset + limit must be < 10000"}'),
+        )
+
+    monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    ci._reset_ingest_stats(["test"])
+    ci.set_debug_http(True)
+
+    try:
+        with caplog.at_level(logging.WARNING):
+            result = ci._safe_get("https://example.com/test", provider="test")
+    finally:
+        ci.set_debug_http(False)
 
     assert result is None
     assert "offset + limit must be < 10000" in caplog.text
@@ -1769,6 +1799,26 @@ def test_verbose_safe_get_prints_permanent_failure(monkeypatch, capsys):
     assert result is None
     assert "404" in captured.err
     assert "skipping" in captured.err.lower()
+
+
+def test_safe_get_emits_periodic_failure_summary(monkeypatch, capsys):
+    """Periodic failure summaries should emit aggregate counts in long runs."""
+
+    def fake_urlopen(req, timeout=None):
+        raise _make_http_error(404)
+
+    monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(ci, "_FAILURE_SUMMARY_REQUEST_INTERVAL", 1)
+    monkeypatch.setattr(ci, "_FAILURE_SUMMARY_SECONDS_INTERVAL", 9999.0)
+    ci._reset_ingest_stats(["test"])
+    ci.set_quiet(False)
+    ci.set_verbose(False)
+
+    ci._safe_get("https://example.com/not-found", provider="test")
+    captured = capsys.readouterr()
+
+    assert "HTTP failures so far" in captured.err
+    assert "404=1" in captured.err
 
 
 # ---------------------------------------------------------------------------
@@ -3612,7 +3662,9 @@ def test_parallel_l2_to_l3_execution_path_runs(monkeypatch, tmp_path):
                 )
             }
 
-        def fetch_citers_for_l1(self, l1_provider_id, max_results=None, resume_state=None, progress_callback=None):
+        def fetch_citers_for_l1(
+            self, l1_provider_id, max_results=None, resume_state=None, progress_callback=None
+        ):
             parent_id = f"{self.name}:L2A"
             return (
                 {
@@ -3625,7 +3677,9 @@ def test_parallel_l2_to_l3_execution_path_runs(monkeypatch, tmp_path):
                 "complete",
             )
 
-        def fetch_l3_references(self, l2_paper_ids, max_l3=None, resume_state=None, progress_callback=None):
+        def fetch_l3_references(
+            self, l2_paper_ids, max_l3=None, resume_state=None, progress_callback=None
+        ):
             with tracker["lock"]:
                 tracker["active"] += 1
                 if tracker["active"] >= 2:

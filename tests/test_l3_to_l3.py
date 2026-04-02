@@ -4,8 +4,9 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
-import citation_ingestion as ci
 import pytest
+
+import citation_ingestion as ci
 
 # ── Helpers ──────────────────────────────────────────────────────────
 

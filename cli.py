@@ -115,6 +115,14 @@ QUIET_OPTION = typer.Option(
     "-q",
     help="Suppress ingestion progress output on stderr.",
 )
+DEBUG_HTTP_OPTION = typer.Option(
+    False,
+    "--debug-http",
+    help=(
+        "Include failed HTTP response bodies in diagnostics/logging. "
+        "Useful for troubleshooting provider-specific failures."
+    ),
+)
 
 
 def _load_config(config_path: Optional[Path]) -> Dict[str, Any]:
@@ -216,6 +224,7 @@ def _resolve_cli_inputs(
     exhaustive: bool,
     verbose: bool,
     quiet: bool,
+    debug_http: bool,
 ) -> Dict[str, Any]:
     l1_cfg = cfg.get("l1_papers")
     l1_cfg_str = ",".join(l1_cfg) if isinstance(l1_cfg, list) else None
@@ -276,6 +285,7 @@ def _resolve_cli_inputs(
         "exhaustive": bool(exhaustive if exhaustive is not None else cfg.get("exhaustive", True)),
         "verbose": bool(verbose or cfg.get("verbose", False)),
         "quiet": bool(quiet or cfg.get("quiet", False)),
+        "debug_http": bool(debug_http or cfg.get("debug_http", False)),
     }
 
 
@@ -325,6 +335,7 @@ def _load_pipeline_inputs(params: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[
             exhaustive=params.get("exhaustive", True),
             verbose=params.get("verbose", False),
             quiet=params.get("quiet", False),
+            debug_http=params.get("debug_http", False),
         )
         typer.echo(
             "Online ingestion complete: "
@@ -388,6 +399,7 @@ def run(
     exhaustive: bool = EXHAUSTIVE_OPTION,
     verbose: bool = VERBOSE_OPTION,
     quiet: bool = QUIET_OPTION,
+    debug_http: bool = DEBUG_HTTP_OPTION,
 ) -> None:
     """Run ADIT using CLI values and/or a config file."""
     cfg = _load_config(config)
@@ -421,6 +433,7 @@ def run(
         exhaustive,
         verbose,
         quiet,
+        debug_http,
     )
 
     if not params["theory_name"]:
