@@ -1006,20 +1006,47 @@ def _merge_papers(existing: IngestionPaper, incoming: IngestionPaper) -> Ingesti
     ``_dedupe_and_materialize``) rely on this guarantee.
 
     Returns a new ``IngestionPaper`` without mutating either argument.
-    """
-    # Title / abstract: longer string is treated as more complete.
-    best_title = (
-        incoming.title
-        if incoming.title and len(incoming.title) > len(existing.title)
-        else existing.title
-    )
-    best_abstract = (
-        incoming.abstract
-        if incoming.abstract and len(incoming.abstract) > len(existing.abstract)
-        else existing.abstract
-    )
 
+    Uncertain merges (cases where non-empty existing data is overwritten or
+    silently discarded) are logged at DEBUG level so that callers can surface
+    them when diagnosing unexpected metadata.
+    """
+    pid = existing.paper_id
+
+    # ------------------------------------------------------------------
+    # Title: prefer the longer non-empty string (more complete text).
+    # Log when we discard a non-empty existing title in favour of incoming.
+    # ------------------------------------------------------------------
+    if incoming.title and len(incoming.title) > len(existing.title):
+        if existing.title:
+            logger.debug(
+                "merge[%s] title overwritten: %r -> %r",
+                pid,
+                existing.title,
+                incoming.title,
+            )
+        best_title = incoming.title
+    else:
+        best_title = existing.title
+
+    # ------------------------------------------------------------------
+    # Abstract: same length-preference logic as title.
+    # ------------------------------------------------------------------
+    if incoming.abstract and len(incoming.abstract) > len(existing.abstract):
+        if existing.abstract:
+            logger.debug(
+                "merge[%s] abstract overwritten (%d chars -> %d chars)",
+                pid,
+                len(existing.abstract),
+                len(incoming.abstract),
+            )
+        best_abstract = incoming.abstract
+    else:
+        best_abstract = existing.abstract
+
+    # ------------------------------------------------------------------
     # Keywords: union-merge comma-separated entries so neither source loses data.
+    # ------------------------------------------------------------------
     if incoming.keywords and existing.keywords:
         existing_kw = {k.strip() for k in existing.keywords.split(",") if k.strip()}
         incoming_kw = {k.strip() for k in incoming.keywords.split(",") if k.strip()}
@@ -1027,14 +1054,35 @@ def _merge_papers(existing: IngestionPaper, incoming: IngestionPaper) -> Ingesti
     else:
         merged_keywords = incoming.keywords or existing.keywords
 
-    # Citations: take the higher count.  Both values may be stale snapshots from
-    # different fetch times; without timestamps we cannot determine which is fresher.
+    # ------------------------------------------------------------------
+    # Citations: take the higher count.  Both values may be stale snapshots
+    # from different fetch times; without timestamps we cannot determine which
+    # is fresher.  Log whenever two non-zero counts diverge so the caller can
+    # see which value was discarded.
+    # ------------------------------------------------------------------
     best_citations = max(existing.citations, incoming.citations)
+    if existing.citations > 0 and incoming.citations > 0 and existing.citations != incoming.citations:
+        discarded = min(existing.citations, incoming.citations)
+        logger.debug(
+            "merge[%s] citation count conflict: keeping %d, discarding %d",
+            pid,
+            best_citations,
+            discarded,
+        )
 
-    # Year: accept incoming only when we have no year yet.  Provider-specific
-    # sentinel values (e.g. a default year returned when the real year is unknown)
-    # should be normalised to None *before* calling this function.
+    # ------------------------------------------------------------------
+    # Year: accept incoming only when we have no year yet.  Log when both
+    # records carry a year but disagree — incoming's value is silently
+    # dropped and the caller may want to investigate.
+    # ------------------------------------------------------------------
     best_year = existing.year or incoming.year
+    if existing.year is not None and incoming.year is not None and existing.year != incoming.year:
+        logger.debug(
+            "merge[%s] year conflict: keeping existing %d, discarding incoming %d",
+            pid,
+            existing.year,
+            incoming.year,
+        )
 
     return IngestionPaper(
         paper_id=existing.paper_id,

@@ -1,5 +1,6 @@
 """Unit tests for the _merge_papers helper."""
 
+import logging
 import pytest
 
 from citation_ingestion import IngestionPaper, _merge_papers
@@ -232,3 +233,102 @@ class TestSourceIds:
         result.source_ids["new"] = "X"
         assert "new" not in a.source_ids
         assert "new" not in b.source_ids
+
+
+# ---------------------------------------------------------------------------
+# Logging: uncertain merges
+# ---------------------------------------------------------------------------
+
+
+class TestMergeLogging:
+    """Verify that uncertain overwrites are surfaced via logger.debug."""
+
+    def test_title_overwrite_is_logged(self, caplog):
+        a = _paper(paper_id="p1", title="Original title")
+        b = _paper(paper_id="p1", title="A longer replacement title")
+        with caplog.at_level(logging.DEBUG, logger="citation_ingestion"):
+            _merge_papers(a, b)
+        assert any("title overwritten" in r.message for r in caplog.records)
+
+    def test_no_title_log_when_existing_is_empty(self, caplog):
+        """Filling an empty title from incoming is expected — not a warning."""
+        a = _paper(paper_id="p1", title="")
+        b = _paper(paper_id="p1", title="New title")
+        with caplog.at_level(logging.DEBUG, logger="citation_ingestion"):
+            _merge_papers(a, b)
+        assert not any("title overwritten" in r.message for r in caplog.records)
+
+    def test_no_title_log_when_existing_wins(self, caplog):
+        """When existing title is kept (it's longer), nothing is discarded."""
+        a = _paper(paper_id="p1", title="A longer existing title")
+        b = _paper(paper_id="p1", title="Short")
+        with caplog.at_level(logging.DEBUG, logger="citation_ingestion"):
+            _merge_papers(a, b)
+        assert not any("title overwritten" in r.message for r in caplog.records)
+
+    def test_abstract_overwrite_is_logged(self, caplog):
+        a = _paper(paper_id="p2", abstract="Short abstract.")
+        b = _paper(paper_id="p2", abstract="A much longer abstract with more detail.")
+        with caplog.at_level(logging.DEBUG, logger="citation_ingestion"):
+            _merge_papers(a, b)
+        assert any("abstract overwritten" in r.message for r in caplog.records)
+
+    def test_no_abstract_log_when_existing_is_empty(self, caplog):
+        a = _paper(paper_id="p2", abstract="")
+        b = _paper(paper_id="p2", abstract="New abstract.")
+        with caplog.at_level(logging.DEBUG, logger="citation_ingestion"):
+            _merge_papers(a, b)
+        assert not any("abstract overwritten" in r.message for r in caplog.records)
+
+    def test_citation_conflict_is_logged(self, caplog):
+        a = _paper(paper_id="p3", citations=10)
+        b = _paper(paper_id="p3", citations=25)
+        with caplog.at_level(logging.DEBUG, logger="citation_ingestion"):
+            _merge_papers(a, b)
+        assert any("citation count conflict" in r.message for r in caplog.records)
+
+    def test_no_citation_log_when_counts_are_equal(self, caplog):
+        a = _paper(paper_id="p3", citations=15)
+        b = _paper(paper_id="p3", citations=15)
+        with caplog.at_level(logging.DEBUG, logger="citation_ingestion"):
+            _merge_papers(a, b)
+        assert not any("citation count conflict" in r.message for r in caplog.records)
+
+    def test_no_citation_log_when_existing_is_zero(self, caplog):
+        """Zero citations means no prior data — filling it is unambiguous."""
+        a = _paper(paper_id="p3", citations=0)
+        b = _paper(paper_id="p3", citations=12)
+        with caplog.at_level(logging.DEBUG, logger="citation_ingestion"):
+            _merge_papers(a, b)
+        assert not any("citation count conflict" in r.message for r in caplog.records)
+
+    def test_year_conflict_is_logged(self, caplog):
+        a = _paper(paper_id="p4", year=2015)
+        b = _paper(paper_id="p4", year=2019)
+        with caplog.at_level(logging.DEBUG, logger="citation_ingestion"):
+            _merge_papers(a, b)
+        assert any("year conflict" in r.message for r in caplog.records)
+
+    def test_no_year_log_when_existing_is_none(self, caplog):
+        """Filling a missing year from incoming is unambiguous — not a conflict."""
+        a = _paper(paper_id="p4", year=None)
+        b = _paper(paper_id="p4", year=2018)
+        with caplog.at_level(logging.DEBUG, logger="citation_ingestion"):
+            _merge_papers(a, b)
+        assert not any("year conflict" in r.message for r in caplog.records)
+
+    def test_no_year_log_when_years_match(self, caplog):
+        a = _paper(paper_id="p4", year=2020)
+        b = _paper(paper_id="p4", year=2020)
+        with caplog.at_level(logging.DEBUG, logger="citation_ingestion"):
+            _merge_papers(a, b)
+        assert not any("year conflict" in r.message for r in caplog.records)
+
+    def test_log_messages_include_paper_id(self, caplog):
+        """paper_id should appear in every log message for traceability."""
+        a = _paper(paper_id="doi:10.1/test", title="Short", year=2010, citations=5)
+        b = _paper(paper_id="doi:10.1/test", title="A longer replacement title", year=2020, citations=50)
+        with caplog.at_level(logging.DEBUG, logger="citation_ingestion"):
+            _merge_papers(a, b)
+        for record in caplog.records:
+            assert "doi:10.1/test" in record.message
