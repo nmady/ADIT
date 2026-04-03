@@ -6,6 +6,7 @@ import math
 import os
 import random
 import re
+import shutil
 import sys
 import threading
 import time
@@ -154,6 +155,65 @@ _DEBUG_HTTP: bool = False
 _VERBOSE_CLEAR_WIDTH = 80  # column width used when clearing a transient line
 _TRANSIENT_PROGRESS_ACTIVE: bool = False
 _TRANSIENT_PROGRESS_LAST_LEN: int = 0
+_PROVIDER_TQDM_ACTIVE: bool = False
+_PROVIDER_TQDM_DEFAULT_NCOLS = 110
+_PROVIDER_TQDM_MIN_NCOLS = 96
+_PROVIDER_TQDM_MAX_NCOLS = 130
+_PROVIDER_TQDM_DESC_MIN_WIDTH = 24
+_PROVIDER_TQDM_DESC_MAX_WIDTH = 34
+
+
+def _provider_tqdm_ncols() -> int:
+    """Return a stable width that fits the active terminal when possible."""
+    terminal_cols = shutil.get_terminal_size((
+        _PROVIDER_TQDM_DEFAULT_NCOLS,
+        20,
+    )).columns
+    preferred_cols = max(_PROVIDER_TQDM_MIN_NCOLS, terminal_cols - 2)
+    return min(_PROVIDER_TQDM_MAX_NCOLS, preferred_cols)
+
+
+def _provider_tqdm_desc(provider_name: str, phase_label: str) -> str:
+    """Create a fixed-width provider label to keep bars visually aligned."""
+    return f"[{provider_name}] {phase_label}"
+
+
+def _provider_tqdm_desc_width(provider_names: Sequence[str], phase_label: str) -> int:
+    """Compute one shared desc width so bars in a block remain column-aligned."""
+    if not provider_names:
+        return _PROVIDER_TQDM_DESC_MIN_WIDTH
+
+    longest = max(len(_provider_tqdm_desc(name, phase_label)) for name in provider_names)
+    return max(_PROVIDER_TQDM_DESC_MIN_WIDTH, min(_PROVIDER_TQDM_DESC_MAX_WIDTH, longest))
+
+
+def _create_provider_tqdm(
+    provider_name: str,
+    phase_label: str,
+    total: int,
+    position: int,
+    unit: str,
+    desc_width: int,
+) -> tqdm:
+    """Create a provider progress bar with consistent sizing and layout."""
+    ncols = _provider_tqdm_ncols()
+    # Reserve width for static fields and use the remainder for the visual bar.
+    bar_width = max(14, min(34, ncols - (desc_width + 48)))
+    return tqdm(
+        total=max(1, int(total or 1)),
+        desc=_provider_tqdm_desc(provider_name, phase_label),
+        position=position,
+        leave=True,
+        dynamic_ncols=False,
+        ncols=ncols,
+        bar_format=(
+            f"{{desc:<{desc_width}}} "
+            f"|{{bar:{bar_width}}}| "
+            "{n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}"
+        ),
+        unit=unit,
+        file=sys.stderr,
+    )
 _PROGRESS_LOCK = threading.RLock()
 _STATS_LOCK = threading.Lock()
 _TRANSIENT_FAILURES_LOCK = threading.Lock()
@@ -209,8 +269,11 @@ def _progress(msg: str) -> None:
         return
     with _PROGRESS_LOCK:
         _clear_transient_progress_line()
-        sys.stderr.write(msg + "\n")
-        sys.stderr.flush()
+        if _PROVIDER_TQDM_ACTIVE:
+            tqdm.write(msg, file=sys.stderr)
+        else:
+            sys.stderr.write(msg + "\n")
+            sys.stderr.flush()
 
 
 def _progress_done(msg: str) -> None:
@@ -223,14 +286,17 @@ def _progress_done(msg: str) -> None:
             prefix = "\033[32m✓\033[0m "
         else:
             prefix = "✓ "
-        sys.stderr.write(prefix + msg + "\n")
-        sys.stderr.flush()
+        if _PROVIDER_TQDM_ACTIVE:
+            tqdm.write(prefix + msg, file=sys.stderr)
+        else:
+            sys.stderr.write(prefix + msg + "\n")
+            sys.stderr.flush()
 
 
 def _progress_inline(msg: str) -> None:
     """Print transient in-place progress updates for interactive terminals."""
     global _TRANSIENT_PROGRESS_ACTIVE, _TRANSIENT_PROGRESS_LAST_LEN
-    if _QUIET:
+    if _QUIET or _PROVIDER_TQDM_ACTIVE:
         return
     if not _stderr_is_tty():
         _progress(msg)
@@ -252,8 +318,35 @@ def _vprint(msg: str) -> None:
     if _QUIET or not _VERBOSE:
         return
     with _PROGRESS_LOCK:
-        sys.stderr.write(msg + "\n")
-        sys.stderr.flush()
+        if _PROVIDER_TQDM_ACTIVE:
+            tqdm.write(msg, file=sys.stderr)
+        else:
+            sys.stderr.write(msg + "\n")
+            sys.stderr.flush()
+
+
+def _update_provider_tqdm_bar(
+    provider_bars: Dict[str, tqdm],
+    provider_name: str,
+    completed: int,
+    total: int,
+    status: Optional[str],
+    lock: threading.Lock,
+) -> None:
+    """Safely update one provider progress bar from sequential/parallel workers."""
+    bar = provider_bars.get(provider_name)
+    if bar is None:
+        return
+
+    bounded_total = max(int(total or 1), 1)
+    bounded_completed = max(0, min(int(completed), bounded_total))
+    with lock:
+        if bar.total != bounded_total:
+            bar.total = bounded_total
+        bar.n = bounded_completed
+        if status:
+            bar.set_postfix_str(status)
+        bar.refresh()
 
 
 def _retry_after_seconds(exc: urllib.error.HTTPError) -> Optional[float]:
@@ -1857,6 +1950,7 @@ def _fetch_l2_via_cited_by_traversal(
     max_results: Optional[int],
     provider_seed_state: Optional[Dict[str, Dict[str, Any]]],
     seed_progress_callback: Optional[Callable[[str, Dict[str, Any]], None]],
+    provider_progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> tuple[Dict[str, Set[str]], Dict[str, IngestionPaper], Dict[str, Dict[str, object]]]:
     """Collect provider-local L2 edges/papers by traversing citers for each seed."""
     l2_edges: Dict[str, Set[str]] = {}
@@ -1875,6 +1969,8 @@ def _fetch_l2_via_cited_by_traversal(
                 l1_id=l1_id,
                 completeness=completeness,
             )
+            if provider_progress_callback is not None:
+                provider_progress_callback(seed_index, total_seeds, "skipped")
             continue
 
         _progress(
@@ -1906,6 +2002,8 @@ def _fetch_l2_via_cited_by_traversal(
             f"  [{provider.name}] Seed {seed_index}/{total_seeds}: "
             f"fetched {len(papers_for_l1)}/{expected_count or '?'} papers ({status})"
         )
+        if provider_progress_callback is not None:
+            provider_progress_callback(seed_index, total_seeds, status)
         completeness.setdefault(l1_id, {})[provider.name] = {
             "status": status,
             "fetched": len(papers_for_l1),
@@ -1995,6 +2093,7 @@ def _fetch_provider_graph(
     max_l3: Optional[int],
     provider_seed_state: Optional[Dict[str, Dict[str, Any]]] = None,
     seed_progress_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    provider_progress_callback: Optional[Callable[[int, int, str], None]] = None,
     provider_l3_state: Optional[Dict[str, Any]] = None,
     l3_progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     include_l3: bool = True,
@@ -2017,6 +2116,7 @@ def _fetch_provider_graph(
             max_results=max_results,
             provider_seed_state=provider_seed_state,
             seed_progress_callback=seed_progress_callback,
+            provider_progress_callback=provider_progress_callback,
         )
     else:
         # Keyword-search fallback: used for Crossref and any provider lacking cited-by support.
@@ -2028,6 +2128,8 @@ def _fetch_provider_graph(
         )
         l2_edges, l2_papers = dict(search_edges), dict(search_papers)
         completeness = {}
+        if provider_progress_callback is not None:
+            provider_progress_callback(1, 1, "complete")
 
     _progress(
         f"  [{provider.name}] Total L2 nodes collected across all seeds (provider-local): {len(l2_edges)}"
@@ -2082,6 +2184,7 @@ def _run_provider_wave1_worker(
     provider_transient_failures: Optional[Dict[str, Dict[str, Any]]],
     checkpoint_root: Path,
     request_key: str,
+    provider_progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> Tuple[
     Dict[str, IngestionPaper],
     Dict[str, Set[str]],
@@ -2140,6 +2243,7 @@ def _run_provider_wave1_worker(
             max_l3=max_l3,
             provider_seed_state=local_seed_state,
             seed_progress_callback=_seed_progress,
+            provider_progress_callback=provider_progress_callback,
             provider_l3_state=local_l3_state,
             l3_progress_callback=_l3_progress,
             include_l3=False,
@@ -2170,6 +2274,7 @@ def _run_provider_l2_to_l3_worker(
     provider_transient_failures: Optional[Dict[str, Dict[str, Any]]],
     checkpoint_root: Path,
     request_key: str,
+    provider_progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> Tuple[
     Dict[str, Set[str]],
     Dict[str, IngestionPaper],
@@ -2187,6 +2292,14 @@ def _run_provider_l2_to_l3_worker(
         def _l3_progress(state: Dict[str, Any]) -> None:
             local_l3_state.clear()
             local_l3_state.update(dict(state))
+            if provider_progress_callback is not None:
+                progress_raw = state.get("next_l2_index")
+                progress_index = progress_raw if isinstance(progress_raw, int) else 0
+                provider_progress_callback(
+                    progress_index,
+                    len(l2_parent_ids),
+                    str(state.get("status") or "in_progress"),
+                )
             _write_provider_checkpoint_state(
                 checkpoint_root,
                 request_key,
@@ -2207,6 +2320,8 @@ def _run_provider_l2_to_l3_worker(
             l3_call_kwargs["progress_callback"] = _l3_progress
 
         l3_edges, l3_papers = provider.fetch_l3_references(**l3_call_kwargs)
+        if provider_progress_callback is not None:
+            provider_progress_callback(len(l2_parent_ids), len(l2_parent_ids), "complete")
         drained_failures = _drain_transient_request_failures(provider.name)
         _merge_provider_transient_failures(local_transient_failures, drained_failures)
         _prune_provider_transient_failures(provider.name, local_transient_failures)
@@ -3468,7 +3583,7 @@ def _dedupe_and_materialize(
     merged_by_key: Dict[str, IngestionPaper] = {}
     key_to_final_id: Dict[str, str] = {}
 
-    for paper in tqdm(all_papers.values()):
+    for paper in tqdm(all_papers.values(), disable=_QUIET, leave=False):
         key = _canonical_merge_key(paper)
         if key in merged_by_key:
             merged_by_key[key] = _merge_papers(merged_by_key[key], paper)
@@ -3909,6 +4024,7 @@ def _execute_l2_to_l3_jobs(
     key: str,
     checkpoint_stats: Dict[str, object],
     persist_callback: Callable[[], None],
+    provider_progress_callbacks: Optional[Dict[str, Callable[[int, int, str], None]]] = None,
 ) -> None:
     """Execute L2->L3 jobs (parallel or sequential based on max_workers)."""
 
@@ -3927,6 +4043,7 @@ def _execute_l2_to_l3_jobs(
             key=key,
             checkpoint_stats=checkpoint_stats,
             persist_callback=persist_callback,
+            provider_progress_callbacks=provider_progress_callbacks,
         )
         return
 
@@ -3943,6 +4060,7 @@ def _execute_l2_to_l3_jobs(
         key=key,
         checkpoint_stats=checkpoint_stats,
         persist_callback=persist_callback,
+        provider_progress_callbacks=provider_progress_callbacks,
     )
 
 
@@ -4043,6 +4161,7 @@ def _execute_l2_to_l3_parallel_jobs(
     key: str,
     checkpoint_stats: Dict[str, object],
     persist_callback: Callable[[], None],
+    provider_progress_callbacks: Optional[Dict[str, Callable[[int, int, str], None]]] = None,
 ) -> None:
     effective_workers = min(max_workers, len(l3_jobs))
     merge_lock = threading.Lock()
@@ -4050,6 +4169,9 @@ def _execute_l2_to_l3_parallel_jobs(
     with ThreadPoolExecutor(max_workers=effective_workers) as executor:
         futures = {}
         for provider, l3_provider_index, provider_l2_parent_ids, provider_l3_run_state in l3_jobs:
+            provider_progress_callback = None
+            if provider_progress_callbacks is not None:
+                provider_progress_callback = provider_progress_callbacks.get(provider.name)
             futures[
                 executor.submit(
                     _run_provider_l2_to_l3_worker,
@@ -4060,14 +4182,19 @@ def _execute_l2_to_l3_parallel_jobs(
                     provider_transient_failures.get(provider.name, {}),
                     checkpoint_root,
                     key,
+                    provider_progress_callback,
                 )
-            ] = (provider, l3_provider_index)
+            ] = (provider, l3_provider_index, len(provider_l2_parent_ids))
 
         for future in as_completed(futures):
-            provider, l3_provider_index = futures[future]
+            provider, l3_provider_index, provider_parent_total = futures[future]
             try:
                 l3_edges, l3_papers, local_l3_state, local_transient_state = future.result()
             except ProviderIngestionError as exc:
+                if provider_progress_callbacks is not None:
+                    progress_cb = provider_progress_callbacks.get(exc.provider_name)
+                    if progress_cb is not None:
+                        progress_cb(provider_parent_total, provider_parent_total, "failed")
                 _restore_failed_l2_to_l3_state(
                     provider_name=exc.provider_name,
                     provider_l3_state=provider_l3_state,
@@ -4085,6 +4212,11 @@ def _execute_l2_to_l3_parallel_jobs(
                     f"failed ({exc.cause}) — continuing"
                 )
                 continue
+
+            if provider_progress_callbacks is not None:
+                progress_cb = provider_progress_callbacks.get(provider.name)
+                if progress_cb is not None:
+                    progress_cb(provider_parent_total, provider_parent_total, "done")
 
             with merge_lock:
                 provider_l3_state[provider.name] = dict(local_l3_state)
@@ -4122,9 +4254,13 @@ def _execute_l2_to_l3_sequential_jobs(
     key: str,
     checkpoint_stats: Dict[str, object],
     persist_callback: Callable[[], None],
+    provider_progress_callbacks: Optional[Dict[str, Callable[[int, int, str], None]]] = None,
 ) -> None:
     l3_job_total = len(l3_jobs)
     for provider, l3_provider_index, provider_l2_parent_ids, provider_l3_run_state in l3_jobs:
+        provider_progress_callback = None
+        if provider_progress_callbacks is not None:
+            provider_progress_callback = provider_progress_callbacks.get(provider.name)
         try:
             l3_edges, l3_papers, local_l3_state, local_transient_state = (
                 _run_provider_l2_to_l3_worker(
@@ -4135,9 +4271,16 @@ def _execute_l2_to_l3_sequential_jobs(
                     provider_transient_failures.get(provider.name, {}),
                     checkpoint_root,
                     key,
+                    provider_progress_callback,
                 )
             )
         except ProviderIngestionError as exc:
+            if provider_progress_callback is not None:
+                provider_progress_callback(
+                    len(provider_l2_parent_ids),
+                    len(provider_l2_parent_ids),
+                    "failed",
+                )
             _restore_failed_l2_to_l3_state(
                 provider_name=provider.name,
                 provider_l3_state=provider_l3_state,
@@ -4147,6 +4290,12 @@ def _execute_l2_to_l3_sequential_jobs(
                 persist_callback=persist_callback,
             )
             raise exc.cause from exc
+        if provider_progress_callback is not None:
+            provider_progress_callback(
+                len(provider_l2_parent_ids),
+                len(provider_l2_parent_ids),
+                "done",
+            )
         provider_l3_state[provider.name] = dict(local_l3_state)
         provider_transient_failures[provider.name] = dict(local_transient_state)
         _finalize_l2_to_l3_provider(
@@ -4194,6 +4343,7 @@ def _scan_l3_provider_edges(
     checkpoint_stats: Dict[str, object],
     persist_callback: Callable[[], None],
     provider_fetch_func: Callable[..., Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper]]],
+    provider_progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> Tuple[Dict[str, Set[str]], int]:
     """Scan one L3 provider for outgoing references. Returns retained edges and count."""
     run_state = l3_to_l3_state.get(provider_name)
@@ -4215,6 +4365,14 @@ def _scan_l3_provider_edges(
     def _l3_to_l3_progress(state: Dict[str, Any], _rs: Dict[str, Any] = run_state) -> None:
         _rs.clear()
         _rs.update(dict(state))
+        if provider_progress_callback is not None:
+            progress_raw = state.get("next_l3_parent_index")
+            progress_index = progress_raw if isinstance(progress_raw, int) else 0
+            provider_progress_callback(
+                progress_index,
+                len(l3_parent_ids),
+                str(state.get("status") or "in_progress"),
+            )
         persist_callback()
 
     raw_edges, raw_papers = provider_fetch_func(
@@ -4223,6 +4381,8 @@ def _scan_l3_provider_edges(
         resume_state=run_state,
         progress_callback=_l3_to_l3_progress,
     )
+    if provider_progress_callback is not None:
+        provider_progress_callback(len(l3_parent_ids), len(l3_parent_ids), "complete")
 
     retained_edges: Dict[str, Set[str]] = {}
     for parent, targets in raw_edges.items():
@@ -4272,21 +4432,55 @@ def _run_l2_to_l3_pass(
         persist_callback=persist_callback,
     )
 
-    _execute_l2_to_l3_jobs(
-        l3_jobs=l3_jobs,
-        l2_to_l3_completed=l2_to_l3_completed,
-        all_edges=all_edges,
-        all_papers=all_papers,
-        provider_stats=provider_stats,
-        provider_l3_state=provider_l3_state,
-        provider_transient_failures=provider_transient_failures,
-        max_workers=max_workers,
-        max_l3=max_l3,
-        checkpoint_root=checkpoint_root,
-        key=key,
-        checkpoint_stats=checkpoint_stats,
-        persist_callback=persist_callback,
-    )
+    bars_lock = threading.Lock()
+    provider_bars: Dict[str, tqdm] = {}
+    provider_progress_callbacks: Dict[str, Callable[[int, int, str], None]] = {}
+
+    global _PROVIDER_TQDM_ACTIVE
+    _PROVIDER_TQDM_ACTIVE = bool(not _QUIET and _stderr_is_tty() and l3_jobs)
+    if _PROVIDER_TQDM_ACTIVE:
+        desc_width = _provider_tqdm_desc_width([provider.name for provider, *_ in l3_jobs], "l2->l3")
+        for bar_position, (provider, _, provider_l2_parent_ids, _) in enumerate(l3_jobs):
+            provider_bars[provider.name] = _create_provider_tqdm(
+                provider_name=provider.name,
+                phase_label="l2->l3",
+                total=max(1, len(provider_l2_parent_ids)),
+                position=bar_position,
+                unit="parent",
+                desc_width=desc_width,
+            )
+            provider_progress_callbacks[provider.name] = (
+                lambda completed, total, status, provider_name=provider.name: _update_provider_tqdm_bar(
+                    provider_bars,
+                    provider_name,
+                    completed,
+                    total,
+                    status,
+                    bars_lock,
+                )
+            )
+
+    try:
+        _execute_l2_to_l3_jobs(
+            l3_jobs=l3_jobs,
+            l2_to_l3_completed=l2_to_l3_completed,
+            all_edges=all_edges,
+            all_papers=all_papers,
+            provider_stats=provider_stats,
+            provider_l3_state=provider_l3_state,
+            provider_transient_failures=provider_transient_failures,
+            max_workers=max_workers,
+            max_l3=max_l3,
+            checkpoint_root=checkpoint_root,
+            key=key,
+            checkpoint_stats=checkpoint_stats,
+            persist_callback=persist_callback,
+            provider_progress_callbacks=provider_progress_callbacks or None,
+        )
+    finally:
+        for bar in provider_bars.values():
+            bar.close()
+        _PROVIDER_TQDM_ACTIVE = False
 
 
 def _run_l3_to_l3_pass(
@@ -4317,29 +4511,72 @@ def _run_l3_to_l3_pass(
     total_l3_to_l3_edges = 0
     l3_providers = [p for p in providers if p.capabilities.supports_l3_outgoing]
     l3_provider_total = len(l3_providers)
-    for l3_provider_index, provider in enumerate(l3_providers, start=1):
-        if provider.name in l3_to_l3_completed:
-            _progress_done(
-                f"  [{provider.name}] L3->L3 provider {l3_provider_index}/{l3_provider_total}: "
-                "skipped (checkpoint complete)"
-            )
-            continue
+    bars_lock = threading.Lock()
+    provider_bars: Dict[str, tqdm] = {}
+    provider_progress_callbacks: Dict[str, Callable[[int, int, str], None]] = {}
 
-        retained_count = _run_l3_to_l3_provider(
-            provider=provider,
-            l3_provider_index=l3_provider_index,
-            l3_provider_total=l3_provider_total,
-            l3_parent_ids=l3_parent_ids,
-            l3_member_set=l3_member_set,
-            all_edges=all_edges,
-            l3_to_l3_completed=l3_to_l3_completed,
-            l3_to_l3_state=l3_to_l3_state,
-            max_l3=max_l3,
-            effective_staleness_seconds=effective_staleness_seconds,
-            checkpoint_stats=checkpoint_stats,
-            persist_callback=persist_callback,
-        )
-        total_l3_to_l3_edges += retained_count
+    global _PROVIDER_TQDM_ACTIVE
+    _PROVIDER_TQDM_ACTIVE = bool(not _QUIET and _stderr_is_tty() and l3_providers)
+    if _PROVIDER_TQDM_ACTIVE:
+        desc_width = _provider_tqdm_desc_width([provider.name for provider in l3_providers], "l3->l3")
+        for bar_position, provider in enumerate(l3_providers):
+            provider_bars[provider.name] = _create_provider_tqdm(
+                provider_name=provider.name,
+                phase_label="l3->l3",
+                total=max(1, len(l3_parent_ids)),
+                position=bar_position,
+                unit="parent",
+                desc_width=desc_width,
+            )
+            provider_progress_callbacks[provider.name] = (
+                lambda completed, total, status, provider_name=provider.name: _update_provider_tqdm_bar(
+                    provider_bars,
+                    provider_name,
+                    completed,
+                    total,
+                    status,
+                    bars_lock,
+                )
+            )
+
+    try:
+        for l3_provider_index, provider in enumerate(l3_providers, start=1):
+            if provider.name in l3_to_l3_completed:
+                if _PROVIDER_TQDM_ACTIVE:
+                    _update_provider_tqdm_bar(
+                        provider_bars,
+                        provider.name,
+                        max(1, len(l3_parent_ids)),
+                        max(1, len(l3_parent_ids)),
+                        "skipped",
+                        bars_lock,
+                    )
+                _progress_done(
+                    f"  [{provider.name}] L3->L3 provider {l3_provider_index}/{l3_provider_total}: "
+                    "skipped (checkpoint complete)"
+                )
+                continue
+
+            retained_count = _run_l3_to_l3_provider(
+                provider=provider,
+                l3_provider_index=l3_provider_index,
+                l3_provider_total=l3_provider_total,
+                l3_parent_ids=l3_parent_ids,
+                l3_member_set=l3_member_set,
+                all_edges=all_edges,
+                l3_to_l3_completed=l3_to_l3_completed,
+                l3_to_l3_state=l3_to_l3_state,
+                max_l3=max_l3,
+                effective_staleness_seconds=effective_staleness_seconds,
+                checkpoint_stats=checkpoint_stats,
+                persist_callback=persist_callback,
+                provider_progress_callback=provider_progress_callbacks.get(provider.name),
+            )
+            total_l3_to_l3_edges += retained_count
+    finally:
+        for bar in provider_bars.values():
+            bar.close()
+        _PROVIDER_TQDM_ACTIVE = False
 
     checkpoint_stats["l3_to_l3_edges_added"] = total_l3_to_l3_edges
     checkpoint_stats["l3_to_l3_parent_scanned_count"] = len(l3_parent_ids)
@@ -4383,6 +4620,7 @@ def _run_l3_to_l3_provider(
     effective_staleness_seconds: int,
     checkpoint_stats: Dict[str, object],
     persist_callback: Callable[[], None],
+    provider_progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> int:
     _progress(
         f"  [{provider.name}] L3->L3 provider {l3_provider_index}/{l3_provider_total}: "
@@ -4399,7 +4637,10 @@ def _run_l3_to_l3_provider(
         checkpoint_stats=checkpoint_stats,
         persist_callback=persist_callback,
         provider_fetch_func=provider.fetch_l3_outgoing_references,
+        provider_progress_callback=provider_progress_callback,
     )
+    if provider_progress_callback is not None:
+        provider_progress_callback(len(l3_parent_ids), len(l3_parent_ids), "done")
     _progress_done(
         f"  [{provider.name}] L3->L3 provider {l3_provider_index}/{l3_provider_total}: "
         f"retained {retained_count} edges"
@@ -4440,6 +4681,7 @@ def _run_parallel_wave1_providers(
     key: str,
     reset_checkpoints: bool,
     persist_callback: Callable[[], None],
+    wave1_desc_width: Optional[int] = None,
 ) -> Tuple[Set[str], Set[str]]:
     """Run parallel wave-1 ingestion across non-crossref providers.
 
@@ -4457,125 +4699,185 @@ def _run_parallel_wave1_providers(
     provider_index_map = {p.name: idx for idx, p in enumerate(providers, start=1)}
     merge_lock = threading.Lock()
     effective_workers = min(max_workers, len(parallel_candidates))
+    bars_lock = threading.Lock()
+    provider_bars: Dict[str, tqdm] = {}
 
-    with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-        futures = {}
-        for provider in parallel_candidates:
-            parallel_attempted.add(provider.name)
-            provider_index = provider_index_map.get(provider.name, 0)
-            executed_names = checkpoint_stats["executed_provider_names"]
-            if isinstance(executed_names, list):
-                executed_names.append(provider.name)
-            checkpoint_stats["providers_executed"] = int(checkpoint_stats["providers_executed"]) + 1
-            _progress(
-                f"[ADIT] Provider {provider_index}/{provider_total}: {provider.name} "
-                "(parallel wave-1)"
+    global _PROVIDER_TQDM_ACTIVE
+    _PROVIDER_TQDM_ACTIVE = bool(not _QUIET and _stderr_is_tty() and parallel_candidates)
+    if _PROVIDER_TQDM_ACTIVE:
+        desc_width = wave1_desc_width or _provider_tqdm_desc_width(
+            [provider.name for provider in parallel_candidates],
+            "wave-1",
+        )
+        for bar_position, provider in enumerate(parallel_candidates):
+            total = max(1, len(l1_norm)) if provider.capabilities.supports_cited_by_traversal else 1
+            unit = "seed" if provider.capabilities.supports_cited_by_traversal else "step"
+            provider_bars[provider.name] = _create_provider_tqdm(
+                provider_name=provider.name,
+                phase_label="wave-1",
+                total=total,
+                position=bar_position,
+                unit=unit,
+                desc_width=desc_width,
             )
 
-            provider_resume_state = provider_pagination_state.get(provider.name, {})
-            provider_l3_resume_state = provider_l3_state.get(provider.name, {})
-            provider_transient_state = provider_transient_failures.get(provider.name, {})
-            provider_checkpoint = _load_provider_checkpoint_state(
-                checkpoint_root, key, provider.name, reset_checkpoints
-            )
-            if provider_checkpoint:
-                checkpoint_seed_state = provider_checkpoint.get("provider_pagination_state")
-                if isinstance(checkpoint_seed_state, dict):
-                    provider_resume_state = checkpoint_seed_state
-                checkpoint_l3_state = provider_checkpoint.get("provider_l3_state")
-                if isinstance(checkpoint_l3_state, dict):
-                    provider_l3_resume_state = checkpoint_l3_state
-                checkpoint_transient_state = provider_checkpoint.get("transient_failures")
-                if isinstance(checkpoint_transient_state, dict):
-                    provider_transient_state = checkpoint_transient_state
+    try:
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            futures = {}
+            for provider in parallel_candidates:
+                parallel_attempted.add(provider.name)
+                provider_index = provider_index_map.get(provider.name, 0)
+                executed_names = checkpoint_stats["executed_provider_names"]
+                if isinstance(executed_names, list):
+                    executed_names.append(provider.name)
+                checkpoint_stats["providers_executed"] = int(checkpoint_stats["providers_executed"]) + 1
+                if not _PROVIDER_TQDM_ACTIVE:
+                    _progress(
+                        f"[ADIT] Provider {provider_index}/{provider_total}: {provider.name} "
+                        "(parallel wave-1)"
+                    )
 
-            provider_transient_state = _deserialize_transient_failures(
-                {provider.name: provider_transient_state}
-            ).get(provider.name, {})
-
-            future = executor.submit(
-                _run_provider_wave1_worker,
-                provider,
-                l1_norm,
-                dict(all_papers),
-                theory_name,
-                key_constructs,
-                depth,
-                exhaustive,
-                max_l2,
-                max_l3,
-                provider_resume_state,
-                provider_l3_resume_state,
-                provider_transient_state,
-                checkpoint_root,
-                key,
-            )
-            futures[future] = (provider, provider_index)
-
-        for future in as_completed(futures):
-            provider, provider_index = futures[future]
-            try:
-                (
-                    seed_metadata,
-                    provider_edges,
-                    provider_papers,
-                    stats,
-                    local_seed_state,
-                    local_l3_state,
-                    local_transient_failures,
-                ) = future.result()
-            except ProviderIngestionError as exc:
-                provider_stats[exc.provider_name] = {"status": "failed", "error": str(exc.cause)}
-                _progress(
-                    f"[ADIT] Provider {provider_index}/{provider_total}: "
-                    f"{exc.provider_name} failed ({exc.cause}) — continuing"
+                provider_resume_state = provider_pagination_state.get(provider.name, {})
+                provider_l3_resume_state = provider_l3_state.get(provider.name, {})
+                provider_transient_state = provider_transient_failures.get(provider.name, {})
+                provider_checkpoint = _load_provider_checkpoint_state(
+                    checkpoint_root, key, provider.name, reset_checkpoints
                 )
-                continue
+                if provider_checkpoint:
+                    checkpoint_seed_state = provider_checkpoint.get("provider_pagination_state")
+                    if isinstance(checkpoint_seed_state, dict):
+                        provider_resume_state = checkpoint_seed_state
+                    checkpoint_l3_state = provider_checkpoint.get("provider_l3_state")
+                    if isinstance(checkpoint_l3_state, dict):
+                        provider_l3_resume_state = checkpoint_l3_state
+                    checkpoint_transient_state = provider_checkpoint.get("transient_failures")
+                    if isinstance(checkpoint_transient_state, dict):
+                        provider_transient_state = checkpoint_transient_state
 
-            with merge_lock:
-                _merge_seed_metadata(all_papers, seed_metadata)
-                _merge_provider_outputs(all_edges, all_papers, provider_edges, provider_papers)
-                provider_stats[provider.name] = stats
-                for l1_id, l1_completeness in stats.get("completeness", {}).items():
-                    combined_completeness.setdefault(l1_id, {}).update(l1_completeness)
+                provider_transient_state = _deserialize_transient_failures(
+                    {provider.name: provider_transient_state}
+                ).get(provider.name, {})
 
-                provider_pagination_state[provider.name] = dict(local_seed_state)
-                provider_l3_state[provider.name] = dict(local_l3_state)
-                provider_transient_failures[provider.name] = dict(local_transient_failures)
-                if not local_transient_failures:
-                    completed_providers.add(provider.name)
-                parallel_completed.add(provider.name)
-                _progress_done(
-                    f"[ADIT] Provider {provider_index}/{provider_total}: {provider.name} "
-                    f"completed (papers={stats.get('papers', 0)}, "
-                    f"l2_edges={stats.get('l2_edges', 0)}, l3_edges={stats.get('l3_edges', 0)})"
-                )
-                _write_coordinator_checkpoint_state(
+                provider_progress_callback: Optional[Callable[[int, int, str], None]] = None
+                if _PROVIDER_TQDM_ACTIVE:
+                    provider_progress_callback = (
+                        lambda completed, total, status, provider_name=provider.name: _update_provider_tqdm_bar(
+                            provider_bars,
+                            provider_name,
+                            completed,
+                            total,
+                            status,
+                            bars_lock,
+                        )
+                    )
+
+                future = executor.submit(
+                    _run_provider_wave1_worker,
+                    provider,
+                    l1_norm,
+                    dict(all_papers),
+                    theory_name,
+                    key_constructs,
+                    depth,
+                    exhaustive,
+                    max_l2,
+                    max_l3,
+                    provider_resume_state,
+                    provider_l3_resume_state,
+                    provider_transient_state,
                     checkpoint_root,
                     key,
-                    completed_providers,
-                    all_edges,
-                    all_papers,
-                    provider_stats,
-                    combined_completeness,
-                    _transient_failure_summary(provider_transient_failures),
-                    l3_to_l3_state,
-                    ingestion_phase,
+                    provider_progress_callback,
                 )
-                persist_callback()
+                futures[future] = (provider, provider_index)
 
-                provider_pagination_state.pop(provider.name, None)
-                provider_l3_state.pop(provider.name, None)
-                if not local_transient_failures:
-                    provider_transient_failures.pop(provider.name, None)
-                    _write_provider_checkpoint_state(
+            for future in as_completed(futures):
+                provider, provider_index = futures[future]
+                try:
+                    (
+                        seed_metadata,
+                        provider_edges,
+                        provider_papers,
+                        stats,
+                        local_seed_state,
+                        local_l3_state,
+                        local_transient_failures,
+                    ) = future.result()
+                except ProviderIngestionError as exc:
+                    if _PROVIDER_TQDM_ACTIVE:
+                        _update_provider_tqdm_bar(
+                            provider_bars,
+                            exc.provider_name,
+                            max(1, len(l1_norm)),
+                            max(1, len(l1_norm)),
+                            "failed",
+                            bars_lock,
+                        )
+                    provider_stats[exc.provider_name] = {"status": "failed", "error": str(exc.cause)}
+                    _progress(
+                        f"[ADIT] Provider {provider_index}/{provider_total}: "
+                        f"{exc.provider_name} failed ({exc.cause}) — continuing"
+                    )
+                    continue
+
+                with merge_lock:
+                    _merge_seed_metadata(all_papers, seed_metadata)
+                    _merge_provider_outputs(all_edges, all_papers, provider_edges, provider_papers)
+                    provider_stats[provider.name] = stats
+                    for l1_id, l1_completeness in stats.get("completeness", {}).items():
+                        combined_completeness.setdefault(l1_id, {}).update(l1_completeness)
+
+                    provider_pagination_state[provider.name] = dict(local_seed_state)
+                    provider_l3_state[provider.name] = dict(local_l3_state)
+                    provider_transient_failures[provider.name] = dict(local_transient_failures)
+                    if not local_transient_failures:
+                        completed_providers.add(provider.name)
+                    parallel_completed.add(provider.name)
+                    if _PROVIDER_TQDM_ACTIVE:
+                        _update_provider_tqdm_bar(
+                            provider_bars,
+                            provider.name,
+                            max(1, len(l1_norm)),
+                            max(1, len(l1_norm)),
+                            "done",
+                            bars_lock,
+                        )
+                    if not _PROVIDER_TQDM_ACTIVE:
+                        _progress_done(
+                            f"[ADIT] Provider {provider_index}/{provider_total}: {provider.name} "
+                            f"completed (papers={stats.get('papers', 0)}, "
+                            f"l2_edges={stats.get('l2_edges', 0)}, l3_edges={stats.get('l3_edges', 0)})"
+                        )
+                    _write_coordinator_checkpoint_state(
                         checkpoint_root,
                         key,
-                        provider.name,
-                        provider_pagination_state={},
-                        provider_l3_state={},
-                        transient_failures={},
+                        completed_providers,
+                        all_edges,
+                        all_papers,
+                        provider_stats,
+                        combined_completeness,
+                        _transient_failure_summary(provider_transient_failures),
+                        l3_to_l3_state,
+                        ingestion_phase,
                     )
+                    persist_callback()
+
+                    provider_pagination_state.pop(provider.name, None)
+                    provider_l3_state.pop(provider.name, None)
+                    if not local_transient_failures:
+                        provider_transient_failures.pop(provider.name, None)
+                        _write_provider_checkpoint_state(
+                            checkpoint_root,
+                            key,
+                            provider.name,
+                            provider_pagination_state={},
+                            provider_l3_state={},
+                            transient_failures={},
+                        )
+    finally:
+        for bar in provider_bars.values():
+            bar.close()
+        _PROVIDER_TQDM_ACTIVE = False
 
     return parallel_completed, parallel_attempted
 
@@ -4604,132 +4906,210 @@ def _run_sequential_providers(
     key: str,
     effective_staleness_seconds: int,
     persist_callback: Callable[[], None],
+    wave1_desc_width: Optional[int] = None,
 ) -> None:
     """Run sequential wave ingestion for providers not handled in parallel."""
+    pending_providers = [
+        provider
+        for provider in providers
+        if provider.name not in parallel_attempted and provider.name not in parallel_completed
+    ]
+    bars_lock = threading.Lock()
+    provider_bars: Dict[str, tqdm] = {}
+
+    global _PROVIDER_TQDM_ACTIVE
+    _PROVIDER_TQDM_ACTIVE = bool(not _QUIET and _stderr_is_tty() and pending_providers)
+    if _PROVIDER_TQDM_ACTIVE:
+        desc_width = wave1_desc_width or _provider_tqdm_desc_width(
+            [provider.name for provider in pending_providers],
+            "wave-1",
+        )
+        for bar_position, provider in enumerate(pending_providers):
+            total = max(1, len(l1_norm)) if provider.capabilities.supports_cited_by_traversal else 1
+            unit = "seed" if provider.capabilities.supports_cited_by_traversal else "step"
+            provider_bars[provider.name] = _create_provider_tqdm(
+                provider_name=provider.name,
+                phase_label="wave-1",
+                total=total,
+                position=bar_position,
+                unit=unit,
+                desc_width=desc_width,
+            )
+
     provider_total = len(providers)
-    for provider_index, provider in enumerate(providers, start=1):
-        if provider.name in parallel_attempted or provider.name in parallel_completed:
-            continue
-        if provider.name in completed_providers:
-            _progress_done(
-                f"[ADIT] Provider {provider_index}/{provider_total}: "
-                f"{provider.name} skipped (checkpoint complete)"
+    try:
+        for provider_index, provider in enumerate(providers, start=1):
+            if provider.name in parallel_attempted or provider.name in parallel_completed:
+                continue
+            if provider.name in completed_providers:
+                if not _PROVIDER_TQDM_ACTIVE:
+                    _progress_done(
+                        f"[ADIT] Provider {provider_index}/{provider_total}: "
+                        f"{provider.name} skipped (checkpoint complete)"
+                    )
+                if _PROVIDER_TQDM_ACTIVE:
+                    _update_provider_tqdm_bar(
+                        provider_bars,
+                        provider.name,
+                        max(1, len(l1_norm)),
+                        max(1, len(l1_norm)),
+                        "skipped",
+                        bars_lock,
+                    )
+                skipped_names = checkpoint_stats["skipped_provider_names"]
+                if isinstance(skipped_names, list):
+                    skipped_names.append(provider.name)
+                checkpoint_stats["providers_skipped"] = int(checkpoint_stats["providers_skipped"]) + 1
+                continue
+
+            executed_names = checkpoint_stats["executed_provider_names"]
+            if isinstance(executed_names, list):
+                executed_names.append(provider.name)
+            checkpoint_stats["providers_executed"] = int(checkpoint_stats["providers_executed"]) + 1
+
+            if not _PROVIDER_TQDM_ACTIVE:
+                _progress(f"[ADIT] Provider {provider_index}/{provider_total}: {provider.name}")
+            _merge_seed_metadata(all_papers, provider.fetch_seed_metadata(l1_norm))
+
+            if provider.name == "crossref":
+                targets = _crossref_enrichment_targets(list(all_edges.keys()), all_papers)
+                crossref_papers = provider.fetch_seed_metadata(targets) if targets else {}
+                _merge_provider_outputs(all_edges, all_papers, {}, crossref_papers)
+                provider_stats[provider.name] = {
+                    "l2_nodes": 0,
+                    "l2_edges": 0,
+                    "l3_edges": 0,
+                    "papers": 0,
+                    "metadata_enriched": len(crossref_papers),
+                    "completeness": {},
+                }
+                if _PROVIDER_TQDM_ACTIVE:
+                    _update_provider_tqdm_bar(
+                        provider_bars,
+                        provider.name,
+                        1,
+                        1,
+                        "done",
+                        bars_lock,
+                    )
+                if not _PROVIDER_TQDM_ACTIVE:
+                    _progress_done(
+                        f"[ADIT] Provider {provider_index}/{provider_total}: {provider.name} completed "
+                        f"(enriched={len(crossref_papers)})"
+                    )
+                completed_providers.add(provider.name)
+                provider_pagination_state.pop(provider.name, None)
+                persist_callback()
+                continue
+
+            provider_state = provider_pagination_state.setdefault(provider.name, {})
+            provider_transient_state = provider_transient_failures.setdefault(provider.name, {})
+            _prune_provider_transient_failures(
+                provider.name, provider_transient_state, checkpoint_stats
             )
-            skipped_names = checkpoint_stats["skipped_provider_names"]
-            if isinstance(skipped_names, list):
-                skipped_names.append(provider.name)
-            checkpoint_stats["providers_skipped"] = int(checkpoint_stats["providers_skipped"]) + 1
-            continue
-
-        executed_names = checkpoint_stats["executed_provider_names"]
-        if isinstance(executed_names, list):
-            executed_names.append(provider.name)
-        checkpoint_stats["providers_executed"] = int(checkpoint_stats["providers_executed"]) + 1
-
-        _progress(f"[ADIT] Provider {provider_index}/{provider_total}: {provider.name}")
-        _merge_seed_metadata(all_papers, provider.fetch_seed_metadata(l1_norm))
-
-        if provider.name == "crossref":
-            targets = _crossref_enrichment_targets(list(all_edges.keys()), all_papers)
-            crossref_papers = provider.fetch_seed_metadata(targets) if targets else {}
-            _merge_provider_outputs(all_edges, all_papers, {}, crossref_papers)
-            provider_stats[provider.name] = {
-                "l2_nodes": 0,
-                "l2_edges": 0,
-                "l3_edges": 0,
-                "papers": 0,
-                "metadata_enriched": len(crossref_papers),
-                "completeness": {},
-            }
-            _progress_done(
-                f"[ADIT] Provider {provider_index}/{provider_total}: {provider.name} completed "
-                f"(enriched={len(crossref_papers)})"
+            _replay_provider_transient_failures(
+                provider.name, provider_transient_state, checkpoint_stats
             )
-            completed_providers.add(provider.name)
+            if _drop_stale_seed_resume_state(
+                provider_name=provider.name,
+                provider_state=provider_state,
+                checkpoint_stats=checkpoint_stats,
+                max_age_seconds=effective_staleness_seconds,
+            ):
+                persist_callback()
+            if _drop_stale_provider_l3_state(
+                provider_name=provider.name,
+                provider_l3_state=provider_l3_state,
+                checkpoint_stats=checkpoint_stats,
+                max_age_seconds=effective_staleness_seconds,
+            ):
+                persist_callback()
+
+            provider_l3_run_state = provider_l3_state.setdefault(provider.name, {})
+            _record_l3_resume_progress(
+                provider_name=provider.name,
+                provider_l3_run_state=provider_l3_run_state,
+                checkpoint_stats=checkpoint_stats,
+            )
+
+            _seed_progress, _l3_progress = _build_provider_progress_callbacks(
+                provider_state=provider_state,
+                provider_l3_run_state=provider_l3_run_state,
+                persist_callback=persist_callback,
+            )
+
+            provider_progress_callback: Optional[Callable[[int, int, str], None]] = None
+            if _PROVIDER_TQDM_ACTIVE:
+                provider_progress_callback = (
+                    lambda completed, total, status, provider_name=provider.name: _update_provider_tqdm_bar(
+                        provider_bars,
+                        provider_name,
+                        completed,
+                        total,
+                        status,
+                        bars_lock,
+                    )
+                )
+
+            provider_edges, provider_papers, stats = _fetch_provider_graph(
+                provider=provider,
+                l1_norm=l1_norm,
+                l1_papers_resolved=all_papers,
+                theory_name=theory_name,
+                key_constructs=key_constructs,
+                depth=depth,
+                exhaustive=exhaustive,
+                max_l2=max_l2,
+                max_l3=max_l3,
+                provider_seed_state=provider_state,
+                seed_progress_callback=_seed_progress,
+                provider_progress_callback=provider_progress_callback,
+                provider_l3_state=provider_l3_run_state,
+                l3_progress_callback=_l3_progress,
+                include_l3=False,
+            )
+            _merge_provider_outputs(all_edges, all_papers, provider_edges, provider_papers)
+            provider_stats[provider.name] = stats
+            if _PROVIDER_TQDM_ACTIVE:
+                _update_provider_tqdm_bar(
+                    provider_bars,
+                    provider.name,
+                    max(1, len(l1_norm)),
+                    max(1, len(l1_norm)),
+                    "done",
+                    bars_lock,
+                )
+            if not _PROVIDER_TQDM_ACTIVE:
+                _progress_done(
+                    f"[ADIT] Provider {provider_index}/{provider_total}: {provider.name} completed "
+                    f"(papers={stats.get('papers', 0)}, "
+                    f"l2_edges={stats.get('l2_edges', 0)}, l3_edges={stats.get('l3_edges', 0)})"
+                )
+            for l1_id, l1_completeness in stats.get("completeness", {}).items():
+                combined_completeness.setdefault(l1_id, {}).update(l1_completeness)
+
+            drained_failures = _drain_transient_request_failures(provider.name)
+            _merge_provider_transient_failures(provider_transient_state, drained_failures)
+            _prune_provider_transient_failures(
+                provider.name, provider_transient_state, checkpoint_stats
+            )
+
+            if provider_transient_state:
+                checkpoint_stats["transient_failures_queued"] = int(
+                    checkpoint_stats.get("transient_failures_queued", 0)
+                ) + len(provider_transient_state)
+                _vprint(
+                    f"  [{provider.name}] Deferred transient retries queued: {len(provider_transient_state)}"
+                )
+            else:
+                completed_providers.add(provider.name)
+                provider_transient_failures.pop(provider.name, None)
             provider_pagination_state.pop(provider.name, None)
             persist_callback()
-            continue
-
-        provider_state = provider_pagination_state.setdefault(provider.name, {})
-        provider_transient_state = provider_transient_failures.setdefault(provider.name, {})
-        _prune_provider_transient_failures(
-            provider.name, provider_transient_state, checkpoint_stats
-        )
-        _replay_provider_transient_failures(
-            provider.name, provider_transient_state, checkpoint_stats
-        )
-        if _drop_stale_seed_resume_state(
-            provider_name=provider.name,
-            provider_state=provider_state,
-            checkpoint_stats=checkpoint_stats,
-            max_age_seconds=effective_staleness_seconds,
-        ):
-            persist_callback()
-        if _drop_stale_provider_l3_state(
-            provider_name=provider.name,
-            provider_l3_state=provider_l3_state,
-            checkpoint_stats=checkpoint_stats,
-            max_age_seconds=effective_staleness_seconds,
-        ):
-            persist_callback()
-
-        provider_l3_run_state = provider_l3_state.setdefault(provider.name, {})
-        _record_l3_resume_progress(
-            provider_name=provider.name,
-            provider_l3_run_state=provider_l3_run_state,
-            checkpoint_stats=checkpoint_stats,
-        )
-
-        _seed_progress, _l3_progress = _build_provider_progress_callbacks(
-            provider_state=provider_state,
-            provider_l3_run_state=provider_l3_run_state,
-            persist_callback=persist_callback,
-        )
-
-        provider_edges, provider_papers, stats = _fetch_provider_graph(
-            provider=provider,
-            l1_norm=l1_norm,
-            l1_papers_resolved=all_papers,
-            theory_name=theory_name,
-            key_constructs=key_constructs,
-            depth=depth,
-            exhaustive=exhaustive,
-            max_l2=max_l2,
-            max_l3=max_l3,
-            provider_seed_state=provider_state,
-            seed_progress_callback=_seed_progress,
-            provider_l3_state=provider_l3_run_state,
-            l3_progress_callback=_l3_progress,
-            include_l3=False,
-        )
-        _merge_provider_outputs(all_edges, all_papers, provider_edges, provider_papers)
-        provider_stats[provider.name] = stats
-        _progress_done(
-            f"[ADIT] Provider {provider_index}/{provider_total}: {provider.name} completed "
-            f"(papers={stats.get('papers', 0)}, "
-            f"l2_edges={stats.get('l2_edges', 0)}, l3_edges={stats.get('l3_edges', 0)})"
-        )
-        for l1_id, l1_completeness in stats.get("completeness", {}).items():
-            combined_completeness.setdefault(l1_id, {}).update(l1_completeness)
-
-        drained_failures = _drain_transient_request_failures(provider.name)
-        _merge_provider_transient_failures(provider_transient_state, drained_failures)
-        _prune_provider_transient_failures(
-            provider.name, provider_transient_state, checkpoint_stats
-        )
-
-        if provider_transient_state:
-            checkpoint_stats["transient_failures_queued"] = int(
-                checkpoint_stats.get("transient_failures_queued", 0)
-            ) + len(provider_transient_state)
-            _vprint(
-                f"  [{provider.name}] Deferred transient retries queued: {len(provider_transient_state)}"
-            )
-        else:
-            completed_providers.add(provider.name)
-            provider_transient_failures.pop(provider.name, None)
-        provider_pagination_state.pop(provider.name, None)
-        persist_callback()
+    finally:
+        for bar in provider_bars.values():
+            bar.close()
+        _PROVIDER_TQDM_ACTIVE = False
 
 
 def ingest_from_internet(
@@ -4898,6 +5278,7 @@ def ingest_from_internet(
 
     parallel_completed: Set[str] = set()
     parallel_attempted: Set[str] = set()
+    wave1_desc_width = _provider_tqdm_desc_width([provider.name for provider in providers], "wave-1")
     if max_workers is not None and max_workers > 1:
         parallel_completed, parallel_attempted = _run_parallel_wave1_providers(
             providers=providers,
@@ -4924,6 +5305,7 @@ def ingest_from_internet(
             key=key,
             reset_checkpoints=reset_checkpoints,
             persist_callback=_persist_checkpoint_snapshot,
+            wave1_desc_width=wave1_desc_width,
         )
 
     _run_sequential_providers(
@@ -4950,6 +5332,7 @@ def ingest_from_internet(
         key=key,
         effective_staleness_seconds=effective_staleness_seconds,
         persist_callback=_persist_checkpoint_snapshot,
+        wave1_desc_width=wave1_desc_width,
     )
 
     # Deduplicate after wave-1 so L2->L3 expands canonical L2 parents only.

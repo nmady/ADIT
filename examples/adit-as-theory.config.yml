@@ -4,7 +4,7 @@ l1_papers:
 #  - 10.1109/HICSS.2014.564 # Larsen et al. (2014) - Theory Identity: A Machine-Learning Approach
   - 10.17705/1jais.00556 # Larsen et al. (2019) - Understanding the Elephant: The Discourse Approach to Boundary Identification and Corpus Construction for Theory Review Articles
 online: true
-depth: l2l3
+depth: l2
 key_constructs:
   - theory identity
   - implicit theory
