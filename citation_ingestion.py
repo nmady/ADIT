@@ -15,6 +15,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from tqdm import tqdm
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -3467,7 +3468,7 @@ def _dedupe_and_materialize(
     merged_by_key: Dict[str, IngestionPaper] = {}
     key_to_final_id: Dict[str, str] = {}
 
-    for paper in all_papers.values():
+    for paper in tqdm(all_papers.values()):
         key = _canonical_merge_key(paper)
         if key in merged_by_key:
             merged_by_key[key] = _merge_papers(merged_by_key[key], paper)
@@ -4950,6 +4951,16 @@ def ingest_from_internet(
         effective_staleness_seconds=effective_staleness_seconds,
         persist_callback=_persist_checkpoint_snapshot,
     )
+
+    # Deduplicate after wave-1 so L2->L3 expands canonical L2 parents only.
+    _progress("[ADIT] Wave-1 complete; deduplicating before L2->L3 expansion")
+    wave1_citation_data, wave1_papers_data, wave1_alias_map = _dedupe_and_materialize(
+        all_edges, all_papers
+    )
+    all_edges = _deserialize_edges(wave1_citation_data)
+    all_papers = _deserialize_papers(wave1_papers_data)
+    l1_norm = [wave1_alias_map.get(pid, pid) for pid in l1_norm]
+    _persist_checkpoint_snapshot()
 
     _run_l2_to_l3_pass(
         depth=depth,

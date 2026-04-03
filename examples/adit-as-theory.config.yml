@@ -9,7 +9,8 @@ key_constructs:
   - theory identity
   - implicit theory
 cache_dir: .cache/adit_ingestion
-refresh_cache: false
+refresh_cache: true
+reset_checkpoints: true
 only_ingest: true
 save_ingested_citation_data: outputs/adit_as_theory_data.json
 save_ingested_papers_data: outputs/adit_as_theory_papers_data.json
