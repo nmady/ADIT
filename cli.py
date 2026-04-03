@@ -80,6 +80,20 @@ MAX_WORKERS_OPTION = typer.Option(
         "When omitted, ingestion runs sequentially."
     ),
 )
+TRANSIENT_RETRY_MAX_ATTEMPTS_OPTION = typer.Option(
+    None,
+    help=(
+        "Optional cap on transient checkpoint retry attempts during resume. "
+        "Records exceeding this cap are pruned."
+    ),
+)
+TRANSIENT_RETRY_MAX_AGE_SECONDS_OPTION = typer.Option(
+    None,
+    help=(
+        "Optional max age in seconds for transient retry records during resume. "
+        "Older records are pruned."
+    ),
+)
 SAVE_INGESTED_CITATION_OPTION = typer.Option(
     None,
     help="Optional output path to persist online-ingested citation_data JSON.",
@@ -215,6 +229,8 @@ def _resolve_cli_inputs(
     max_l2: int,
     max_l3: Optional[int],
     max_workers: Optional[int],
+    transient_retry_max_attempts: Optional[int],
+    transient_retry_max_age_seconds: Optional[int],
     save_ingested_citation_data: Optional[Path],
     save_ingested_papers_data: Optional[Path],
     output_features: Optional[Path],
@@ -244,6 +260,28 @@ def _resolve_cli_inputs(
     if resolved_max_workers is not None and resolved_max_workers <= 0:
         raise typer.BadParameter("max_workers must be a positive integer.")
 
+    resolved_transient_retry_max_attempts = (
+        int(cfg["transient_retry_max_attempts"])
+        if cfg.get("transient_retry_max_attempts") is not None
+        else transient_retry_max_attempts
+    )
+    if (
+        resolved_transient_retry_max_attempts is not None
+        and resolved_transient_retry_max_attempts <= 0
+    ):
+        raise typer.BadParameter("transient_retry_max_attempts must be a positive integer.")
+
+    resolved_transient_retry_max_age_seconds = (
+        int(cfg["transient_retry_max_age_seconds"])
+        if cfg.get("transient_retry_max_age_seconds") is not None
+        else transient_retry_max_age_seconds
+    )
+    if (
+        resolved_transient_retry_max_age_seconds is not None
+        and resolved_transient_retry_max_age_seconds <= 0
+    ):
+        raise typer.BadParameter("transient_retry_max_age_seconds must be a positive integer.")
+
     return {
         "theory_name": theory_name or cfg.get("theory_name"),
         "acronym": acronym or cfg.get("acronym"),
@@ -271,6 +309,8 @@ def _resolve_cli_inputs(
         "max_l2": int(cfg.get("max_l2", max_l2)),
         "max_l3": int(cfg["max_l3"]) if cfg.get("max_l3") is not None else max_l3,
         "max_workers": resolved_max_workers,
+        "transient_retry_max_attempts": resolved_transient_retry_max_attempts,
+        "transient_retry_max_age_seconds": resolved_transient_retry_max_age_seconds,
         "save_ingested_citation_data": save_ingested_citation_data
         or (
             Path(cfg["save_ingested_citation_data"])
@@ -332,6 +372,8 @@ def _load_pipeline_inputs(params: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[
             max_l2=params["max_l2"],
             max_l3=params["max_l3"],
             max_workers=params.get("max_workers"),
+            transient_retry_max_attempts=params.get("transient_retry_max_attempts"),
+            transient_retry_max_age_seconds=params.get("transient_retry_max_age_seconds"),
             exhaustive=params.get("exhaustive", True),
             verbose=params.get("verbose", False),
             quiet=params.get("quiet", False),
@@ -391,6 +433,8 @@ def run(
     max_l2: int = MAX_L2_OPTION,
     max_l3: Optional[int] = MAX_L3_OPTION,
     max_workers: Optional[int] = MAX_WORKERS_OPTION,
+    transient_retry_max_attempts: Optional[int] = TRANSIENT_RETRY_MAX_ATTEMPTS_OPTION,
+    transient_retry_max_age_seconds: Optional[int] = TRANSIENT_RETRY_MAX_AGE_SECONDS_OPTION,
     save_ingested_citation_data: Optional[Path] = SAVE_INGESTED_CITATION_OPTION,
     save_ingested_papers_data: Optional[Path] = SAVE_INGESTED_PAPERS_OPTION,
     output_features: Optional[Path] = OUTPUT_FEATURES_OPTION,
@@ -424,6 +468,8 @@ def run(
         max_l2,
         max_l3,
         max_workers,
+        transient_retry_max_attempts,
+        transient_retry_max_age_seconds,
         save_ingested_citation_data,
         save_ingested_papers_data,
         output_features,

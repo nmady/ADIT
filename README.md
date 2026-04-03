@@ -326,6 +326,9 @@ A compact reference for keys accepted in config files (and equivalent CLI flags)
 - **refresh_cache**: (bool, default: false) — If true, ignore cached ingestion and force fresh retrieval.
 - **max_l2**: (int, default: 200) — Per-provider cap on L2 retrieval. Admitted L2 papers must explicitly cite an L1 seed.
 - **max_l3**: (int or null, default: null/unlimited) — Optional per-provider cap on L3 reference edges retrieved when expanding L2 → L3, and also applied to second-pass L3→L3 edge retrieval. Omit or set to null for exhaustive retrieval.
+- **max_workers**: (int or null, default: null/sequential) — Optional provider-level parallel worker count for online ingestion.
+- **transient_retry_max_attempts**: (int, default: 5) — Optional cap on checkpointed transient retry attempts per record during resume; records exceeding this are pruned.
+- **transient_retry_max_age_seconds**: (int, default: 604800) — Optional max age (seconds) for checkpointed transient retry records before pruning.
 - **save_ingested_citation_data**: (path, optional) — Persist normalized `citation_data.json` produced by online ingestion.
 - **save_ingested_papers_data**: (path, optional) — Persist normalized `papers_data.json` produced by online ingestion.
 - **output_features**: (path, optional) — CSV path to write extracted features.

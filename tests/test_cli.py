@@ -812,3 +812,79 @@ def test_cli_max_workers_default_is_none(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert captured_kwargs.get("max_workers") is None
+
+
+def test_cli_transient_retry_options_passed_to_ingestion(monkeypatch):
+    """Transient retry tuning options should be forwarded to ingest_from_internet."""
+    monkeypatch.setattr(cli, "ADIT", FakeADIT)
+    captured_kwargs: dict = {}
+
+    def fake_ingest(**kwargs):
+        captured_kwargs.update(kwargs)
+        return SimpleNamespace(
+            citation_data={"PaperA": ["TAM1"]},
+            papers_data={
+                "PaperA": {
+                    "title": "A",
+                    "abstract": "a",
+                    "keywords": "k",
+                    "citations": 1,
+                    "year": 2010,
+                },
+                "TAM1": {
+                    "title": "TAM",
+                    "abstract": "foundation",
+                    "keywords": "tam",
+                    "citations": 100,
+                    "year": 1990,
+                },
+            },
+            metadata={"paper_count": 2, "edge_count": 1},
+        )
+
+    monkeypatch.setattr(cli, "ingest_from_internet", fake_ingest)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "--online",
+            "--theory-name",
+            "Technology Acceptance Model",
+            "--l1-papers",
+            "TAM1,TAM2",
+            "--depth",
+            "l2",
+            "--transient-retry-max-attempts",
+            "7",
+            "--transient-retry-max-age-seconds",
+            "86400",
+        ],
+        color=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured_kwargs.get("transient_retry_max_attempts") == 7
+    assert captured_kwargs.get("transient_retry_max_age_seconds") == 86400
+
+
+def test_cli_transient_retry_attempts_must_be_positive(monkeypatch):
+    """transient_retry_max_attempts should reject non-positive values."""
+    monkeypatch.setattr(cli, "ADIT", FakeADIT)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "--online",
+            "--theory-name",
+            "Technology Acceptance Model",
+            "--l1-papers",
+            "TAM1,TAM2",
+            "--transient-retry-max-attempts",
+            "0",
+        ],
+        color=False,
+    )
+
+    assert result.exit_code != 0
+    clean_output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    assert "transient_retry_max_attempts must be a positive integer" in clean_output

@@ -801,6 +801,8 @@ def test_safe_get_retries_on_429_then_succeeds(monkeypatch):
         return mock_resp
 
     monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    clock = {"value": 1_000.0}
+    monkeypatch.setattr(ci.time, "time", lambda: clock["value"])
     monkeypatch.setattr(ci.time, "sleep", lambda _: None)
     ci._reset_ingest_stats(["test"])
 
@@ -818,6 +820,8 @@ def test_safe_get_stops_immediately_on_permanent_failure(monkeypatch):
         raise _make_http_error(403)
 
     monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    clock = {"value": 1_000.0}
+    monkeypatch.setattr(ci.time, "time", lambda: clock["value"])
     monkeypatch.setattr(ci.time, "sleep", lambda _: None)
     ci._reset_ingest_stats(["test"])
 
@@ -843,6 +847,99 @@ def test_safe_get_exhausts_retries_and_returns_none(monkeypatch):
     assert result is None
     assert call_count[0] == 3
     assert ci._INGEST_STATS["total_failures"] == 1
+
+
+def test_provider_checkpoint_round_trip_transient_failures(tmp_path):
+    checkpoint_root = Path(tmp_path) / "checkpoints"
+    key = "req-key"
+    provider_name = "openalex"
+    failures = {
+        "openalex:safe_get:https://api.openalex.org/works/W1": {
+            "op": "safe_get",
+            "provider": provider_name,
+            "target_id": "https://api.openalex.org/works/W1",
+            "resume_state": {"timeout": 20, "max_retries": 5, "headers": {"Accept": "json"}},
+            "error_code": 429,
+            "error_type": "http_error",
+            "attempts": 2,
+            "last_attempt_ts": time.time(),
+            "server_retry_after": 30.0,
+        }
+    }
+
+    ci._write_provider_checkpoint_state(
+        checkpoint_root=checkpoint_root,
+        key=key,
+        provider_name=provider_name,
+        provider_pagination_state={},
+        provider_l3_state={},
+        transient_failures=failures,
+    )
+
+    payload = ci._load_provider_checkpoint_state(
+        checkpoint_root=checkpoint_root,
+        key=key,
+        provider_name=provider_name,
+        reset_checkpoints=False,
+    )
+    assert payload is not None
+    restored = ci._deserialize_transient_failures(
+        {provider_name: payload.get("transient_failures")}
+    )
+    assert provider_name in restored
+    assert list(restored[provider_name]) == ["openalex:safe_get:https://api.openalex.org/works/W1"]
+
+
+def test_replay_provider_transient_failures_retries_eligible(monkeypatch):
+    ci._drain_transient_request_failures()
+    stats = {}
+    failures = {
+        "openalex:safe_get:https://api.openalex.org/works/W1": {
+            "op": "safe_get",
+            "provider": "openalex",
+            "target_id": "https://api.openalex.org/works/W1",
+            "resume_state": {"timeout": 20, "max_retries": 2, "headers": {}},
+            "attempts": 1,
+            "last_attempt_ts": time.time() - 120,
+            "server_retry_after": None,
+        }
+    }
+
+    monkeypatch.setattr(ci, "_safe_get", lambda *args, **kwargs: {"ok": True})
+
+    ci._replay_provider_transient_failures("openalex", failures, stats)
+
+    assert failures == {}
+    assert stats["transient_failures_retried"] == 1
+    assert stats["transient_failures_resumed_success"] == 1
+
+
+def test_replay_provider_transient_failures_skips_unready(monkeypatch):
+    stats = {}
+    failures = {
+        "openalex:safe_get:https://api.openalex.org/works/W2": {
+            "op": "safe_get",
+            "provider": "openalex",
+            "target_id": "https://api.openalex.org/works/W2",
+            "resume_state": {"timeout": 20, "max_retries": 2, "headers": {}},
+            "attempts": 1,
+            "last_attempt_ts": time.time(),
+            "server_retry_after": 300.0,
+        }
+    }
+
+    called = {"count": 0}
+
+    def _fake_safe_get(*args, **kwargs):
+        called["count"] += 1
+        return {"ok": True}
+
+    monkeypatch.setattr(ci, "_safe_get", _fake_safe_get)
+
+    ci._replay_provider_transient_failures("openalex", failures, stats)
+
+    assert called["count"] == 0
+    assert len(failures) == 1
 
 
 def test_safe_get_suppresses_http_error_body_without_debug_http(monkeypatch, caplog):
@@ -2027,6 +2124,136 @@ class _CheckpointProvider(ci.CitationProvider):
         return {}, {}
 
 
+class _TransientRetryCheckpointProvider(ci.CitationProvider):
+    capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=False)
+
+    def __init__(self, name: str, edge_id: str):
+        self.name = name
+        self.edge_id = edge_id
+
+    def fetch_seed_metadata(self, l1_papers):
+        return {
+            l1_papers[0]: ci.IngestionPaper(
+                paper_id=l1_papers[0],
+                title=f"Seed from {self.name}",
+                source_ids={self.name: f"seed-{self.name}"},
+            )
+        }
+
+    def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
+        result = ci._safe_get(
+            "https://example.com/transient-retry",
+            provider=self.name,
+            max_retries=1,
+        )
+        if result is None:
+            return {}, {}
+        return (
+            {self.edge_id: {l1_papers[0]}},
+            {
+                self.edge_id: ci.IngestionPaper(
+                    paper_id=self.edge_id,
+                    title=f"{self.name} L2",
+                    year=2020,
+                    citations=1,
+                )
+            },
+        )
+
+    def fetch_l3_references(self, l2_paper_ids, max_l3=None):
+        return {}, {}
+
+
+class _TransientL3RetryProvider(ci.CitationProvider):
+    capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=False)
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def fetch_seed_metadata(self, l1_papers):
+        return {
+            l1_papers[0]: ci.IngestionPaper(
+                paper_id=l1_papers[0],
+                title=f"Seed from {self.name}",
+                source_ids={self.name: f"seed-{self.name}"},
+            )
+        }
+
+    def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
+        seed = l1_papers[0]
+        return (
+            {
+                f"{self.name}:L2A": {seed},
+                f"{self.name}:L2B": {seed},
+            },
+            {
+                f"{self.name}:L2A": ci.IngestionPaper(
+                    paper_id=f"{self.name}:L2A",
+                    title="L2 A",
+                    year=2020,
+                    source_ids={self.name: "l2a"},
+                ),
+                f"{self.name}:L2B": ci.IngestionPaper(
+                    paper_id=f"{self.name}:L2B",
+                    title="L2 B",
+                    year=2021,
+                    source_ids={self.name: "l2b"},
+                ),
+            },
+        )
+
+    def fetch_l3_references(
+        self, l2_paper_ids, max_l3=None, resume_state=None, progress_callback=None
+    ):
+        edges = ci._deserialize_edges((resume_state or {}).get("edges"))
+        papers = ci._deserialize_papers((resume_state or {}).get("papers"))
+        start_index = (
+            ci._parse_optional_int((resume_state or {}).get("next_l2_index"), default=0) or 0
+        )
+
+        for idx in range(start_index, len(l2_paper_ids)):
+            parent_id = l2_paper_ids[idx]
+            payload = ci._safe_get(
+                f"https://example.com/l3/{parent_id}",
+                provider=self.name,
+                max_retries=1,
+            )
+            if payload and payload.get("ref"):
+                ref_id = ci.normalize_identifier(str(payload["ref"]))
+                edges.setdefault(parent_id, set()).add(ref_id)
+                papers.setdefault(
+                    ref_id,
+                    ci.IngestionPaper(
+                        paper_id=ref_id,
+                        title=f"Ref {ref_id}",
+                        citations=1,
+                        year=2018,
+                        doi=ref_id.split(":", 1)[1] if ref_id.startswith("doi:") else None,
+                    ),
+                )
+
+            ci._emit_traversal_progress(
+                progress_callback=progress_callback,
+                status="in_progress",
+                index_key="next_l2_index",
+                index_value=idx + 1,
+                budget_remaining=None,
+                edges=edges,
+                papers=papers,
+            )
+
+        ci._emit_traversal_progress(
+            progress_callback=progress_callback,
+            status="complete",
+            index_key="next_l2_index",
+            index_value=len(l2_paper_ids),
+            budget_remaining=None,
+            edges=edges,
+            papers=papers,
+        )
+        return edges, papers
+
+
 def test_checkpoint_resume_skips_completed_provider(monkeypatch, tmp_path):
     cache_dir = Path(tmp_path) / "cache"
     checkpoint_dir = Path(tmp_path) / "checkpoints"
@@ -2133,6 +2360,152 @@ def test_checkpoint_corruption_is_ignored(monkeypatch, tmp_path):
 
     assert result.metadata["provider_stats"]["checkpoint_corrupt"]["l2_nodes"] == 1
     assert provider.l2_calls == 1
+
+
+def test_checkpoint_resume_retries_and_clears_transient_failures(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+    provider_name = "checkpoint_transient"
+    edge_id = "checkpoint_transient:L2"
+    provider = _TransientRetryCheckpointProvider(provider_name, edge_id)
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    fail_once = {"value": True}
+
+    def fake_urlopen(req, timeout=None):
+        if fail_once["value"]:
+            fail_once["value"] = False
+            raise urllib.error.HTTPError(
+                url="https://example.com/transient-retry",
+                code=500,
+                msg="temporary server error",
+                hdrs=None,
+                fp=None,
+            )
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = b'{"ok": true}'
+        return mock_resp
+
+    monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    clock = {"value": 1_000.0}
+    monkeypatch.setattr(ci.time, "time", lambda: clock["value"])
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    first = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=[provider_name],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    key = first.metadata["cache_key"]
+    first_state = ci._load_checkpoint_state(checkpoint_dir, key, reset_checkpoints=False)
+    assert first_state is not None
+    assert provider_name in first_state.get("provider_transient_failures", {})
+    assert first.metadata["checkpoint_stats"]["transient_failures_queued"] >= 1
+
+    clock["value"] += 120.0
+
+    resumed = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=[provider_name],
+        depth="l2",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    resumed_state = ci._load_checkpoint_state(checkpoint_dir, key, reset_checkpoints=False)
+    assert resumed_state is not None
+    assert resumed_state.get("provider_transient_failures", {}).get(provider_name, {}) == {}
+    assert resumed.metadata["checkpoint_stats"]["transient_failures_retried"] >= 1
+    assert resumed.metadata["checkpoint_stats"]["transient_failures_resumed_success"] >= 1
+    assert edge_id in resumed.citation_data
+
+
+def test_l2_to_l3_transient_failures_retry_on_resume(monkeypatch, tmp_path):
+    cache_dir = Path(tmp_path) / "cache"
+    checkpoint_dir = Path(tmp_path) / "checkpoints"
+    provider_name = "checkpoint_l3_transient"
+    provider = _TransientL3RetryProvider(provider_name)
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    fail_l2b_once = {"value": True}
+
+    def fake_urlopen(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if url.endswith(f"{provider_name}:L2A"):
+            body = b'{"ref": "10.1000/l3a"}'
+        elif url.endswith(f"{provider_name}:L2B"):
+            if fail_l2b_once["value"]:
+                fail_l2b_once["value"] = False
+                raise urllib.error.HTTPError(
+                    url=url,
+                    code=500,
+                    msg="temporary l3 failure",
+                    hdrs=None,
+                    fp=None,
+                )
+            body = b'{"ref": "10.1000/l3b"}'
+        else:
+            body = b'{"ok": true}'
+
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = body
+        return mock_resp
+
+    monkeypatch.setattr(ci.urllib.request, "urlopen", fake_urlopen)
+    clock = {"value": 2_000.0}
+    monkeypatch.setattr(ci.time, "time", lambda: clock["value"])
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+
+    first = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=[provider_name],
+        depth="l2l3",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    key = first.metadata["cache_key"]
+    first_state = ci._load_checkpoint_state(checkpoint_dir, key, reset_checkpoints=False)
+    assert first_state is not None
+    assert provider_name in first_state.get("provider_transient_failures", {})
+
+    clock["value"] += 120.0
+    resumed = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=[provider_name],
+        depth="l2l3",
+        cache_dir=cache_dir,
+        checkpoint_dir=checkpoint_dir,
+        refresh=True,
+    )
+
+    resumed_state = ci._load_checkpoint_state(checkpoint_dir, key, reset_checkpoints=False)
+    assert resumed_state is not None
+    assert resumed_state.get("provider_transient_failures", {}).get(provider_name, {}) == {}
+    assert (
+        resumed.metadata.get("transient_failure_summary", {})
+        .get(provider_name, {})
+        .get("queued", 0)
+        == 0
+    )
+
+    all_targets = {target for values in resumed.citation_data.values() for target in values}
+    assert "doi:10.1000/l3a" in all_targets
+    assert "doi:10.1000/l3b" in all_targets
 
 
 def test_checkpoint_crash_resume_matches_uninterrupted_baseline(monkeypatch, tmp_path):
@@ -3617,6 +3990,34 @@ def test_ingest_rejects_nonpositive_max_workers(tmp_path):
             cache_dir=Path(tmp_path),
             refresh=True,
             max_workers=0,
+        )
+
+
+def test_ingest_rejects_nonpositive_transient_retry_max_attempts(tmp_path):
+    with pytest.raises(ValueError, match="transient_retry_max_attempts must be a positive integer"):
+        ci.ingest_from_internet(
+            theory_name="My Fake Theory",
+            l1_papers=["10.1000/xyz1"],
+            sources=["openalex"],
+            depth="l2",
+            cache_dir=Path(tmp_path),
+            refresh=True,
+            transient_retry_max_attempts=0,
+        )
+
+
+def test_ingest_rejects_nonpositive_transient_retry_max_age_seconds(tmp_path):
+    with pytest.raises(
+        ValueError, match="transient_retry_max_age_seconds must be a positive integer"
+    ):
+        ci.ingest_from_internet(
+            theory_name="My Fake Theory",
+            l1_papers=["10.1000/xyz1"],
+            sources=["openalex"],
+            depth="l2",
+            cache_dir=Path(tmp_path),
+            refresh=True,
+            transient_retry_max_age_seconds=0,
         )
 
 

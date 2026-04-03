@@ -327,7 +327,9 @@ class TestMergeLogging:
     def test_log_messages_include_paper_id(self, caplog):
         """paper_id should appear in every log message for traceability."""
         a = _paper(paper_id="doi:10.1/test", title="Short", year=2010, citations=5)
-        b = _paper(paper_id="doi:10.1/test", title="A longer replacement title", year=2020, citations=50)
+        b = _paper(
+            paper_id="doi:10.1/test", title="A longer replacement title", year=2020, citations=50
+        )
         with caplog.at_level(logging.DEBUG, logger="citation_ingestion"):
             _merge_papers(a, b)
         for record in caplog.records:

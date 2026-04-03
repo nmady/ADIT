@@ -122,9 +122,9 @@ class CitationProvider:
 
 
 _CACHE_SCHEMA_VERSION = 5
-_CHECKPOINT_SCHEMA_VERSION = 3
-_COORDINATOR_CHECKPOINT_SCHEMA_VERSION = 1
-_PROVIDER_CHECKPOINT_SCHEMA_VERSION = 1
+_CHECKPOINT_SCHEMA_VERSION = 4
+_COORDINATOR_CHECKPOINT_SCHEMA_VERSION = 2
+_PROVIDER_CHECKPOINT_SCHEMA_VERSION = 2
 
 # HTTP codes that are safe to retry vs. those that indicate a permanent failure.
 _PERMANENT_FAILURE_HTTP_CODES = frozenset({400, 401, 403, 404})
@@ -136,6 +136,12 @@ _SAFE_GET_RETRY_AFTER_MAX_SECONDS = 300  # cap on server-specified Retry-After w
 _PAGINATION_STATE_MAX_AGE_SECONDS = 6 * 60 * 60
 _FAILURE_SUMMARY_REQUEST_INTERVAL = 50
 _FAILURE_SUMMARY_SECONDS_INTERVAL = 15.0
+_DEFAULT_TRANSIENT_RETRY_MAX_ATTEMPTS = 5
+_DEFAULT_TRANSIENT_RETRY_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+_TRANSIENT_RETRY_MAX_ATTEMPTS = _DEFAULT_TRANSIENT_RETRY_MAX_ATTEMPTS
+_TRANSIENT_RETRY_MAX_AGE_SECONDS = _DEFAULT_TRANSIENT_RETRY_MAX_AGE_SECONDS
+
+_SENSITIVE_HEADER_NAMES = frozenset({"authorization", "proxy-authorization", "cookie", "x-api-key"})
 
 # ---------------------------------------------------------------------------
 # Verbose terminal output
@@ -149,6 +155,7 @@ _TRANSIENT_PROGRESS_ACTIVE: bool = False
 _TRANSIENT_PROGRESS_LAST_LEN: int = 0
 _PROGRESS_LOCK = threading.RLock()
 _STATS_LOCK = threading.Lock()
+_TRANSIENT_FAILURES_LOCK = threading.Lock()
 
 
 def set_verbose(flag: bool) -> None:
@@ -323,6 +330,97 @@ _INGEST_STATS = {
     "last_summary_timestamp": 0.0,
 }
 
+_TRANSIENT_REQUEST_FAILURES: List[Dict[str, Any]] = []
+
+
+def _sanitize_retry_headers(headers: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Drop sensitive headers before persisting request replay metadata."""
+    if not isinstance(headers, dict):
+        return {}
+    sanitized: Dict[str, str] = {}
+    for key, value in headers.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        if key.lower() in _SENSITIVE_HEADER_NAMES:
+            continue
+        sanitized[key] = value
+    return sanitized
+
+
+def _transient_failure_key(record: Dict[str, Any]) -> str:
+    """Build a deterministic identity for one transient retry record."""
+    op = str(record.get("op") or "safe_get")
+    provider = str(record.get("provider") or "unknown")
+    target = str(record.get("target_id") or "")
+    return f"{provider}:{op}:{target}"
+
+
+def _record_transient_request_failure(
+    provider: Optional[str],
+    url: str,
+    timeout: int,
+    max_retries: int,
+    headers: Optional[Dict[str, str]],
+    last_error: Optional[Exception],
+    last_error_body: Optional[str],
+) -> None:
+    """Store retry-exhausted transient request metadata for checkpoint replay."""
+    if not provider:
+        return
+
+    retry_after_seconds: Optional[float] = None
+    status_code: Optional[int] = None
+    error_type = "unknown"
+    if isinstance(last_error, urllib.error.HTTPError):
+        status_code = int(last_error.code)
+        error_type = "http_error"
+        retry_after_seconds = _retry_after_seconds(last_error)
+        if retry_after_seconds is not None:
+            retry_after_seconds = min(retry_after_seconds, _SAFE_GET_RETRY_AFTER_MAX_SECONDS)
+    elif last_error is not None:
+        error_type = type(last_error).__name__
+
+    payload: Dict[str, Any] = {
+        "op": "safe_get",
+        "provider": provider,
+        "target_id": url,
+        "resume_state": {
+            "timeout": int(timeout),
+            "max_retries": int(max_retries),
+            "headers": _sanitize_retry_headers(headers),
+        },
+        "error_code": status_code,
+        "error_type": error_type,
+        "attempts": 1,
+        "last_attempt_ts": time.time(),
+        "server_retry_after": retry_after_seconds,
+    }
+    if _DEBUG_HTTP and last_error_body:
+        payload["error_hint"] = re.sub(r"\s+", " ", str(last_error_body)).strip()[:1024]
+
+    with _TRANSIENT_FAILURES_LOCK:
+        _TRANSIENT_REQUEST_FAILURES.append(payload)
+
+
+def _drain_transient_request_failures(provider: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Pop queued transient request failures, optionally filtering by provider."""
+    with _TRANSIENT_FAILURES_LOCK:
+        if provider is None:
+            drained = list(_TRANSIENT_REQUEST_FAILURES)
+            _TRANSIENT_REQUEST_FAILURES.clear()
+            return drained
+
+        kept: List[Dict[str, Any]] = []
+        drained: List[Dict[str, Any]] = []
+        for payload in _TRANSIENT_REQUEST_FAILURES:
+            if payload.get("provider") == provider:
+                drained.append(payload)
+            else:
+                kept.append(payload)
+        _TRANSIENT_REQUEST_FAILURES.clear()
+        _TRANSIENT_REQUEST_FAILURES.extend(kept)
+        return drained
+
 
 def _http_error_body(exc: urllib.error.HTTPError) -> Optional[str]:
     """Extract and normalize text body from an HTTPError response."""
@@ -346,6 +444,7 @@ def _reset_ingest_stats(source_list: Sequence[str]) -> None:
     _INGEST_STATS["per_status_failures"] = {}
     _INGEST_STATS["last_summary_request_count"] = 0
     _INGEST_STATS["last_summary_timestamp"] = time.time()
+    _drain_transient_request_failures()
 
 
 def _record_request_failure(provider: Optional[str], status_code: Optional[int] = None) -> None:
@@ -420,7 +519,8 @@ def _safe_get(
 
     Retryable: network/timeout errors and HTTP 429/5xx.
     Permanent failures: HTTP 400/401/403/404 — these return None immediately.
-    Exhausted retries: also return None and record to _INGEST_STATS.
+    Exhausted retries: also return None, record to _INGEST_STATS, and queue
+    provider-scoped transient retry metadata for checkpoint resume.
     """
     with _STATS_LOCK:
         _INGEST_STATS["total_requests"] += 1
@@ -494,6 +594,15 @@ def _safe_get(
             delay *= _SAFE_GET_BACKOFF_FACTOR
 
     _record_request_failure(provider, status_code=getattr(last_error, "code", None))
+    _record_transient_request_failure(
+        provider=provider,
+        url=url,
+        timeout=timeout,
+        max_retries=max_retries,
+        headers=request_headers,
+        last_error=last_error,
+        last_error_body=last_error_body,
+    )
     log_body = last_error_body if _DEBUG_HTTP else "<suppressed; enable --debug-http>"
     logger.warning(
         "Request failed after %d attempts: provider=%s url=%s final_error=%s body=%s",
@@ -803,6 +912,206 @@ def _deserialize_provider_l3_state(raw_state: Any) -> Dict[str, Dict[str, Any]]:
     return output
 
 
+def _serialize_transient_failures(
+    state: Dict[str, Dict[str, Dict[str, Any]]],
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Prepare provider transient retry records for checkpoint persistence."""
+    serialized: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for provider_name, provider_failures in state.items():
+        if not isinstance(provider_name, str) or not isinstance(provider_failures, dict):
+            continue
+
+        provider_out: Dict[str, Dict[str, Any]] = {}
+        for failure_key, failure in provider_failures.items():
+            if not isinstance(failure_key, str) or not isinstance(failure, dict):
+                continue
+
+            clean = dict(failure)
+            resume_state = clean.get("resume_state")
+            if not isinstance(resume_state, dict):
+                clean["resume_state"] = {}
+            else:
+                headers = _sanitize_retry_headers(resume_state.get("headers"))
+                clean["resume_state"] = {
+                    "timeout": _parse_optional_int(resume_state.get("timeout"), default=20) or 20,
+                    "max_retries": _parse_optional_int(
+                        resume_state.get("max_retries"),
+                        default=_SAFE_GET_MAX_RETRIES,
+                    )
+                    or _SAFE_GET_MAX_RETRIES,
+                    "headers": headers,
+                }
+
+            clean["attempts"] = _parse_optional_int(clean.get("attempts"), default=0) or 0
+            updated_ts = clean.get("last_attempt_ts")
+            try:
+                clean["last_attempt_ts"] = float(updated_ts) if updated_ts is not None else 0.0
+            except (TypeError, ValueError):
+                clean["last_attempt_ts"] = 0.0
+
+            retry_after = clean.get("server_retry_after")
+            try:
+                clean["server_retry_after"] = (
+                    float(retry_after) if retry_after is not None else None
+                )
+            except (TypeError, ValueError):
+                clean["server_retry_after"] = None
+
+            provider_out[failure_key] = clean
+
+        if provider_out:
+            serialized[provider_name] = provider_out
+
+    return serialized
+
+
+def _deserialize_transient_failures(raw_state: Any) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Load and sanitize transient retry records from checkpoint payloads."""
+    if not isinstance(raw_state, dict):
+        return {}
+
+    output: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for provider_name, provider_failures in raw_state.items():
+        if not isinstance(provider_name, str) or not isinstance(provider_failures, dict):
+            continue
+
+        provider_out: Dict[str, Dict[str, Any]] = {}
+        for failure_key, failure in provider_failures.items():
+            if not isinstance(failure_key, str) or not isinstance(failure, dict):
+                continue
+
+            clean = dict(failure)
+            clean.setdefault("provider", provider_name)
+            clean.setdefault("op", "safe_get")
+            clean.setdefault("target_id", "")
+            clean["attempts"] = _parse_optional_int(clean.get("attempts"), default=0) or 0
+
+            updated_ts = clean.get("last_attempt_ts")
+            try:
+                clean["last_attempt_ts"] = float(updated_ts) if updated_ts is not None else 0.0
+            except (TypeError, ValueError):
+                clean["last_attempt_ts"] = 0.0
+
+            retry_after = clean.get("server_retry_after")
+            try:
+                clean["server_retry_after"] = (
+                    float(retry_after) if retry_after is not None else None
+                )
+            except (TypeError, ValueError):
+                clean["server_retry_after"] = None
+
+            resume_state = clean.get("resume_state")
+            if not isinstance(resume_state, dict):
+                clean["resume_state"] = {}
+            else:
+                clean["resume_state"] = {
+                    "timeout": _parse_optional_int(resume_state.get("timeout"), default=20) or 20,
+                    "max_retries": _parse_optional_int(
+                        resume_state.get("max_retries"),
+                        default=_SAFE_GET_MAX_RETRIES,
+                    )
+                    or _SAFE_GET_MAX_RETRIES,
+                    "headers": _sanitize_retry_headers(resume_state.get("headers")),
+                }
+
+            provider_out[failure_key] = clean
+
+        if provider_out:
+            output[provider_name] = provider_out
+
+    return output
+
+
+def _merge_provider_transient_failures(
+    existing: Dict[str, Dict[str, Any]],
+    incoming: Sequence[Dict[str, Any]],
+) -> None:
+    """Merge newly observed transient failures into provider-local retry state."""
+    for payload in incoming:
+        if not isinstance(payload, dict):
+            continue
+        failure = dict(payload)
+        failure.setdefault("op", "safe_get")
+        failure.setdefault("provider", "unknown")
+        failure.setdefault("target_id", "")
+        failure["attempts"] = _parse_optional_int(failure.get("attempts"), default=0) or 0
+        failure.setdefault("last_attempt_ts", time.time())
+        key = _transient_failure_key(failure)
+        previous = existing.get(key)
+        if isinstance(previous, dict):
+            previous_attempts = _parse_optional_int(previous.get("attempts"), default=0) or 0
+            failure["attempts"] = max(previous_attempts + 1, failure["attempts"])
+        existing[key] = failure
+
+
+def _transient_retry_wait_seconds(record: Dict[str, Any], now_ts: Optional[float] = None) -> float:
+    """Return remaining wait time before a transient record can be retried."""
+    now = time.time() if now_ts is None else float(now_ts)
+    attempts = _parse_optional_int(record.get("attempts"), default=0) or 0
+    last_attempt = record.get("last_attempt_ts")
+    try:
+        last_ts = float(last_attempt) if last_attempt is not None else 0.0
+    except (TypeError, ValueError):
+        last_ts = 0.0
+
+    backoff_delay = min(
+        _SAFE_GET_INITIAL_DELAY * (_SAFE_GET_BACKOFF_FACTOR ** max(attempts, 0)),
+        _SAFE_GET_MAX_DELAY,
+    )
+    retry_after = record.get("server_retry_after")
+    try:
+        retry_after_delay = float(retry_after) if retry_after is not None else 0.0
+    except (TypeError, ValueError):
+        retry_after_delay = 0.0
+
+    wait_until = max(last_ts + backoff_delay, last_ts + retry_after_delay)
+    return max(0.0, wait_until - now)
+
+
+def _prune_provider_transient_failures(
+    provider_name: str,
+    failures: Dict[str, Dict[str, Any]],
+    checkpoint_stats: Optional[Dict[str, object]] = None,
+) -> None:
+    """Drop transient retry records that are too old or exhausted."""
+    now = time.time()
+    for failure_key, record in list(failures.items()):
+        attempts = _parse_optional_int(record.get("attempts"), default=0) or 0
+        last_attempt = record.get("last_attempt_ts")
+        try:
+            last_ts = float(last_attempt) if last_attempt is not None else 0.0
+        except (TypeError, ValueError):
+            last_ts = 0.0
+        too_old = last_ts > 0.0 and (now - last_ts) > _TRANSIENT_RETRY_MAX_AGE_SECONDS
+        exhausted = attempts >= _TRANSIENT_RETRY_MAX_ATTEMPTS
+        if not too_old and not exhausted:
+            continue
+        failures.pop(failure_key, None)
+        if checkpoint_stats is None:
+            continue
+        checkpoint_stats["transient_failures_pruned"] = (
+            int(checkpoint_stats.get("transient_failures_pruned", 0)) + 1
+        )
+        _vprint(f"  [{provider_name}] Pruned transient retry record: {failure_key}")
+
+
+def _transient_failure_summary(
+    transient_failures: Dict[str, Dict[str, Dict[str, Any]]],
+) -> Dict[str, Dict[str, int]]:
+    """Build compact coordinator-friendly summary for transient retry queues."""
+    summary: Dict[str, Dict[str, int]] = {}
+    for provider_name, provider_records in transient_failures.items():
+        if not isinstance(provider_name, str) or not isinstance(provider_records, dict):
+            continue
+        queued = len(provider_records)
+        max_attempts = 0
+        for record in provider_records.values():
+            attempts = _parse_optional_int((record or {}).get("attempts"), default=0) or 0
+            max_attempts = max(max_attempts, attempts)
+        summary[provider_name] = {"queued": queued, "max_attempts": max_attempts}
+    return summary
+
+
 def _load_checkpoint_state(
     checkpoint_root: Path,
     key: str,
@@ -826,7 +1135,7 @@ def _load_checkpoint_state(
 
     if not isinstance(payload, dict):
         return None
-    if payload.get("checkpoint_schema_version") != _CHECKPOINT_SCHEMA_VERSION:
+    if payload.get("checkpoint_schema_version") not in {3, _CHECKPOINT_SCHEMA_VERSION}:
         return None
     if payload.get("request_key") != key:
         return None
@@ -856,10 +1165,10 @@ def _load_coordinator_checkpoint_state(
 
     if not isinstance(payload, dict):
         return None
-    if (
-        payload.get("coordinator_checkpoint_schema_version")
-        != _COORDINATOR_CHECKPOINT_SCHEMA_VERSION
-    ):
+    if payload.get("coordinator_checkpoint_schema_version") not in {
+        1,
+        _COORDINATOR_CHECKPOINT_SCHEMA_VERSION,
+    }:
         return None
     if payload.get("request_key") != key:
         return None
@@ -874,6 +1183,7 @@ def _write_coordinator_checkpoint_state(
     all_papers: Dict[str, IngestionPaper],
     provider_stats: Dict[str, object],
     combined_completeness: Dict[str, Dict[str, object]],
+    transient_failure_summary: Optional[Dict[str, Dict[str, int]]] = None,
     l3_to_l3_state: Optional[Dict[str, Dict[str, Any]]] = None,
     ingestion_phase: str = "l2_to_l3",
 ) -> None:
@@ -887,6 +1197,7 @@ def _write_coordinator_checkpoint_state(
         "all_papers": _serialize_papers(all_papers),
         "provider_stats": provider_stats,
         "combined_completeness": combined_completeness,
+        "transient_failure_summary": transient_failure_summary or {},
         "l3_to_l3_state": _serialize_provider_l3_state(l3_to_l3_state or {}),
         "ingestion_phase": ingestion_phase,
     }
@@ -917,7 +1228,10 @@ def _load_provider_checkpoint_state(
 
     if not isinstance(payload, dict):
         return None
-    if payload.get("provider_checkpoint_schema_version") != _PROVIDER_CHECKPOINT_SCHEMA_VERSION:
+    if payload.get("provider_checkpoint_schema_version") not in {
+        1,
+        _PROVIDER_CHECKPOINT_SCHEMA_VERSION,
+    }:
         return None
     if payload.get("request_key") != key:
         return None
@@ -932,6 +1246,7 @@ def _write_provider_checkpoint_state(
     provider_name: str,
     provider_pagination_state: Optional[Dict[str, Dict[str, Any]]] = None,
     provider_l3_state: Optional[Dict[str, Any]] = None,
+    transient_failures: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> None:
     """Persist provider-specific checkpoint state for in-flight resume."""
     checkpoint_path = _provider_checkpoint_file(checkpoint_root, key, provider_name)
@@ -944,6 +1259,9 @@ def _write_provider_checkpoint_state(
         ).get(provider_name, {}),
         "provider_l3_state": _serialize_provider_l3_state(
             {provider_name: provider_l3_state or {}}
+        ).get(provider_name, {}),
+        "transient_failures": _serialize_transient_failures(
+            {provider_name: transient_failures or {}}
         ).get(provider_name, {}),
     }
     _write_json_atomic(checkpoint_path, payload)
@@ -959,6 +1277,7 @@ def _write_checkpoint_state(
     combined_completeness: Dict[str, Dict[str, object]],
     provider_pagination_state: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
     provider_l3_state: Optional[Dict[str, Dict[str, Any]]] = None,
+    provider_transient_failures: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
     l3_to_l3_state: Optional[Dict[str, Dict[str, Any]]] = None,
     ingestion_phase: str = "l2_to_l3",
 ) -> None:
@@ -976,6 +1295,10 @@ def _write_checkpoint_state(
             provider_pagination_state or {}
         ),
         "provider_l3_state": _serialize_provider_l3_state(provider_l3_state or {}),
+        "provider_transient_failures": _serialize_transient_failures(
+            provider_transient_failures or {}
+        ),
+        "transient_failure_summary": _transient_failure_summary(provider_transient_failures or {}),
         "l3_to_l3_state": _serialize_provider_l3_state(l3_to_l3_state or {}),
         "ingestion_phase": ingestion_phase,
     }
@@ -1061,7 +1384,11 @@ def _merge_papers(existing: IngestionPaper, incoming: IngestionPaper) -> Ingesti
     # see which value was discarded.
     # ------------------------------------------------------------------
     best_citations = max(existing.citations, incoming.citations)
-    if existing.citations > 0 and incoming.citations > 0 and existing.citations != incoming.citations:
+    if (
+        existing.citations > 0
+        and incoming.citations > 0
+        and existing.citations != incoming.citations
+    ):
         discarded = min(existing.citations, incoming.citations)
         logger.debug(
             "merge[%s] citation count conflict: keeping %d, discarding %d",
@@ -1751,6 +2078,7 @@ def _run_provider_wave1_worker(
     max_l3: Optional[int],
     provider_seed_state: Optional[Dict[str, Dict[str, Any]]],
     provider_l3_state: Optional[Dict[str, Any]],
+    provider_transient_failures: Optional[Dict[str, Dict[str, Any]]],
     checkpoint_root: Path,
     request_key: str,
 ) -> Tuple[
@@ -1760,11 +2088,17 @@ def _run_provider_wave1_worker(
     Dict[str, object],
     Dict[str, Dict[str, Any]],
     Dict[str, Any],
+    Dict[str, Dict[str, Any]],
 ]:
     """Run one provider ingestion unit for parallel wave-1 execution."""
     try:
         local_seed_state: Dict[str, Dict[str, Any]] = dict(provider_seed_state or {})
         local_l3_state: Dict[str, Any] = dict(provider_l3_state or {})
+        local_transient_failures: Dict[str, Dict[str, Any]] = dict(
+            provider_transient_failures or {}
+        )
+
+        _replay_provider_transient_failures(provider.name, local_transient_failures, {})
 
         seed_metadata = provider.fetch_seed_metadata(l1_norm)
         local_papers_resolved = dict(all_papers_snapshot)
@@ -1778,6 +2112,7 @@ def _run_provider_wave1_worker(
                 provider.name,
                 provider_pagination_state=local_seed_state,
                 provider_l3_state=local_l3_state,
+                transient_failures=local_transient_failures,
             )
 
         def _l3_progress(state: Dict[str, Any]) -> None:
@@ -1789,6 +2124,7 @@ def _run_provider_wave1_worker(
                 provider.name,
                 provider_pagination_state=local_seed_state,
                 provider_l3_state=local_l3_state,
+                transient_failures=local_transient_failures,
             )
 
         provider_edges, provider_papers, stats = _fetch_provider_graph(
@@ -1808,6 +2144,10 @@ def _run_provider_wave1_worker(
             include_l3=False,
         )
 
+        drained_failures = _drain_transient_request_failures(provider.name)
+        _merge_provider_transient_failures(local_transient_failures, drained_failures)
+        _prune_provider_transient_failures(provider.name, local_transient_failures)
+
         return (
             seed_metadata,
             provider_edges,
@@ -1815,6 +2155,7 @@ def _run_provider_wave1_worker(
             stats,
             local_seed_state,
             local_l3_state,
+            local_transient_failures,
         )
     except Exception as exc:  # pragma: no cover - exercised by parallel failure tests
         raise ProviderIngestionError(provider.name, exc) from exc
@@ -1825,12 +2166,22 @@ def _run_provider_l2_to_l3_worker(
     l2_parent_ids: Sequence[str],
     max_l3: Optional[int],
     provider_l3_state: Optional[Dict[str, Any]],
+    provider_transient_failures: Optional[Dict[str, Dict[str, Any]]],
     checkpoint_root: Path,
     request_key: str,
-) -> Tuple[Dict[str, Set[str]], Dict[str, IngestionPaper], Dict[str, Any]]:
+) -> Tuple[
+    Dict[str, Set[str]],
+    Dict[str, IngestionPaper],
+    Dict[str, Any],
+    Dict[str, Dict[str, Any]],
+]:
     """Run L2->L3 expansion for one provider with provider-local checkpoint updates."""
     try:
         local_l3_state: Dict[str, Any] = dict(provider_l3_state or {})
+        local_transient_failures: Dict[str, Dict[str, Any]] = dict(
+            provider_transient_failures or {}
+        )
+        _replay_provider_transient_failures(provider.name, local_transient_failures, {})
 
         def _l3_progress(state: Dict[str, Any]) -> None:
             local_l3_state.clear()
@@ -1841,6 +2192,7 @@ def _run_provider_l2_to_l3_worker(
                 provider.name,
                 provider_pagination_state={},
                 provider_l3_state=local_l3_state,
+                transient_failures=local_transient_failures,
             )
 
         l3_call_kwargs: Dict[str, Any] = {
@@ -1854,7 +2206,10 @@ def _run_provider_l2_to_l3_worker(
             l3_call_kwargs["progress_callback"] = _l3_progress
 
         l3_edges, l3_papers = provider.fetch_l3_references(**l3_call_kwargs)
-        return l3_edges, l3_papers, local_l3_state
+        drained_failures = _drain_transient_request_failures(provider.name)
+        _merge_provider_transient_failures(local_transient_failures, drained_failures)
+        _prune_provider_transient_failures(provider.name, local_transient_failures)
+        return l3_edges, l3_papers, local_l3_state, local_transient_failures
     except Exception as exc:  # pragma: no cover - exercised by parallel failure tests
         raise ProviderIngestionError(provider.name, exc) from exc
 
@@ -1956,6 +2311,7 @@ def _build_metadata(
     papers_data: Dict[str, Dict[str, object]],
     citation_data: Dict[str, List[str]],
     completeness: Dict[str, Dict[str, object]],
+    transient_failure_summary: Optional[Dict[str, Dict[str, int]]] = None,
     checkpoint_stats: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     """Assemble final run metadata for output payload and cache."""
@@ -1974,6 +2330,7 @@ def _build_metadata(
         "alias_count": len(alias_map),
         "paper_count": len(papers_data),
         "edge_count": sum(len(values) for values in citation_data.values()),
+        "transient_failure_summary": transient_failure_summary or {},
     }
     if checkpoint_stats is not None:
         metadata["checkpoint_stats"] = checkpoint_stats
@@ -3117,7 +3474,10 @@ def _dedupe_and_materialize(
         else:
             merged_by_key[key] = paper
 
+    # Map final canonical paper_id → materialized metadata dict (output-ready paper records)
     papers_out: Dict[str, Dict[str, object]] = {}
+
+    # Map each original/alias paper ID to its canonical final ID for edge normalization.
     alias_to_final: Dict[str, str] = {}
 
     for key, paper in merged_by_key.items():
@@ -3160,6 +3520,11 @@ def _default_checkpoint_stats() -> Dict[str, object]:
         "l3_to_l3_edges_added": 0,
         "l3_to_l3_parent_scanned_count": 0,
         "l3_to_l3_resumed_providers": [],
+        "transient_failures_retried": 0,
+        "transient_failures_resumed_success": 0,
+        "transient_failures_exhausted": 0,
+        "transient_failures_pruned": 0,
+        "transient_failures_queued": 0,
     }
 
 
@@ -3189,6 +3554,7 @@ def _initialize_runtime_state(
     Set[str],
     Dict[str, Dict[str, Dict[str, Any]]],
     Dict[str, Dict[str, Any]],
+    Dict[str, Dict[str, Dict[str, Any]]],
     Dict[str, Dict[str, Any]],
     str,
 ]:
@@ -3201,6 +3567,7 @@ def _initialize_runtime_state(
     completed_providers: Set[str] = set()
     provider_pagination_state: Dict[str, Dict[str, Dict[str, Any]]] = {}
     provider_l3_state: Dict[str, Dict[str, Any]] = {}
+    provider_transient_failures: Dict[str, Dict[str, Dict[str, Any]]] = {}
     l3_to_l3_state: Dict[str, Dict[str, Any]] = {}
     ingestion_phase = "l2_to_l3"
     return (
@@ -3212,6 +3579,7 @@ def _initialize_runtime_state(
         completed_providers,
         provider_pagination_state,
         provider_l3_state,
+        provider_transient_failures,
         l3_to_l3_state,
         ingestion_phase,
     )
@@ -3228,6 +3596,7 @@ def _restore_runtime_state_from_checkpoint(
     completed_providers: Set[str],
     provider_pagination_state: Dict[str, Dict[str, Dict[str, Any]]],
     provider_l3_state: Dict[str, Dict[str, Any]],
+    provider_transient_failures: Dict[str, Dict[str, Dict[str, Any]]],
     l3_to_l3_state: Dict[str, Dict[str, Any]],
     ingestion_phase: str,
 ) -> tuple[
@@ -3238,6 +3607,7 @@ def _restore_runtime_state_from_checkpoint(
     Set[str],
     Dict[str, Dict[str, Dict[str, Any]]],
     Dict[str, Dict[str, Any]],
+    Dict[str, Dict[str, Dict[str, Any]]],
     Dict[str, Dict[str, Any]],
     str,
 ]:
@@ -3265,6 +3635,9 @@ def _restore_runtime_state_from_checkpoint(
         checkpoint_state.get("provider_pagination_state")
     )
     provider_l3_state = _deserialize_provider_l3_state(checkpoint_state.get("provider_l3_state"))
+    provider_transient_failures = _deserialize_transient_failures(
+        checkpoint_state.get("provider_transient_failures")
+    )
     l3_to_l3_state = _deserialize_provider_l3_state(checkpoint_state.get("l3_to_l3_state"))
     raw_phase = checkpoint_state.get("ingestion_phase")
     if isinstance(raw_phase, str) and raw_phase in ("l2_to_l3", "l3_to_l3"):
@@ -3279,6 +3652,7 @@ def _restore_runtime_state_from_checkpoint(
         completed_providers,
         provider_pagination_state,
         provider_l3_state,
+        provider_transient_failures,
         l3_to_l3_state,
         ingestion_phase,
     )
@@ -3345,6 +3719,83 @@ def _record_l3_resume_progress(
     checkpoint_stats["l3_resumed_parent_count"] = (
         int(checkpoint_stats.get("l3_resumed_parent_count", 0)) + resumed_l3_index
     )
+
+
+def _replay_provider_transient_failures(
+    provider_name: str,
+    failures: Dict[str, Dict[str, Any]],
+    checkpoint_stats: Dict[str, object],
+) -> None:
+    """Replay eligible transient request failures for one provider before ingestion resumes."""
+    _prune_provider_transient_failures(provider_name, failures, checkpoint_stats)
+    if not failures:
+        return
+
+    attempted = 0
+    succeeded = 0
+    exhausted = 0
+    now = time.time()
+    for failure_key, record in list(failures.items()):
+        wait_seconds = _transient_retry_wait_seconds(record, now_ts=now)
+        if wait_seconds > 0.0:
+            continue
+
+        attempts = _parse_optional_int(record.get("attempts"), default=0) or 0
+        if attempts >= _TRANSIENT_RETRY_MAX_ATTEMPTS:
+            failures.pop(failure_key, None)
+            exhausted += 1
+            continue
+
+        attempted += 1
+        resume_state = (
+            record.get("resume_state") if isinstance(record.get("resume_state"), dict) else {}
+        )
+        timeout = _parse_optional_int(resume_state.get("timeout"), default=20) or 20
+        max_retries = (
+            _parse_optional_int(
+                resume_state.get("max_retries"),
+                default=_SAFE_GET_MAX_RETRIES,
+            )
+            or _SAFE_GET_MAX_RETRIES
+        )
+        headers = _sanitize_retry_headers(resume_state.get("headers"))
+        target_url = str(record.get("target_id") or "")
+        if not target_url:
+            failures.pop(failure_key, None)
+            exhausted += 1
+            continue
+
+        failures.pop(failure_key, None)
+        result = _safe_get(
+            target_url,
+            timeout=timeout,
+            provider=provider_name,
+            max_retries=max_retries,
+            headers=headers,
+        )
+        drained = _drain_transient_request_failures(provider_name)
+        _merge_provider_transient_failures(failures, drained)
+        if result is not None:
+            succeeded += 1
+            continue
+
+        if failure_key not in failures:
+            exhausted += 1
+
+    if attempted:
+        checkpoint_stats["transient_failures_retried"] = (
+            int(checkpoint_stats.get("transient_failures_retried", 0)) + attempted
+        )
+        checkpoint_stats["transient_failures_resumed_success"] = (
+            int(checkpoint_stats.get("transient_failures_resumed_success", 0)) + succeeded
+        )
+        checkpoint_stats["transient_failures_exhausted"] = (
+            int(checkpoint_stats.get("transient_failures_exhausted", 0)) + exhausted
+        )
+        _vprint(
+            f"  [{provider_name}] Replay transient retries: "
+            f"attempted={attempted}, succeeded={succeeded}, exhausted={exhausted}, queued={len(failures)}"
+        )
 
 
 def _build_provider_progress_callbacks(
@@ -3450,10 +3901,12 @@ def _execute_l2_to_l3_jobs(
     all_papers: Dict[str, IngestionPaper],
     provider_stats: Dict[str, Any],
     provider_l3_state: Dict[str, Dict[str, Any]],
+    provider_transient_failures: Dict[str, Dict[str, Dict[str, Any]]],
     max_workers: Optional[int],
     max_l3: int,
     checkpoint_root: Path,
     key: str,
+    checkpoint_stats: Dict[str, object],
     persist_callback: Callable[[], None],
 ) -> None:
     """Execute L2->L3 jobs (parallel or sequential based on max_workers)."""
@@ -3466,10 +3919,12 @@ def _execute_l2_to_l3_jobs(
             all_papers=all_papers,
             provider_stats=provider_stats,
             provider_l3_state=provider_l3_state,
+            provider_transient_failures=provider_transient_failures,
             max_workers=max_workers,
             max_l3=max_l3,
             checkpoint_root=checkpoint_root,
             key=key,
+            checkpoint_stats=checkpoint_stats,
             persist_callback=persist_callback,
         )
         return
@@ -3481,9 +3936,11 @@ def _execute_l2_to_l3_jobs(
         all_papers=all_papers,
         provider_stats=provider_stats,
         provider_l3_state=provider_l3_state,
+        provider_transient_failures=provider_transient_failures,
         max_l3=max_l3,
         checkpoint_root=checkpoint_root,
         key=key,
+        checkpoint_stats=checkpoint_stats,
         persist_callback=persist_callback,
     )
 
@@ -3499,8 +3956,11 @@ def _finalize_l2_to_l3_provider(
     all_papers: Dict[str, IngestionPaper],
     provider_stats: Dict[str, Any],
     provider_l3_state: Dict[str, Dict[str, Any]],
+    provider_transient_failures: Dict[str, Dict[str, Dict[str, Any]]],
+    provider_transient_state: Dict[str, Dict[str, Any]],
     checkpoint_root: Path,
     key: str,
+    checkpoint_stats: Dict[str, object],
     persist_callback: Callable[[], None],
 ) -> None:
     _merge_provider_outputs(all_edges, all_papers, l3_edges, l3_papers)
@@ -3522,8 +3982,15 @@ def _finalize_l2_to_l3_provider(
         f"  [{provider.name}] L2->L3 provider {l3_provider_index}/{l3_job_total}: "
         f"added {l3_edges_added} edges"
     )
-    l2_to_l3_completed.add(provider.name)
-    provider_l3_state["__completed_providers"] = {"names": sorted(l2_to_l3_completed)}
+    provider_transient_failures[provider.name] = dict(provider_transient_state)
+    if provider_transient_state:
+        checkpoint_stats["transient_failures_queued"] = int(
+            checkpoint_stats.get("transient_failures_queued", 0)
+        ) + len(provider_transient_state)
+    else:
+        l2_to_l3_completed.add(provider.name)
+        provider_l3_state["__completed_providers"] = {"names": sorted(l2_to_l3_completed)}
+        provider_transient_failures.pop(provider.name, None)
     provider_l3_state.pop(provider.name, None)
     _write_provider_checkpoint_state(
         checkpoint_root,
@@ -3531,6 +3998,7 @@ def _finalize_l2_to_l3_provider(
         provider.name,
         provider_pagination_state={},
         provider_l3_state={},
+        transient_failures=provider_transient_state,
     )
     persist_callback()
 
@@ -3538,6 +4006,7 @@ def _finalize_l2_to_l3_provider(
 def _restore_failed_l2_to_l3_state(
     provider_name: str,
     provider_l3_state: Dict[str, Dict[str, Any]],
+    provider_transient_failures: Dict[str, Dict[str, Dict[str, Any]]],
     checkpoint_root: Path,
     key: str,
     persist_callback: Callable[[], None],
@@ -3550,6 +4019,12 @@ def _restore_failed_l2_to_l3_state(
     checkpoint_l3_state = provider_checkpoint.get("provider_l3_state")
     if isinstance(checkpoint_l3_state, dict):
         provider_l3_state[provider_name] = checkpoint_l3_state
+    checkpoint_transient = provider_checkpoint.get("transient_failures")
+    if isinstance(checkpoint_transient, dict):
+        provider_transient_failures[provider_name] = _deserialize_transient_failures(
+            {provider_name: checkpoint_transient}
+        ).get(provider_name, {})
+    if isinstance(checkpoint_l3_state, dict) or isinstance(checkpoint_transient, dict):
         persist_callback()
 
 
@@ -3560,10 +4035,12 @@ def _execute_l2_to_l3_parallel_jobs(
     all_papers: Dict[str, IngestionPaper],
     provider_stats: Dict[str, Any],
     provider_l3_state: Dict[str, Dict[str, Any]],
+    provider_transient_failures: Dict[str, Dict[str, Dict[str, Any]]],
     max_workers: int,
     max_l3: int,
     checkpoint_root: Path,
     key: str,
+    checkpoint_stats: Dict[str, object],
     persist_callback: Callable[[], None],
 ) -> None:
     effective_workers = min(max_workers, len(l3_jobs))
@@ -3579,6 +4056,7 @@ def _execute_l2_to_l3_parallel_jobs(
                     provider_l2_parent_ids,
                     max_l3,
                     provider_l3_run_state,
+                    provider_transient_failures.get(provider.name, {}),
                     checkpoint_root,
                     key,
                 )
@@ -3587,11 +4065,12 @@ def _execute_l2_to_l3_parallel_jobs(
         for future in as_completed(futures):
             provider, l3_provider_index = futures[future]
             try:
-                l3_edges, l3_papers, local_l3_state = future.result()
+                l3_edges, l3_papers, local_l3_state, local_transient_state = future.result()
             except ProviderIngestionError as exc:
                 _restore_failed_l2_to_l3_state(
                     provider_name=exc.provider_name,
                     provider_l3_state=provider_l3_state,
+                    provider_transient_failures=provider_transient_failures,
                     checkpoint_root=checkpoint_root,
                     key=key,
                     persist_callback=persist_callback,
@@ -3608,6 +4087,7 @@ def _execute_l2_to_l3_parallel_jobs(
 
             with merge_lock:
                 provider_l3_state[provider.name] = dict(local_l3_state)
+                provider_transient_failures[provider.name] = dict(local_transient_state)
                 _finalize_l2_to_l3_provider(
                     provider=provider,
                     l3_provider_index=l3_provider_index,
@@ -3619,8 +4099,11 @@ def _execute_l2_to_l3_parallel_jobs(
                     all_papers=all_papers,
                     provider_stats=provider_stats,
                     provider_l3_state=provider_l3_state,
+                    provider_transient_failures=provider_transient_failures,
+                    provider_transient_state=local_transient_state,
                     checkpoint_root=checkpoint_root,
                     key=key,
+                    checkpoint_stats=checkpoint_stats,
                     persist_callback=persist_callback,
                 )
 
@@ -3632,32 +4115,39 @@ def _execute_l2_to_l3_sequential_jobs(
     all_papers: Dict[str, IngestionPaper],
     provider_stats: Dict[str, Any],
     provider_l3_state: Dict[str, Dict[str, Any]],
+    provider_transient_failures: Dict[str, Dict[str, Dict[str, Any]]],
     max_l3: int,
     checkpoint_root: Path,
     key: str,
+    checkpoint_stats: Dict[str, object],
     persist_callback: Callable[[], None],
 ) -> None:
     l3_job_total = len(l3_jobs)
     for provider, l3_provider_index, provider_l2_parent_ids, provider_l3_run_state in l3_jobs:
         try:
-            l3_edges, l3_papers, local_l3_state = _run_provider_l2_to_l3_worker(
-                provider,
-                provider_l2_parent_ids,
-                max_l3,
-                provider_l3_run_state,
-                checkpoint_root,
-                key,
+            l3_edges, l3_papers, local_l3_state, local_transient_state = (
+                _run_provider_l2_to_l3_worker(
+                    provider,
+                    provider_l2_parent_ids,
+                    max_l3,
+                    provider_l3_run_state,
+                    provider_transient_failures.get(provider.name, {}),
+                    checkpoint_root,
+                    key,
+                )
             )
         except ProviderIngestionError as exc:
             _restore_failed_l2_to_l3_state(
                 provider_name=provider.name,
                 provider_l3_state=provider_l3_state,
+                provider_transient_failures=provider_transient_failures,
                 checkpoint_root=checkpoint_root,
                 key=key,
                 persist_callback=persist_callback,
             )
             raise exc.cause from exc
         provider_l3_state[provider.name] = dict(local_l3_state)
+        provider_transient_failures[provider.name] = dict(local_transient_state)
         _finalize_l2_to_l3_provider(
             provider=provider,
             l3_provider_index=l3_provider_index,
@@ -3669,8 +4159,11 @@ def _execute_l2_to_l3_sequential_jobs(
             all_papers=all_papers,
             provider_stats=provider_stats,
             provider_l3_state=provider_l3_state,
+            provider_transient_failures=provider_transient_failures,
+            provider_transient_state=local_transient_state,
             checkpoint_root=checkpoint_root,
             key=key,
+            checkpoint_stats=checkpoint_stats,
             persist_callback=persist_callback,
         )
 
@@ -3746,6 +4239,7 @@ def _run_l2_to_l3_pass(
     all_papers: Dict[str, IngestionPaper],
     provider_stats: Dict[str, Any],
     provider_l3_state: Dict[str, Dict[str, Any]],
+    provider_transient_failures: Dict[str, Dict[str, Dict[str, Any]]],
     providers: List[CitationProvider],
     max_workers: Optional[int],
     max_l3: int,
@@ -3784,10 +4278,12 @@ def _run_l2_to_l3_pass(
         all_papers=all_papers,
         provider_stats=provider_stats,
         provider_l3_state=provider_l3_state,
+        provider_transient_failures=provider_transient_failures,
         max_workers=max_workers,
         max_l3=max_l3,
         checkpoint_root=checkpoint_root,
         key=key,
+        checkpoint_stats=checkpoint_stats,
         persist_callback=persist_callback,
     )
 
@@ -3927,6 +4423,7 @@ def _run_parallel_wave1_providers(
     combined_completeness: Dict[str, Any],
     provider_pagination_state: Dict[str, Dict[str, Any]],
     provider_l3_state: Dict[str, Dict[str, Any]],
+    provider_transient_failures: Dict[str, Dict[str, Dict[str, Any]]],
     l3_to_l3_state: Dict[str, Dict[str, Any]],
     ingestion_phase: str,
     checkpoint_stats: Dict[str, object],
@@ -3976,6 +4473,7 @@ def _run_parallel_wave1_providers(
 
             provider_resume_state = provider_pagination_state.get(provider.name, {})
             provider_l3_resume_state = provider_l3_state.get(provider.name, {})
+            provider_transient_state = provider_transient_failures.get(provider.name, {})
             provider_checkpoint = _load_provider_checkpoint_state(
                 checkpoint_root, key, provider.name, reset_checkpoints
             )
@@ -3986,6 +4484,13 @@ def _run_parallel_wave1_providers(
                 checkpoint_l3_state = provider_checkpoint.get("provider_l3_state")
                 if isinstance(checkpoint_l3_state, dict):
                     provider_l3_resume_state = checkpoint_l3_state
+                checkpoint_transient_state = provider_checkpoint.get("transient_failures")
+                if isinstance(checkpoint_transient_state, dict):
+                    provider_transient_state = checkpoint_transient_state
+
+            provider_transient_state = _deserialize_transient_failures(
+                {provider.name: provider_transient_state}
+            ).get(provider.name, {})
 
             future = executor.submit(
                 _run_provider_wave1_worker,
@@ -4000,6 +4505,7 @@ def _run_parallel_wave1_providers(
                 max_l3,
                 provider_resume_state,
                 provider_l3_resume_state,
+                provider_transient_state,
                 checkpoint_root,
                 key,
             )
@@ -4015,6 +4521,7 @@ def _run_parallel_wave1_providers(
                     stats,
                     local_seed_state,
                     local_l3_state,
+                    local_transient_failures,
                 ) = future.result()
             except ProviderIngestionError as exc:
                 provider_stats[exc.provider_name] = {"status": "failed", "error": str(exc.cause)}
@@ -4033,7 +4540,9 @@ def _run_parallel_wave1_providers(
 
                 provider_pagination_state[provider.name] = dict(local_seed_state)
                 provider_l3_state[provider.name] = dict(local_l3_state)
-                completed_providers.add(provider.name)
+                provider_transient_failures[provider.name] = dict(local_transient_failures)
+                if not local_transient_failures:
+                    completed_providers.add(provider.name)
                 parallel_completed.add(provider.name)
                 _progress_done(
                     f"[ADIT] Provider {provider_index}/{provider_total}: {provider.name} "
@@ -4048,6 +4557,7 @@ def _run_parallel_wave1_providers(
                     all_papers,
                     provider_stats,
                     combined_completeness,
+                    _transient_failure_summary(provider_transient_failures),
                     l3_to_l3_state,
                     ingestion_phase,
                 )
@@ -4055,13 +4565,16 @@ def _run_parallel_wave1_providers(
 
                 provider_pagination_state.pop(provider.name, None)
                 provider_l3_state.pop(provider.name, None)
-                _write_provider_checkpoint_state(
-                    checkpoint_root,
-                    key,
-                    provider.name,
-                    provider_pagination_state={},
-                    provider_l3_state={},
-                )
+                if not local_transient_failures:
+                    provider_transient_failures.pop(provider.name, None)
+                    _write_provider_checkpoint_state(
+                        checkpoint_root,
+                        key,
+                        provider.name,
+                        provider_pagination_state={},
+                        provider_l3_state={},
+                        transient_failures={},
+                    )
 
     return parallel_completed, parallel_attempted
 
@@ -4077,6 +4590,7 @@ def _run_sequential_providers(
     combined_completeness: Dict[str, Any],
     provider_pagination_state: Dict[str, Dict[str, Any]],
     provider_l3_state: Dict[str, Dict[str, Any]],
+    provider_transient_failures: Dict[str, Dict[str, Dict[str, Any]]],
     checkpoint_stats: Dict[str, object],
     l1_norm: Set[str],
     theory_name: str,
@@ -4136,6 +4650,13 @@ def _run_sequential_providers(
             continue
 
         provider_state = provider_pagination_state.setdefault(provider.name, {})
+        provider_transient_state = provider_transient_failures.setdefault(provider.name, {})
+        _prune_provider_transient_failures(
+            provider.name, provider_transient_state, checkpoint_stats
+        )
+        _replay_provider_transient_failures(
+            provider.name, provider_transient_state, checkpoint_stats
+        )
         if _drop_stale_seed_resume_state(
             provider_name=provider.name,
             provider_state=provider_state,
@@ -4190,7 +4711,22 @@ def _run_sequential_providers(
         for l1_id, l1_completeness in stats.get("completeness", {}).items():
             combined_completeness.setdefault(l1_id, {}).update(l1_completeness)
 
-        completed_providers.add(provider.name)
+        drained_failures = _drain_transient_request_failures(provider.name)
+        _merge_provider_transient_failures(provider_transient_state, drained_failures)
+        _prune_provider_transient_failures(
+            provider.name, provider_transient_state, checkpoint_stats
+        )
+
+        if provider_transient_state:
+            checkpoint_stats["transient_failures_queued"] = int(
+                checkpoint_stats.get("transient_failures_queued", 0)
+            ) + len(provider_transient_state)
+            _vprint(
+                f"  [{provider.name}] Deferred transient retries queued: {len(provider_transient_state)}"
+            )
+        else:
+            completed_providers.add(provider.name)
+            provider_transient_failures.pop(provider.name, None)
         provider_pagination_state.pop(provider.name, None)
         persist_callback()
 
@@ -4213,6 +4749,8 @@ def ingest_from_internet(
     checkpoint_dir: Optional[Path] = None,
     reset_checkpoints: bool = False,
     checkpoint_staleness_seconds: Optional[int] = None,
+    transient_retry_max_attempts: Optional[int] = None,
+    transient_retry_max_age_seconds: Optional[int] = None,
 ) -> IngestionResult:
     """Ingest citation data from internet providers.
 
@@ -4227,11 +4765,32 @@ def ingest_from_internet(
         checkpoint_staleness_seconds: Optional staleness window in seconds for
             checkpoint resume state. When unset, defaults to
             ``_PAGINATION_STATE_MAX_AGE_SECONDS``.
+        transient_retry_max_attempts: Optional cap on resume retry attempts
+            per transient record before it is pruned.
+        transient_retry_max_age_seconds: Optional max age in seconds for
+            transient retry records before pruning.
     """
+    global _TRANSIENT_RETRY_MAX_ATTEMPTS, _TRANSIENT_RETRY_MAX_AGE_SECONDS
+
     if checkpoint_staleness_seconds is not None and checkpoint_staleness_seconds <= 0:
         raise ValueError("checkpoint_staleness_seconds must be a positive integer")
     if max_workers is not None and max_workers < 1:
         raise ValueError("max_workers must be a positive integer")
+    if transient_retry_max_attempts is not None and transient_retry_max_attempts <= 0:
+        raise ValueError("transient_retry_max_attempts must be a positive integer")
+    if transient_retry_max_age_seconds is not None and transient_retry_max_age_seconds <= 0:
+        raise ValueError("transient_retry_max_age_seconds must be a positive integer")
+
+    _TRANSIENT_RETRY_MAX_ATTEMPTS = (
+        int(transient_retry_max_attempts)
+        if transient_retry_max_attempts is not None
+        else _DEFAULT_TRANSIENT_RETRY_MAX_ATTEMPTS
+    )
+    _TRANSIENT_RETRY_MAX_AGE_SECONDS = (
+        int(transient_retry_max_age_seconds)
+        if transient_retry_max_age_seconds is not None
+        else _DEFAULT_TRANSIENT_RETRY_MAX_AGE_SECONDS
+    )
 
     set_verbose(verbose)
     set_quiet(quiet)
@@ -4279,6 +4838,7 @@ def ingest_from_internet(
         completed_providers,
         provider_pagination_state,
         provider_l3_state,
+        provider_transient_failures,
         l3_to_l3_state,
         ingestion_phase,
     ) = _initialize_runtime_state(l1_papers)
@@ -4300,6 +4860,7 @@ def ingest_from_internet(
             completed_providers,
             provider_pagination_state,
             provider_l3_state,
+            provider_transient_failures,
             l3_to_l3_state,
             ingestion_phase,
         ) = _restore_runtime_state_from_checkpoint(
@@ -4313,6 +4874,7 @@ def ingest_from_internet(
             completed_providers=completed_providers,
             provider_pagination_state=provider_pagination_state,
             provider_l3_state=provider_l3_state,
+            provider_transient_failures=provider_transient_failures,
             l3_to_l3_state=l3_to_l3_state,
             ingestion_phase=ingestion_phase,
         )
@@ -4328,6 +4890,7 @@ def ingest_from_internet(
             combined_completeness,
             provider_pagination_state,
             provider_l3_state,
+            provider_transient_failures,
             l3_to_l3_state,
             ingestion_phase,
         )
@@ -4344,6 +4907,7 @@ def ingest_from_internet(
             combined_completeness=combined_completeness,
             provider_pagination_state=provider_pagination_state,
             provider_l3_state=provider_l3_state,
+            provider_transient_failures=provider_transient_failures,
             l3_to_l3_state=l3_to_l3_state,
             ingestion_phase=ingestion_phase,
             checkpoint_stats=checkpoint_stats,
@@ -4372,6 +4936,7 @@ def ingest_from_internet(
         combined_completeness=combined_completeness,
         provider_pagination_state=provider_pagination_state,
         provider_l3_state=provider_l3_state,
+        provider_transient_failures=provider_transient_failures,
         checkpoint_stats=checkpoint_stats,
         l1_norm=l1_norm,
         theory_name=theory_name,
@@ -4393,6 +4958,7 @@ def ingest_from_internet(
         all_papers=all_papers,
         provider_stats=provider_stats,
         provider_l3_state=provider_l3_state,
+        provider_transient_failures=provider_transient_failures,
         providers=providers,
         max_workers=max_workers,
         max_l3=max_l3,
@@ -4436,6 +5002,7 @@ def ingest_from_internet(
         papers_data,
         citation_data,
         combined_completeness,
+        _transient_failure_summary(provider_transient_failures),
         checkpoint_stats,
     )
 
