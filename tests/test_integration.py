@@ -85,125 +85,116 @@ def test_adit_full_pipeline(mock_transformer, sample_citation_data, sample_paper
     assert np.array_equal(predictions, predictions2)
 
 
-def test_ingestion_checkpoint_resume_feeds_adit_pipeline(monkeypatch, tmp_path, mock_transformer):
-    """Crash-resume ingestion output should match baseline and remain ADIT-compatible."""
+class _IntegrationCheckpointProvider(ci.CitationProvider):
+    capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=False)
 
-    class _IntegrationCheckpointProvider(ci.CitationProvider):
-        capabilities = ci.ProviderCapabilities(True, True, True, supports_cited_by_traversal=False)
+    def __init__(self, name, l2_prefix, l3_refs, crash_at_l3_index=None, fail_on_call=False):
+        self.name = name
+        self.l2_prefix = l2_prefix
+        self.l3_refs = l3_refs
+        self.crash_at_l3_index = crash_at_l3_index
+        self.fail_on_call = fail_on_call
 
-        def __init__(self, name, l2_prefix, l3_refs, crash_at_l3_index=None, fail_on_call=False):
-            self.name = name
-            self.l2_prefix = l2_prefix
-            self.l3_refs = l3_refs
-            self.crash_at_l3_index = crash_at_l3_index
-            self.fail_on_call = fail_on_call
+    def fetch_seed_metadata(self, l1_papers):
+        if self.fail_on_call:
+            raise AssertionError(f"{self.name} should have been skipped via checkpoint")
+        return {
+            seed: ci.IngestionPaper(
+                paper_id=seed,
+                title=f"Seed {seed}",
+                year=1990,
+                source_ids={self.name: f"seed-{seed}"},
+            )
+            for seed in l1_papers
+        }
 
-        def fetch_seed_metadata(self, l1_papers):
-            if self.fail_on_call:
-                raise AssertionError(f"{self.name} should have been skipped via checkpoint")
-            return {
-                seed: ci.IngestionPaper(
-                    paper_id=seed,
-                    title=f"Seed {seed}",
-                    year=1990,
-                    source_ids={self.name: f"seed-{seed}"},
+    def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
+        if self.fail_on_call:
+            raise AssertionError(f"{self.name} should have been skipped via checkpoint")
+        l2_a = f"{self.l2_prefix}:L2A"
+        l2_b = f"{self.l2_prefix}:L2B"
+        return (
+            {
+                l2_a: {l1_papers[0]},
+                l2_b: {l1_papers[1] if len(l1_papers) > 1 else l1_papers[0]},
+            },
+            {
+                l2_a: ci.IngestionPaper(
+                    paper_id=l2_a,
+                    title="Technology acceptance in healthcare",
+                    abstract="Uses technology acceptance model constructs.",
+                    keywords="technology acceptance, usefulness",
+                    citations=12,
+                    year=2020,
+                ),
+                l2_b: ci.IngestionPaper(
+                    paper_id=l2_b,
+                    title="Ease of use and behavioral intention",
+                    abstract="Empirical evidence for acceptance.",
+                    keywords="ease of use, acceptance",
+                    citations=9,
+                    year=2021,
+                ),
+            },
+        )
+
+    def fetch_l3_references(
+        self,
+        l2_paper_ids,
+        max_l3=None,
+        resume_state=None,
+        progress_callback=None,
+    ):
+        edges = ci._deserialize_edges((resume_state or {}).get("edges"))
+        papers = ci._deserialize_papers((resume_state or {}).get("papers"))
+        start_index = (
+            ci._parse_optional_int((resume_state or {}).get("next_l2_index"), default=0) or 0
+        )
+
+        for idx in range(start_index, len(l2_paper_ids)):
+            if self.crash_at_l3_index is not None and idx == self.crash_at_l3_index:
+                raise RuntimeError(f"simulated integration l3 crash in {self.name}")
+
+            parent_id = l2_paper_ids[idx]
+            for ref_id in self.l3_refs.get(parent_id, []):
+                edges.setdefault(parent_id, set()).add(ref_id)
+                papers.setdefault(
+                    ref_id,
+                    ci.IngestionPaper(
+                        paper_id=ref_id,
+                        title=f"Reference {ref_id}",
+                        citations=1,
+                        year=2018,
+                        doi=ref_id.split(":", 1)[1] if ref_id.startswith("doi:") else None,
+                    ),
                 )
-                for seed in l1_papers
-            }
 
-        def fetch_l2_and_metadata(self, l1_papers, theory_name, key_constructs=None, max_l2=200):
-            if self.fail_on_call:
-                raise AssertionError(f"{self.name} should have been skipped via checkpoint")
-            l2_a = f"{self.l2_prefix}:L2A"
-            l2_b = f"{self.l2_prefix}:L2B"
-            return (
-                {
-                    l2_a: {l1_papers[0]},
-                    l2_b: {l1_papers[1] if len(l1_papers) > 1 else l1_papers[0]},
-                },
-                {
-                    l2_a: ci.IngestionPaper(
-                        paper_id=l2_a,
-                        title="Technology acceptance in healthcare",
-                        abstract="Uses technology acceptance model constructs.",
-                        keywords="technology acceptance, usefulness",
-                        citations=12,
-                        year=2020,
-                    ),
-                    l2_b: ci.IngestionPaper(
-                        paper_id=l2_b,
-                        title="Ease of use and behavioral intention",
-                        abstract="Empirical evidence for acceptance.",
-                        keywords="ease of use, acceptance",
-                        citations=9,
-                        year=2021,
-                    ),
-                },
+            ci._emit_traversal_progress(
+                progress_callback=progress_callback,
+                status="in_progress",
+                index_key="next_l2_index",
+                index_value=idx + 1,
+                budget_remaining=None,
+                edges=edges,
+                papers=papers,
             )
 
-        def fetch_l3_references(
-            self,
-            l2_paper_ids,
-            max_l3=None,
-            resume_state=None,
-            progress_callback=None,
-        ):
-            edges = ci._deserialize_edges((resume_state or {}).get("edges"))
-            papers = ci._deserialize_papers((resume_state or {}).get("papers"))
+        ci._emit_traversal_progress(
+            progress_callback=progress_callback,
+            status="complete",
+            index_key="next_l2_index",
+            index_value=len(l2_paper_ids),
+            budget_remaining=None,
+            edges=edges,
+            papers=papers,
+        )
+        return edges, papers
 
-            start_index_raw = (resume_state or {}).get("next_l2_index")
-            try:
-                start_index = int(start_index_raw) if start_index_raw is not None else 0
-            except (TypeError, ValueError):
-                start_index = 0
 
-            for idx in range(start_index, len(l2_paper_ids)):
-                if self.crash_at_l3_index is not None and idx == self.crash_at_l3_index:
-                    raise RuntimeError(f"simulated integration l3 crash in {self.name}")
-
-                parent_id = l2_paper_ids[idx]
-                for ref_id in self.l3_refs.get(parent_id, []):
-                    edges.setdefault(parent_id, set()).add(ref_id)
-                    papers.setdefault(
-                        ref_id,
-                        ci.IngestionPaper(
-                            paper_id=ref_id,
-                            title=f"Reference {ref_id}",
-                            citations=1,
-                            year=2018,
-                            doi=ref_id.split(":", 1)[1] if ref_id.startswith("doi:") else None,
-                        ),
-                    )
-
-                if progress_callback:
-                    progress_callback(
-                        {
-                            "status": "in_progress",
-                            "next_l2_index": idx + 1,
-                            "budget_remaining": None,
-                            "edges": ci._serialize_edges(edges),
-                            "papers": ci._serialize_papers(papers),
-                            "updated_at": ci.time.time(),
-                        }
-                    )
-
-            if progress_callback:
-                progress_callback(
-                    {
-                        "status": "complete",
-                        "next_l2_index": len(l2_paper_ids),
-                        "budget_remaining": None,
-                        "edges": ci._serialize_edges(edges),
-                        "papers": ci._serialize_papers(papers),
-                        "updated_at": ci.time.time(),
-                    }
-                )
-
-            return edges, papers
-
+def _run_checkpoint_resume_ingestion(monkeypatch, tmp_path):
+    l1 = ["TAM1", "TAM2"]
     cache_dir = Path(tmp_path) / "cache"
     checkpoint_dir = Path(tmp_path) / "checkpoints"
-    l1 = ["TAM1", "TAM2"]
 
     oa_refs = {
         "openalex:L2A": ["doi:10.1000/shared-int", "doi:10.1000/oa-int"],
@@ -222,7 +213,6 @@ def test_ingestion_checkpoint_resume_feeds_adit_pipeline(monkeypatch, tmp_path, 
         crash_at_l3_index=1,
     )
     monkeypatch.setattr(ci, "build_providers", lambda _: [first_oa, first_s2])
-
     with pytest.raises(RuntimeError, match="simulated integration l3 crash"):
         ci.ingest_from_internet(
             theory_name="Technology Acceptance Model",
@@ -234,19 +224,9 @@ def test_ingestion_checkpoint_resume_feeds_adit_pipeline(monkeypatch, tmp_path, 
             refresh=True,
         )
 
-    resumed_oa = _IntegrationCheckpointProvider(
-        "openalex",
-        "openalex",
-        oa_refs,
-        fail_on_call=True,
-    )
-    resumed_s2 = _IntegrationCheckpointProvider(
-        "semantic_scholar",
-        "semantic_scholar",
-        s2_refs,
-    )
+    resumed_oa = _IntegrationCheckpointProvider("openalex", "openalex", oa_refs, fail_on_call=True)
+    resumed_s2 = _IntegrationCheckpointProvider("semantic_scholar", "semantic_scholar", s2_refs)
     monkeypatch.setattr(ci, "build_providers", lambda _: [resumed_oa, resumed_s2])
-
     resumed = ci.ingest_from_internet(
         theory_name="Technology Acceptance Model",
         l1_papers=l1,
@@ -260,7 +240,6 @@ def test_ingestion_checkpoint_resume_feeds_adit_pipeline(monkeypatch, tmp_path, 
     baseline_oa = _IntegrationCheckpointProvider("openalex", "openalex", oa_refs)
     baseline_s2 = _IntegrationCheckpointProvider("semantic_scholar", "semantic_scholar", s2_refs)
     monkeypatch.setattr(ci, "build_providers", lambda _: [baseline_oa, baseline_s2])
-
     baseline = ci.ingest_from_internet(
         theory_name="Technology Acceptance Model",
         l1_papers=l1,
@@ -271,20 +250,23 @@ def test_ingestion_checkpoint_resume_feeds_adit_pipeline(monkeypatch, tmp_path, 
         refresh=True,
     )
 
+    return resumed, baseline, checkpoint_dir, l1
+
+
+def test_ingestion_checkpoint_resume_matches_baseline(monkeypatch, tmp_path):
+    """Crash-resume ingestion output should match a clean baseline run."""
+    resumed, baseline, checkpoint_dir, _ = _run_checkpoint_resume_ingestion(monkeypatch, tmp_path)
+
     assert resumed.citation_data == baseline.citation_data
     assert resumed.papers_data == baseline.papers_data
+    assert any(checkpoint_dir.glob("*.checkpoint.json"))
+    assert not any(checkpoint_dir.glob("*.coordinator.checkpoint.json"))
+    assert list(checkpoint_dir.glob("*.provider.checkpoint.json"))
 
-    # Checkpoint-file shape assertions.
-    # Sequential mode (no max_workers): only the main `.checkpoint.json` should be present;
-    # coordinator and per-provider files are written exclusively in parallel mode.
-    assert any(
-        checkpoint_dir.glob("*.checkpoint.json")
-    ), "Expected a main checkpoint file after crash + resume"
-    assert not any(
-        checkpoint_dir.glob("*.coordinator.checkpoint.json")
-    ), "Coordinator checkpoint should only be written in parallel mode"
-    provider_checkpoint_files = list(checkpoint_dir.glob("*.provider.checkpoint.json"))
-    assert provider_checkpoint_files, "Expected provider checkpoint files to be present"
+
+def test_ingestion_checkpoint_resume_feeds_adit_pipeline(monkeypatch, tmp_path, mock_transformer):
+    """Resumed ingestion output remains compatible with the ADIT pipeline."""
+    resumed, _, _, l1 = _run_checkpoint_resume_ingestion(monkeypatch, tmp_path)
 
     adit = ADIT(
         "Technology Acceptance Model",

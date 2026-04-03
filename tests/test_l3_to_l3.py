@@ -321,9 +321,7 @@ class TestSecondPassL3ToL3:
 
     def test_l3_to_l3_edges_retained(self, tmp_path):
         """Second pass retains edges where both ends are L3 members."""
-        # Setup: L1 seed → L2 citer → L3 refs
-        l1 = "doi:10.1000/seed"
-        l2 = "fakeprov:l2citer"
+        # Setup: L3 member papers with an L3->L3 outgoing reference.
         l3a = "fakeprov:l3a"
         l3b = "fakeprov:l3b"
 
@@ -332,19 +330,7 @@ class TestSecondPassL3ToL3:
             l3_outgoing_papers={l3b: ci.IngestionPaper(paper_id=l3b)},
         )
 
-        # Pre-build initial state: manually construct the graph
-        all_edges = {l2: {l1}, l2: {l1, l3a, l3b}}
-        all_papers = {
-            l1: ci.IngestionPaper(paper_id=l1, doi="10.1000/seed", source_ids={"fakeprov": l1}),
-            l2: ci.IngestionPaper(paper_id=l2, source_ids={"fakeprov": l2}),
-            l3a: ci.IngestionPaper(paper_id=l3a, source_ids={"fakeprov": l3a}),
-            l3b: ci.IngestionPaper(paper_id=l3b, source_ids={"fakeprov": l3b}),
-        }
-
-        # Build providers and manually set the state for a direct test of the
-        # second-pass filtering logic
-        l1_set = {l1}
-        l2_set = {l2}
+        # Build provider state for a direct test of second-pass filtering logic.
         l3_member_set = {l3a, l3b}
 
         raw_edges, raw_papers = fake.fetch_l3_outgoing_references(sorted(l3_member_set))

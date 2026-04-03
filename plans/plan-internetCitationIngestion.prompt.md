@@ -4,7 +4,7 @@ Build a provider-agnostic citation retrieval pipeline that pulls from OpenAlex, 
 
 **Steps**
 1. Define scope contract and canonical data model.
-   - Specify exactly what "theory inputs" mean: `theory_name`, `l1_papers`, optional `key_constructs`.
+   - Specify exactly what "theory inputs" mean: `theory_name`, `l1_papers`.
    - Formalize canonical output schemas already used by ADIT:
      - `citation_data`: `{citing_paper_id: [cited_paper_ids]}`
      - `papers_data`: `{paper_id: {title, abstract, keywords, citations, year}}`
