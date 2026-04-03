@@ -999,21 +999,53 @@ def _paper_to_output_dict(paper: IngestionPaper) -> Dict[str, object]:
 
 
 def _merge_papers(existing: IngestionPaper, incoming: IngestionPaper) -> IngestionPaper:
-    """Merge two paper records, preferring richer fields from incoming."""
-    if incoming.title and len(incoming.title) > len(existing.title):
-        existing.title = incoming.title
-    if incoming.abstract and len(incoming.abstract) > len(existing.abstract):
-        existing.abstract = incoming.abstract
-    if incoming.keywords and len(incoming.keywords) > len(existing.keywords):
-        existing.keywords = incoming.keywords
-    if incoming.citations > existing.citations:
-        existing.citations = incoming.citations
-    if incoming.year and (not existing.year or existing.year == 2010):
-        existing.year = incoming.year
-    if incoming.doi and not existing.doi:
-        existing.doi = incoming.doi
-    existing.source_ids.update(incoming.source_ids)
-    return existing
+    """Merge two paper records, preferring richer fields from incoming.
+
+    ``existing.paper_id`` is always preserved as the identity of the merged
+    result.  Callers that intentionally merge records with different IDs (e.g.
+    ``_dedupe_and_materialize``) rely on this guarantee.
+
+    Returns a new ``IngestionPaper`` without mutating either argument.
+    """
+    # Title / abstract: longer string is treated as more complete.
+    best_title = (
+        incoming.title
+        if incoming.title and len(incoming.title) > len(existing.title)
+        else existing.title
+    )
+    best_abstract = (
+        incoming.abstract
+        if incoming.abstract and len(incoming.abstract) > len(existing.abstract)
+        else existing.abstract
+    )
+
+    # Keywords: union-merge comma-separated entries so neither source loses data.
+    if incoming.keywords and existing.keywords:
+        existing_kw = {k.strip() for k in existing.keywords.split(",") if k.strip()}
+        incoming_kw = {k.strip() for k in incoming.keywords.split(",") if k.strip()}
+        merged_keywords = ", ".join(sorted(existing_kw | incoming_kw))
+    else:
+        merged_keywords = incoming.keywords or existing.keywords
+
+    # Citations: take the higher count.  Both values may be stale snapshots from
+    # different fetch times; without timestamps we cannot determine which is fresher.
+    best_citations = max(existing.citations, incoming.citations)
+
+    # Year: accept incoming only when we have no year yet.  Provider-specific
+    # sentinel values (e.g. a default year returned when the real year is unknown)
+    # should be normalised to None *before* calling this function.
+    best_year = existing.year or incoming.year
+
+    return IngestionPaper(
+        paper_id=existing.paper_id,
+        title=best_title,
+        abstract=best_abstract,
+        keywords=merged_keywords,
+        citations=best_citations,
+        year=best_year,
+        doi=existing.doi or incoming.doi,
+        source_ids={**existing.source_ids, **incoming.source_ids},
+    )
 
 
 def _query_terms(theory_name: str, key_constructs: Optional[Sequence[str]]) -> str:
