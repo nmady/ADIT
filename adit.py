@@ -242,17 +242,27 @@ class ADIT:
         """
         Extract features for L2 papers combining hand-designed and modern NLP features.
         Hand-designed features from Larsen et al. (2014, 2019):
-        - Eigenfactor_Eco: Article-level Eigenfactor (prestige-based importance)
+        - Eigenfactor_Eco: Article-level Eigenfactor (2014, 2019)
+        - Theory-Attribution Ratio (TAR) (2014 as TAR1, 2019)
+        - TAR2 (2014)
+        - TAR3 (2014)
+        - Citation count: Number of citations to the paper (2014)
+        - Impact/Impact Factor (unclear how to compute) (2014 as Impact Factor, 2019 as Impact)
+        - Publication Year (2014, 2019)
+        - Depth (2014)
+        - Journal ID (2014)
+        - Word count in abstract (2019)
+        - Theory name/acronym presence in title/keywords/abstract (binary flags) (2019)
+        - Key construct presence in title/keywords/abstract (binary flags) (2019)
+        
+        Modern Graph features:
         - Betweenness centrality: Bridge importance in citation network
-        - Theory-Attribution Ratio (TAR): Citations to other L2 papers
-        - Citation count: Number of citations
-        - Publication Year (dynamically normalized to [0, 1] based on data range)
-        - Word count in abstract
-        - Theory name/acronym presence in title/keywords/abstract (binary flags)
-        - Key construct presence in title/abstract (binary flags)
 
         Modern NLP features:
         - Semantic similarity: Cosine similarity via sentence transformers
+
+        Note:
+        - Publication year is normalized dynamically between 0 and 1.
 
         :param papers_data: Dict with paper info: {paper_id: {'title': str, 'abstract': str,
                                                           'keywords': str, 'citations': int,

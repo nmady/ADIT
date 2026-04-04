@@ -165,10 +165,12 @@ _PROVIDER_TQDM_DESC_MAX_WIDTH = 34
 
 def _provider_tqdm_ncols() -> int:
     """Return a stable width that fits the active terminal when possible."""
-    terminal_cols = shutil.get_terminal_size((
-        _PROVIDER_TQDM_DEFAULT_NCOLS,
-        20,
-    )).columns
+    terminal_cols = shutil.get_terminal_size(
+        (
+            _PROVIDER_TQDM_DEFAULT_NCOLS,
+            20,
+        )
+    ).columns
     preferred_cols = max(_PROVIDER_TQDM_MIN_NCOLS, terminal_cols - 2)
     return min(_PROVIDER_TQDM_MAX_NCOLS, preferred_cols)
 
@@ -214,6 +216,8 @@ def _create_provider_tqdm(
         unit=unit,
         file=sys.stderr,
     )
+
+
 _PROGRESS_LOCK = threading.RLock()
 _STATS_LOCK = threading.Lock()
 _TRANSIENT_FAILURES_LOCK = threading.Lock()
@@ -4453,7 +4457,9 @@ def _run_l2_to_l3_pass(
     global _PROVIDER_TQDM_ACTIVE
     _PROVIDER_TQDM_ACTIVE = bool(not _QUIET and _stderr_is_tty() and l3_jobs)
     if _PROVIDER_TQDM_ACTIVE:
-        desc_width = _provider_tqdm_desc_width([provider.name for provider, *_ in l3_jobs], "l2->l3")
+        desc_width = _provider_tqdm_desc_width(
+            [provider.name for provider, *_ in l3_jobs], "l2->l3"
+        )
         for bar_position, (provider, _, provider_l2_parent_ids, _) in enumerate(l3_jobs):
             provider_bars[provider.name] = _create_provider_tqdm(
                 provider_name=provider.name,
@@ -4532,7 +4538,9 @@ def _run_l3_to_l3_pass(
     global _PROVIDER_TQDM_ACTIVE
     _PROVIDER_TQDM_ACTIVE = bool(not _QUIET and _stderr_is_tty() and l3_providers)
     if _PROVIDER_TQDM_ACTIVE:
-        desc_width = _provider_tqdm_desc_width([provider.name for provider in l3_providers], "l3->l3")
+        desc_width = _provider_tqdm_desc_width(
+            [provider.name for provider in l3_providers], "l3->l3"
+        )
         for bar_position, provider in enumerate(l3_providers):
             provider_bars[provider.name] = _create_provider_tqdm(
                 provider_name=provider.name,
@@ -4744,7 +4752,9 @@ def _run_parallel_wave1_providers(
                 executed_names = checkpoint_stats["executed_provider_names"]
                 if isinstance(executed_names, list):
                     executed_names.append(provider.name)
-                checkpoint_stats["providers_executed"] = int(checkpoint_stats["providers_executed"]) + 1
+                checkpoint_stats["providers_executed"] = (
+                    int(checkpoint_stats["providers_executed"]) + 1
+                )
                 if not _PROVIDER_TQDM_ACTIVE:
                     _progress(
                         f"[ADIT] Provider {provider_index}/{provider_total}: {provider.name} "
@@ -4774,15 +4784,13 @@ def _run_parallel_wave1_providers(
 
                 provider_progress_callback: Optional[Callable[[int, int, str], None]] = None
                 if _PROVIDER_TQDM_ACTIVE:
-                    provider_progress_callback = (
-                        lambda completed, total, status, provider_name=provider.name: _update_provider_tqdm_bar(
-                            provider_bars,
-                            provider_name,
-                            completed,
-                            total,
-                            status,
-                            bars_lock,
-                        )
+                    provider_progress_callback = lambda completed, total, status, provider_name=provider.name: _update_provider_tqdm_bar(
+                        provider_bars,
+                        provider_name,
+                        completed,
+                        total,
+                        status,
+                        bars_lock,
                     )
 
                 future = executor.submit(
@@ -4827,7 +4835,10 @@ def _run_parallel_wave1_providers(
                             "failed",
                             bars_lock,
                         )
-                    provider_stats[exc.provider_name] = {"status": "failed", "error": str(exc.cause)}
+                    provider_stats[exc.provider_name] = {
+                        "status": "failed",
+                        "error": str(exc.cause),
+                    }
                     _progress(
                         f"[ADIT] Provider {provider_index}/{provider_total}: "
                         f"{exc.provider_name} failed ({exc.cause}) — continuing"
@@ -4973,7 +4984,9 @@ def _run_sequential_providers(
                 skipped_names = checkpoint_stats["skipped_provider_names"]
                 if isinstance(skipped_names, list):
                     skipped_names.append(provider.name)
-                checkpoint_stats["providers_skipped"] = int(checkpoint_stats["providers_skipped"]) + 1
+                checkpoint_stats["providers_skipped"] = (
+                    int(checkpoint_stats["providers_skipped"]) + 1
+                )
                 continue
 
             executed_names = checkpoint_stats["executed_provider_names"]
@@ -5054,15 +5067,13 @@ def _run_sequential_providers(
 
             provider_progress_callback: Optional[Callable[[int, int, str], None]] = None
             if _PROVIDER_TQDM_ACTIVE:
-                provider_progress_callback = (
-                    lambda completed, total, status, provider_name=provider.name: _update_provider_tqdm_bar(
-                        provider_bars,
-                        provider_name,
-                        completed,
-                        total,
-                        status,
-                        bars_lock,
-                    )
+                provider_progress_callback = lambda completed, total, status, provider_name=provider.name: _update_provider_tqdm_bar(
+                    provider_bars,
+                    provider_name,
+                    completed,
+                    total,
+                    status,
+                    bars_lock,
                 )
 
             provider_edges, provider_papers, stats = _fetch_provider_graph(
@@ -5296,7 +5307,9 @@ def ingest_from_internet(
 
     parallel_completed: Set[str] = set()
     parallel_attempted: Set[str] = set()
-    wave1_desc_width = _provider_tqdm_desc_width([provider.name for provider in providers], "wave-1")
+    wave1_desc_width = _provider_tqdm_desc_width(
+        [provider.name for provider in providers], "wave-1"
+    )
     if max_workers is not None and max_workers > 1:
         parallel_completed, parallel_attempted = _run_parallel_wave1_providers(
             providers=providers,
