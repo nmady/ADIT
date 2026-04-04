@@ -775,6 +775,45 @@ def test_ingest_l3_zero_budget_adds_no_l3_edges(monkeypatch, tmp_path):
     assert len(l3_cited) == 0
 
 
+def test_ingest_l2_depth_skips_l3_collection_even_without_budget(monkeypatch, tmp_path):
+    """depth=l2 should skip L2->L3 collection entirely."""
+    provider = _L3BudgetProvider()
+    monkeypatch.setattr(ci, "build_providers", lambda _: [provider])
+
+    result = ci.ingest_from_internet(
+        theory_name="My Fake Theory",
+        l1_papers=["10.1000/xyz1"],
+        sources=["l3budget"],
+        depth="l2",
+        cache_dir=Path(tmp_path),
+        refresh=True,
+        exhaustive=True,
+    )
+
+    assert provider.max_l3_calls == []
+    assert result.metadata["provider_stats"]["l3budget"]["l3_edges"] == 0
+    l3_cited = {
+        cited_id
+        for cited_set in result.citation_data.values()
+        for cited_id in cited_set
+        if cited_id.startswith("l3budget:R")
+    }
+    assert len(l3_cited) == 0
+
+
+@pytest.mark.parametrize("depth", ["l3", "2", "bad-depth"])
+def test_ingest_rejects_unsupported_depth_values(depth, tmp_path):
+    with pytest.raises(ValueError, match="depth must be either 'l2' or 'l2l3'"):
+        ci.ingest_from_internet(
+            theory_name="My Fake Theory",
+            l1_papers=["10.1000/xyz1"],
+            sources=["openalex"],
+            depth=depth,
+            cache_dir=Path(tmp_path),
+            refresh=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # _safe_get: retry on transient errors, stop on permanent errors
 # ---------------------------------------------------------------------------

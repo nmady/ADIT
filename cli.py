@@ -1,10 +1,12 @@
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
+import click
 import pandas as pd
 import typer
+from click.core import ParameterSource
 
 from adit import ADIT
 from citation_ingestion import ingest_from_internet
@@ -209,8 +211,129 @@ def _parse_key_constructs(raw_constructs: Any) -> List[str]:
     return [item.strip() for item in str(raw_constructs).split(",") if item.strip()]
 
 
+def _normalize_cli_list_value(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [item.strip() for item in str(value).split(",") if item.strip()]
+
+
+def _normalize_conflict_value(key: str, value: Any) -> Any:
+    path_keys = {
+        "l1_file",
+        "citation_data",
+        "papers_data",
+        "labels_data",
+        "cache_dir",
+        "checkpoint_dir",
+        "save_ingested_citation_data",
+        "save_ingested_papers_data",
+        "output_features",
+        "output_predictions",
+    }
+    int_keys = {
+        "max_l2",
+        "max_l3",
+        "max_workers",
+        "checkpoint_staleness_seconds",
+        "transient_retry_max_attempts",
+        "transient_retry_max_age_seconds",
+    }
+    bool_keys = {
+        "online",
+        "refresh_cache",
+        "reset_checkpoints",
+        "only_ingest",
+        "exhaustive",
+        "verbose",
+        "quiet",
+        "debug_http",
+    }
+
+    if key in path_keys:
+        return str(Path(value)) if value is not None else None
+    if key in {"sources", "key_constructs", "l1_papers"}:
+        return _normalize_cli_list_value(value)
+    if key in int_keys:
+        return int(value) if value is not None else None
+    if key in bool_keys:
+        return bool(value)
+    if key == "depth":
+        return str(value or "").strip().lower()
+    if isinstance(value, str):
+        return value.strip()
+    return value
+
+
+def _get_cli_provided_params() -> Set[str]:
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return set()
+
+    provided: Set[str] = set()
+    for param_name in ctx.params:
+        source = ctx.get_parameter_source(param_name)
+        if source == ParameterSource.COMMANDLINE:
+            provided.add(param_name)
+    return provided
+
+
+def _validate_cli_config_conflicts(
+    cfg: Dict[str, Any],
+    cli_values: Dict[str, Any],
+    provided_cli_params: Set[str],
+) -> None:
+    conflicts: List[str] = []
+    shared_keys = [
+        "theory_name",
+        "acronym",
+        "l1_papers",
+        "l1_file",
+        "citation_data",
+        "papers_data",
+        "labels_data",
+        "online",
+        "sources",
+        "depth",
+        "key_constructs",
+        "cache_dir",
+        "checkpoint_dir",
+        "checkpoint_staleness_seconds",
+        "refresh_cache",
+        "reset_checkpoints",
+        "max_l2",
+        "max_l3",
+        "max_workers",
+        "transient_retry_max_attempts",
+        "transient_retry_max_age_seconds",
+        "save_ingested_citation_data",
+        "save_ingested_papers_data",
+        "output_features",
+        "output_predictions",
+        "only_ingest",
+        "exhaustive",
+        "verbose",
+        "quiet",
+        "debug_http",
+    ]
+
+    for key in shared_keys:
+        if key not in provided_cli_params or key not in cfg:
+            continue
+
+        cli_norm = _normalize_conflict_value(key, cli_values.get(key))
+        cfg_norm = _normalize_conflict_value(key, cfg.get(key))
+        if cli_norm != cfg_norm:
+            conflicts.append(f"{key} (CLI={cli_values.get(key)!r}, config={cfg.get(key)!r})")
+
+    if conflicts:
+        raise typer.BadParameter("Conflicting CLI/config values: " + "; ".join(conflicts))
+
+
 def _resolve_cli_inputs(
     cfg: Dict[str, Any],
+    provided_cli_params: Set[str],
     theory_name: Optional[str],
     acronym: Optional[str],
     l1_papers: Optional[str],
@@ -242,28 +365,50 @@ def _resolve_cli_inputs(
     quiet: bool,
     debug_http: bool,
 ) -> Dict[str, Any]:
+    def _prefer_cli(param_name: str, cfg_key: str, cli_value: Any, *, default: Any = None) -> Any:
+        if param_name in provided_cli_params:
+            return cli_value
+        if cfg.get(cfg_key) is not None:
+            return cfg.get(cfg_key)
+        if cli_value is not None:
+            return cli_value
+        return default
+
     l1_cfg = cfg.get("l1_papers")
     l1_cfg_str = ",".join(l1_cfg) if isinstance(l1_cfg, list) else None
-    resolved_l1_file = l1_file or (Path(cfg["l1_file"]) if cfg.get("l1_file") else None)
+    resolved_l1_file_value = _prefer_cli("l1_file", "l1_file", l1_file)
+    resolved_l1_file = Path(resolved_l1_file_value) if resolved_l1_file_value else None
+    resolved_l1_papers = _prefer_cli("l1_papers", "l1_papers", l1_papers, default=l1_cfg_str)
+    if isinstance(resolved_l1_papers, list):
+        resolved_l1_papers = ",".join(
+            str(item).strip() for item in resolved_l1_papers if str(item).strip()
+        )
 
+    raw_checkpoint_staleness = _prefer_cli(
+        "checkpoint_staleness_seconds",
+        "checkpoint_staleness_seconds",
+        checkpoint_staleness_seconds,
+    )
     resolved_checkpoint_staleness = (
-        int(cfg["checkpoint_staleness_seconds"])
-        if cfg.get("checkpoint_staleness_seconds") is not None
-        else checkpoint_staleness_seconds
+        int(raw_checkpoint_staleness) if raw_checkpoint_staleness is not None else None
     )
     if resolved_checkpoint_staleness is not None and resolved_checkpoint_staleness <= 0:
         raise typer.BadParameter("checkpoint_staleness_seconds must be a positive integer.")
 
-    resolved_max_workers = (
-        int(cfg["max_workers"]) if cfg.get("max_workers") is not None else max_workers
-    )
+    raw_max_workers = _prefer_cli("max_workers", "max_workers", max_workers)
+    resolved_max_workers = int(raw_max_workers) if raw_max_workers is not None else None
     if resolved_max_workers is not None and resolved_max_workers <= 0:
         raise typer.BadParameter("max_workers must be a positive integer.")
 
+    raw_transient_retry_max_attempts = _prefer_cli(
+        "transient_retry_max_attempts",
+        "transient_retry_max_attempts",
+        transient_retry_max_attempts,
+    )
     resolved_transient_retry_max_attempts = (
-        int(cfg["transient_retry_max_attempts"])
-        if cfg.get("transient_retry_max_attempts") is not None
-        else transient_retry_max_attempts
+        int(raw_transient_retry_max_attempts)
+        if raw_transient_retry_max_attempts is not None
+        else None
     )
     if (
         resolved_transient_retry_max_attempts is not None
@@ -271,10 +416,15 @@ def _resolve_cli_inputs(
     ):
         raise typer.BadParameter("transient_retry_max_attempts must be a positive integer.")
 
+    raw_transient_retry_max_age_seconds = _prefer_cli(
+        "transient_retry_max_age_seconds",
+        "transient_retry_max_age_seconds",
+        transient_retry_max_age_seconds,
+    )
     resolved_transient_retry_max_age_seconds = (
-        int(cfg["transient_retry_max_age_seconds"])
-        if cfg.get("transient_retry_max_age_seconds") is not None
-        else transient_retry_max_age_seconds
+        int(raw_transient_retry_max_age_seconds)
+        if raw_transient_retry_max_age_seconds is not None
+        else None
     )
     if (
         resolved_transient_retry_max_age_seconds is not None
@@ -283,49 +433,97 @@ def _resolve_cli_inputs(
         raise typer.BadParameter("transient_retry_max_age_seconds must be a positive integer.")
 
     return {
-        "theory_name": theory_name or cfg.get("theory_name"),
-        "acronym": acronym or cfg.get("acronym"),
-        "l1": _parse_l1(l1_papers or l1_cfg_str, resolved_l1_file),
-        "citation_data_path": citation_data
-        or (Path(cfg["citation_data"]) if cfg.get("citation_data") else None),
-        "papers_data_path": papers_data
-        or (Path(cfg["papers_data"]) if cfg.get("papers_data") else None),
-        "labels_data_path": labels_data
-        or (Path(cfg["labels_data"]) if cfg.get("labels_data") else None),
-        "output_features": output_features
-        or (Path(cfg["output_features"]) if cfg.get("output_features") else None),
-        "output_predictions": output_predictions
-        or (Path(cfg["output_predictions"]) if cfg.get("output_predictions") else None),
-        "online": bool(online or cfg.get("online", False)),
-        "sources": sources or cfg.get("sources"),
-        "depth": (depth or cfg.get("depth") or "l2l3").lower(),
-        "key_constructs": key_constructs or cfg.get("key_constructs"),
-        "cache_dir": cache_dir or (Path(cfg["cache_dir"]) if cfg.get("cache_dir") else None),
-        "checkpoint_dir": checkpoint_dir
-        or (Path(cfg["checkpoint_dir"]) if cfg.get("checkpoint_dir") else None),
+        "theory_name": _prefer_cli("theory_name", "theory_name", theory_name),
+        "acronym": _prefer_cli("acronym", "acronym", acronym),
+        "l1": _parse_l1(resolved_l1_papers, resolved_l1_file),
+        "citation_data_path": (
+            Path(_prefer_cli("citation_data", "citation_data", citation_data))
+            if _prefer_cli("citation_data", "citation_data", citation_data)
+            else None
+        ),
+        "papers_data_path": (
+            Path(_prefer_cli("papers_data", "papers_data", papers_data))
+            if _prefer_cli("papers_data", "papers_data", papers_data)
+            else None
+        ),
+        "labels_data_path": (
+            Path(_prefer_cli("labels_data", "labels_data", labels_data))
+            if _prefer_cli("labels_data", "labels_data", labels_data)
+            else None
+        ),
+        "output_features": (
+            Path(_prefer_cli("output_features", "output_features", output_features))
+            if _prefer_cli("output_features", "output_features", output_features)
+            else None
+        ),
+        "output_predictions": (
+            Path(_prefer_cli("output_predictions", "output_predictions", output_predictions))
+            if _prefer_cli("output_predictions", "output_predictions", output_predictions)
+            else None
+        ),
+        "online": bool(_prefer_cli("online", "online", online, default=False)),
+        "sources": _prefer_cli("sources", "sources", sources),
+        "depth": str(_prefer_cli("depth", "depth", depth, default="l2l3")).lower(),
+        "key_constructs": _prefer_cli("key_constructs", "key_constructs", key_constructs),
+        "cache_dir": (
+            Path(_prefer_cli("cache_dir", "cache_dir", cache_dir))
+            if _prefer_cli("cache_dir", "cache_dir", cache_dir)
+            else None
+        ),
+        "checkpoint_dir": (
+            Path(_prefer_cli("checkpoint_dir", "checkpoint_dir", checkpoint_dir))
+            if _prefer_cli("checkpoint_dir", "checkpoint_dir", checkpoint_dir)
+            else None
+        ),
         "checkpoint_staleness_seconds": resolved_checkpoint_staleness,
-        "refresh_cache": bool(refresh_cache or cfg.get("refresh_cache", False)),
-        "reset_checkpoints": bool(reset_checkpoints or cfg.get("reset_checkpoints", False)),
-        "max_l2": int(cfg.get("max_l2", max_l2)),
-        "max_l3": int(cfg["max_l3"]) if cfg.get("max_l3") is not None else max_l3,
+        "refresh_cache": bool(_prefer_cli("refresh_cache", "refresh_cache", refresh_cache)),
+        "reset_checkpoints": bool(
+            _prefer_cli("reset_checkpoints", "reset_checkpoints", reset_checkpoints)
+        ),
+        "max_l2": int(_prefer_cli("max_l2", "max_l2", max_l2, default=200)),
+        "max_l3": (
+            int(_prefer_cli("max_l3", "max_l3", max_l3))
+            if _prefer_cli("max_l3", "max_l3", max_l3) is not None
+            else None
+        ),
         "max_workers": resolved_max_workers,
         "transient_retry_max_attempts": resolved_transient_retry_max_attempts,
         "transient_retry_max_age_seconds": resolved_transient_retry_max_age_seconds,
-        "save_ingested_citation_data": save_ingested_citation_data
-        or (
-            Path(cfg["save_ingested_citation_data"])
-            if cfg.get("save_ingested_citation_data")
+        "save_ingested_citation_data": (
+            Path(
+                _prefer_cli(
+                    "save_ingested_citation_data",
+                    "save_ingested_citation_data",
+                    save_ingested_citation_data,
+                )
+            )
+            if _prefer_cli(
+                "save_ingested_citation_data",
+                "save_ingested_citation_data",
+                save_ingested_citation_data,
+            )
             else None
         ),
-        "save_ingested_papers_data": save_ingested_papers_data
-        or (
-            Path(cfg["save_ingested_papers_data"]) if cfg.get("save_ingested_papers_data") else None
+        "save_ingested_papers_data": (
+            Path(
+                _prefer_cli(
+                    "save_ingested_papers_data",
+                    "save_ingested_papers_data",
+                    save_ingested_papers_data,
+                )
+            )
+            if _prefer_cli(
+                "save_ingested_papers_data",
+                "save_ingested_papers_data",
+                save_ingested_papers_data,
+            )
+            else None
         ),
-        "only_ingest": bool(only_ingest or cfg.get("only_ingest", False)),
-        "exhaustive": bool(exhaustive if exhaustive is not None else cfg.get("exhaustive", True)),
-        "verbose": bool(verbose or cfg.get("verbose", False)),
-        "quiet": bool(quiet or cfg.get("quiet", False)),
-        "debug_http": bool(debug_http or cfg.get("debug_http", False)),
+        "only_ingest": bool(_prefer_cli("only_ingest", "only_ingest", only_ingest)),
+        "exhaustive": bool(_prefer_cli("exhaustive", "exhaustive", exhaustive, default=True)),
+        "verbose": bool(_prefer_cli("verbose", "verbose", verbose)),
+        "quiet": bool(_prefer_cli("quiet", "quiet", quiet)),
+        "debug_http": bool(_prefer_cli("debug_http", "debug_http", debug_http)),
     }
 
 
@@ -448,8 +646,44 @@ def run(
     """Run ADIT using CLI values and/or a config file."""
     cfg = _load_config(config)
 
+    provided_cli_params = _get_cli_provided_params()
+    cli_values: Dict[str, Any] = {
+        "theory_name": theory_name,
+        "acronym": acronym,
+        "l1_papers": l1_papers,
+        "l1_file": l1_file,
+        "citation_data": citation_data,
+        "papers_data": papers_data,
+        "labels_data": labels_data,
+        "online": online,
+        "sources": sources,
+        "depth": depth,
+        "key_constructs": key_constructs,
+        "cache_dir": cache_dir,
+        "checkpoint_dir": checkpoint_dir,
+        "checkpoint_staleness_seconds": checkpoint_staleness_seconds,
+        "refresh_cache": refresh_cache,
+        "reset_checkpoints": reset_checkpoints,
+        "max_l2": max_l2,
+        "max_l3": max_l3,
+        "max_workers": max_workers,
+        "transient_retry_max_attempts": transient_retry_max_attempts,
+        "transient_retry_max_age_seconds": transient_retry_max_age_seconds,
+        "save_ingested_citation_data": save_ingested_citation_data,
+        "save_ingested_papers_data": save_ingested_papers_data,
+        "output_features": output_features,
+        "output_predictions": output_predictions,
+        "only_ingest": only_ingest,
+        "exhaustive": exhaustive,
+        "verbose": verbose,
+        "quiet": quiet,
+        "debug_http": debug_http,
+    }
+    _validate_cli_config_conflicts(cfg, cli_values, provided_cli_params)
+
     params = _resolve_cli_inputs(
         cfg,
+        provided_cli_params,
         theory_name,
         acronym,
         l1_papers,

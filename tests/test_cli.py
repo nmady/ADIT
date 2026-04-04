@@ -179,8 +179,8 @@ def test_cli_run_with_json_config_and_no_labels(tmp_path, monkeypatch):
     assert inst.trained is False
 
 
-def test_cli_cli_args_override_config_values(tmp_path, monkeypatch):
-    """Direct CLI options should take precedence over config values."""
+def test_cli_errors_on_conflicting_cli_and_config_values(tmp_path, monkeypatch):
+    """Explicit CLI values conflicting with config should raise an error."""
     monkeypatch.setattr(cli, "ADIT", FakeADIT)
 
     citation_file = tmp_path / "citation.json"
@@ -232,13 +232,68 @@ def test_cli_cli_args_override_config_values(tmp_path, monkeypatch):
         ],
     )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code != 0
+    clean_output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    assert "Conflicting CLI/config values" in clean_output
+    assert "theory_name" in clean_output
+    assert "acronym" in clean_output
+    assert "l1_papers" in clean_output
 
-    inst = FakeADIT.last_instance
-    assert inst is not None
-    assert inst.theory_name == "Overridden Theory"
-    assert inst.acronym == "ovr"
-    assert inst.l1_papers == ["TAM1", "TAM2"]
+
+def test_cli_allows_matching_cli_and_config_values(tmp_path, monkeypatch):
+    """Same explicit values in CLI and config should not error."""
+    monkeypatch.setattr(cli, "ADIT", FakeADIT)
+
+    citation_file = tmp_path / "citation.json"
+    papers_file = tmp_path / "papers.json"
+    config_file = tmp_path / "config.json"
+
+    _write_json(citation_file, {"PaperA": ["TAM1"]})
+    _write_json(
+        papers_file,
+        {
+            "PaperA": {
+                "title": "A",
+                "abstract": "a",
+                "keywords": "k",
+                "citations": 1,
+                "year": 2010,
+            },
+            "TAM1": {
+                "title": "TAM",
+                "abstract": "foundation",
+                "keywords": "tam",
+                "citations": 100,
+                "year": 1990,
+            },
+        },
+    )
+    _write_json(
+        config_file,
+        {
+            "theory_name": "Technology Acceptance Model",
+            "acronym": "TAM",
+            "l1_papers": ["TAM1", "TAM2"],
+            "citation_data": str(citation_file),
+            "papers_data": str(papers_file),
+        },
+    )
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "--config",
+            str(config_file),
+            "--theory-name",
+            "Technology Acceptance Model",
+            "--acronym",
+            "TAM",
+            "--l1-papers",
+            "TAM1,TAM2",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
 
 
 def test_cli_requires_theory_and_data(tmp_path):
@@ -379,6 +434,7 @@ def test_cli_online_mode_honors_configured_max_l3_budget(tmp_path, monkeypatch):
     )
 
     def fake_ingest(**kwargs):
+        assert kwargs["depth"] == "l2"
         assert kwargs["max_l3"] == 25
         return SimpleNamespace(
             citation_data={"PaperA": ["TAM1"]},

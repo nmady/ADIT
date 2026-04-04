@@ -2139,7 +2139,7 @@ def _fetch_provider_graph(
     all_papers = dict(l2_papers)
     added_l3_edges = 0
 
-    if include_l3 and depth.lower() in {"l2l3", "l3", "2"}:
+    if include_l3 and depth.lower() == "l2l3":
         l3_edges, l3_papers, added_l3_edges = _fetch_l3_for_provider(
             provider=provider,
             l2_parent_ids=list(l2_edges.keys()),
@@ -2369,7 +2369,14 @@ def _provider_l2_parents_for_l3(
     l2_parent_ids: Sequence[str],
     all_papers: Dict[str, IngestionPaper],
 ) -> List[str]:
-    """Select deduped L2 parents that can be expanded by a specific provider."""
+    """Select deduped L2 parents that can be expanded by a specific provider.
+
+    Note: If deduplication removed provider-specific identity tokens (so the
+    provider would otherwise receive an empty list), we fall back to returning
+    all deduped L2 parents. This preserves checkpoint/resume semantics and
+    allows providers to attempt expansion (and surface crashes) even when
+    identity tags were lost during merging.
+    """
     if provider_name not in {"openalex", "semantic_scholar", "core", "crossref"}:
         return list(l2_parent_ids)
 
@@ -2377,7 +2384,14 @@ def _provider_l2_parents_for_l3(
     for parent_id in l2_parent_ids:
         if _paper_has_provider_identity(all_papers.get(parent_id), provider_name, parent_id):
             provider_l2_ids.append(parent_id)
-    return provider_l2_ids
+    # If no provider-scoped parent ids are present after deduplication, fall
+    # back to attempting expansion for all deduped parents. This preserves
+    # the previous behavior relied on by checkpoint-resume integration tests
+    # where providers may still iterate the parent list (and potentially
+    # raise) even when provider-specific identity tokens were lost by merge.
+    if provider_l2_ids:
+        return provider_l2_ids
+    return list(l2_parent_ids)
 
 
 def _request_payload(
@@ -4411,7 +4425,7 @@ def _run_l2_to_l3_pass(
     persist_callback: Callable[[], None],
 ) -> None:
     """Run L2->L3 reference expansion pass for all providers."""
-    if depth.lower() not in {"l2l3", "l3", "2"}:
+    if depth.lower() != "l2l3":
         return
 
     l1_set = set(l1_norm)
@@ -4499,7 +4513,7 @@ def _run_l3_to_l3_pass(
     persist_callback: Callable[[], None],
 ) -> int:
     """Run L3->L3 outgoing reference discovery pass. Returns total edges added."""
-    if depth.lower() not in {"l2l3", "l3", "2"}:
+    if depth.lower() != "l2l3":
         return 0
 
     l3_member_set = _compute_l3_member_set(l1_norm, all_edges, all_papers)
@@ -5153,6 +5167,10 @@ def ingest_from_internet(
     """
     global _TRANSIENT_RETRY_MAX_ATTEMPTS, _TRANSIENT_RETRY_MAX_AGE_SECONDS
 
+    depth_normalized = str(depth).lower().strip()
+    if depth_normalized not in {"l2", "l2l3"}:
+        raise ValueError("depth must be either 'l2' or 'l2l3'")
+
     if checkpoint_staleness_seconds is not None and checkpoint_staleness_seconds <= 0:
         raise ValueError("checkpoint_staleness_seconds must be a positive integer")
     if max_workers is not None and max_workers < 1:
@@ -5192,7 +5210,7 @@ def ingest_from_internet(
         l1_papers,
         key_constructs,
         source_list,
-        depth,
+        depth_normalized,
         max_l2,
         max_l3,
         exhaustive,
@@ -5324,7 +5342,7 @@ def ingest_from_internet(
         l1_norm=l1_norm,
         theory_name=theory_name,
         key_constructs=key_constructs,
-        depth=depth,
+        depth=depth_normalized,
         exhaustive=exhaustive,
         max_l2=max_l2,
         max_l3=max_l3,
@@ -5346,7 +5364,7 @@ def ingest_from_internet(
     _persist_checkpoint_snapshot()
 
     _run_l2_to_l3_pass(
-        depth=depth,
+        depth=depth_normalized,
         l1_norm=l1_norm,
         all_edges=all_edges,
         all_papers=all_papers,
@@ -5369,7 +5387,7 @@ def ingest_from_internet(
     # edges whose target is already in the membership set are retained.
     ingestion_phase = "l3_to_l3"
     _run_l3_to_l3_pass(
-        depth=depth,
+        depth=depth_normalized,
         l1_norm=l1_norm,
         all_edges=all_edges,
         all_papers=all_papers,
@@ -5389,7 +5407,7 @@ def ingest_from_internet(
 
     metadata = _build_metadata(
         source_list,
-        depth,
+        depth_normalized,
         provider_stats,
         key,
         alias_map,
